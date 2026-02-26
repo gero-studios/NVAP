@@ -1,0 +1,214 @@
+# NVAP
+
+NVAP (NeuroVascular Analytics Program) is a desktop 3D viewer and analyzer for microscopy image stacks containing:
+
+- Green channel: microglia
+- Red channel: vasculature
+
+It supports missing-slice interpolation, branch-preserving pixel-to-voxel denoising (no PSF), 3D volume + isosurface rendering, basic metrics, and export.
+
+## Units and spacing
+
+Default voxel spacing is interpreted in micrometers:
+
+- `x = 0.331 um`
+- `y = 0.331 um`
+- `z = 0.4 um`
+
+## Expected input layout
+
+Default auto-detection expects either:
+
+- `Input/Segmented/Green/*.png`
+- `Input/Segmented/Red/*.png`
+
+or a selected root containing `Segmented/Green` and `Segmented/Red`.
+
+NVAP also supports a single user-selected folder of RGB PNG slices when:
+
+- filenames include `_z###` (for example `sample_z030.png`), and
+- slice pixels are red/green-only (black background allowed; blue or mixed red+green pixels are ignored).
+
+Filenames should include z-index and channel marker, for example:
+
+- `..._z030c1.png` (green)
+- `..._z030c2.png` (red)
+
+## Run from source
+
+### PowerShell quick start (Windows)
+
+```powershell
+# From repo root
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
+Optional model backend:
+
+```powershell
+# Torch / model backend (optional)
+python -m pip install -e ".[denoise_torch]"
+```
+
+If activation is blocked:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+Launch GUI:
+
+```powershell
+nvap
+```
+
+Launch GUI with verbose debug logs:
+
+```powershell
+nvap --debug
+```
+
+Optional headless smoke test:
+
+```powershell
+nvap --headless-smoke --input Input
+```
+
+Clear processed cache safely (only `.nvap_cache/processed_*.npz` in selected root):
+
+```powershell
+nvap --clear-cache
+# or choose another root that contains .nvap_cache
+nvap --clear-cache --cache-root "C:\path\to\root"
+```
+
+Run tests:
+
+```powershell
+python -m pytest
+```
+
+## How to load dataset in NVAP
+
+1. Click `Load Dataset`.
+2. Choose a root folder that contains either:
+- `Segmented/Green` and `Segmented/Red`, or
+- `Input/Segmented/Green` and `Input/Segmented/Red`.
+  You can also choose a single folder of RGB `_z###.png` slices that use only red/green pixels.
+3. If auto-detection fails, NVAP prompts you to select Green and Red folders manually.
+4. Wait for loading dialogs to complete:
+- channel stack load
+- missing z-slice interpolation
+- pixel2voxel_no_psf processing
+- initial render + metrics
+  During this step, NVAP shows `Elapsed` and estimated `ETA`.
+5. Use threshold/opacity/isosurface controls in the left panel.
+6. Check debug output in the `Debug Log` panel.
+
+### Simplified controls
+
+- NVAP now starts in a simple mode by default.
+- Toggle `Show advanced controls` only when you need denoise expert settings.
+- Core workflow in simple mode: `Load Dataset` -> adjust thresholds -> export.
+
+### Individual microglia viewer
+
+- Use the `Microglia Viewer` panel to inspect one connected green component at a time.
+- Enable `View one microglia`.
+- Select a component index (`Cell`) to isolate that microglia in 3D.
+- Component ranking is size-based (largest first) at the current green threshold.
+
+### Processing note
+
+- NVAP now runs a single denoise mode: `pixel2voxel_no_psf`.
+- PSF deconvolution controls are removed from normal workflow.
+- Dataset processing runs in background threads with elapsed-time and ETA dialogs.
+
+### Branch-preserving preprocessing and mesh clarity
+
+NVAP now applies a preprocessing chain before visualization:
+
+- Flat-field/background correction
+- Per-slice contrast normalization
+- Branch-preserving pixel-to-voxel denoise (stronger on green channel)
+
+Green channel denoising uses only:
+
+- `pixel2voxel_no_psf` (single default mode)
+
+In advanced controls, you can tune noise strength, noise multiplier, branch protection, and speckle attenuation.
+
+To better clean isosurfaces from anisotropic microscopy stacks, NVAP also resamples Z to near-isotropic spacing for mesh rendering.
+Metrics remain computed on the processed (non-resampled) dataset.
+
+For visualization, NVAP applies a display-only Z height scale (default `0.67`) so depth is less visually disproportionate.
+You can tune this live with `Rendering -> Z height scale`.
+
+For green microglia, default threshold initialization is biased lower to reduce the risk of cutting faint branches.
+Threshold suggestion now uses a branch-aware green mode by default.
+
+### Green denoise benchmark
+
+CLI benchmark report:
+
+```powershell
+nvap --benchmark-denoise --input Input --output green_denoise_report.json
+```
+
+Override profile:
+
+```powershell
+nvap --benchmark-denoise --input Input --output report.json --green-denoise-profile low_snr
+```
+
+Script alternative:
+
+```powershell
+python scripts/benchmark_green_denoise.py --input Input --output report.json
+```
+
+### Green denoise cookbook
+
+- Default workflow: `pixel2voxel_no_psf` with unchanged defaults.
+- Faint branches, noisy stack: increase `Branch protect` to `0.75-0.85` and keep `Noise multiplier` around `1.9-2.3`.
+- Speckle-heavy output: lower `Speckle attenuation` and slightly increase `Noise strength`.
+
+### Auto-save cache
+
+- Processed volumes are cached automatically in `.nvap_cache/`.
+- Re-loading the same dataset with the same processing settings reuses cache when available.
+- This avoids re-running full denoise processing and speeds up re-open/re-render workflows.
+
+## Windows packaging
+
+Use:
+
+```powershell
+.\scripts\build_windows.ps1
+```
+
+This builds a one-folder executable in `dist/NVAP/`.
+
+## Current v1 capabilities
+
+- Auto-detect channels with manual directory override fallback.
+- Missing z-slice interpolation.
+- Pixel-to-voxel branch-preserving denoising (no PSF).
+- 3D rendering per channel with independent controls.
+- Basic metrics:
+  - voxel count
+  - physical volume
+  - connected component count
+  - largest component size
+  - red-green overlap in shared z-range
+- Export:
+  - metrics CSV
+  - snapshot PNG
+
+## AI extension scaffold
+
+NVAP exposes plugin discovery through the `nvap.plugins` entry point group and a `ChannelAnalyzerPlugin` protocol. v1 includes extension points only.

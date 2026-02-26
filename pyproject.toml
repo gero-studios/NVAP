@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvap"
+version = "0.1.0"
+description = "NeuroVascular Analytics Program (NVAP)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "scikit-image>=0.22",
+  "pandas>=2.1",
+  "imageio>=2.33",
+  "PySide6>=6.6",
+  "vtk>=9.2",
+  "PyWavelets>=1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-qt>=4.4",
+  "pyinstaller>=6.3",
+]
+denoise_bm4d = [
+  "bm4d>=4.2.5",
+]
+denoise_torch = [
+  "torch>=2.2",
+]
+mesh = [
+  "trimesh>=4.0",
+]
+rocm = [
+  "torch>=2.2",
+]
+
+[project.scripts]
+nvap = "nvap.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

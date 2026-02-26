@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+import numpy as np
+
+from nvap.analysis.microglia_components import compute_component_labels, isolate_component
+
+
+def test_compute_component_labels_orders_by_size_desc() -> None:
+    arr = np.zeros((4, 16, 16), dtype=np.float32)
+    arr[1:3, 8, 2:12] = 0.2  # large component
+    arr[2, 3:5, 13] = 0.25   # small component
+    labels, order, sizes = compute_component_labels(arr, threshold=0.15)
+
+    assert labels.shape == arr.shape
+    assert len(order) == 2
+    assert int(sizes[int(order[0])]) >= int(sizes[int(order[1])])
+
+
+def test_isolate_component_keeps_only_selected_microglia() -> None:
+    arr = np.zeros((3, 12, 12), dtype=np.float32)
+    arr[1, 4, 2:8] = 0.18
+    arr[1, 9, 8:11] = 0.21
+    labels, order, _ = compute_component_labels(arr, threshold=0.15)
+    isolated = isolate_component(arr, labels, int(order[0]))
+
+    assert isolated.shape == arr.shape
+    assert float(np.count_nonzero(isolated)) > 0
+    # Some voxels from the original should be removed when isolating one component.
+    assert int(np.count_nonzero(isolated)) < int(np.count_nonzero(arr))
+
+
+def test_component_filtering_avoids_noise_explosion() -> None:
+    rng = np.random.default_rng(88)
+    arr = np.zeros((8, 64, 64), dtype=np.float32)
+    # Two meaningful components.
+    arr[3:6, 20, 10:30] = 0.2
+    arr[2:5, 42, 34:54] = 0.22
+    # A lot of isolated noise voxels above threshold.
+    noise_mask = rng.random(arr.shape) < 0.02
+    arr[noise_mask] = np.maximum(arr[noise_mask], 0.18)
+
+    labels, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.15,
+        min_voxels=20,
+        max_components=8,
+    )
+    assert labels.shape == arr.shape
+    assert len(order) <= 8
+    assert len(order) >= 2
+    assert int(sizes[int(order[0])]) >= int(sizes[int(order[-1])])
+
+
+def test_component_cap_limits_result_count() -> None:
+    rng = np.random.default_rng(9)
+    arr = np.zeros((5, 80, 80), dtype=np.float32)
+    # Many tiny disconnected components.
+    points = rng.choice(arr.size, size=400, replace=False)
+    arr.reshape(-1)[points] = 0.2
+
+    _, order, _ = compute_component_labels(
+        arr,
+        threshold=0.15,
+        min_voxels=1,
+        max_components=32,
+        smooth_sigma=(0.0, 0.0, 0.0),
+    )
+    assert len(order) <= 32
+
+
+def test_giant_component_filtered_keeps_cell_sized_components() -> None:
+    arr = np.zeros((6, 64, 64), dtype=np.float32)
+    # Large connected blob that should not be treated as one microglia cell.
+    arr[:, 8:56, 8:56] = 0.19
+    # Smaller disconnected bright structure that should remain selectable.
+    arr[2:5, 2, 5:25] = 0.24
+
+    _, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.15,
+        min_voxels=20,
+        max_components=8,
+    )
+    assert len(order) == 1
+    assert int(sizes[int(order[0])]) >= 50
+
+
+def test_hysteresis_preserves_connected_low_intensity_branches() -> None:
+    arr = np.zeros((5, 48, 48), dtype=np.float32)
+    # Bright core (soma-like)
+    arr[2, 24, 24] = 0.36
+    arr[2, 24, 25] = 0.32
+    arr[2, 25, 24] = 0.31
+    # Lower-intensity branches connected to core
+    arr[2, 24, 26:40] = 0.12
+    arr[2, 20:24, 24] = 0.11
+    # Isolated dim speckle should not survive as its own component
+    arr[1, 4, 4] = 0.11
+
+    labels, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.18,
+        min_voxels=6,
+        max_components=8,
+    )
+    assert len(order) == 1
+    comp_id = int(order[0])
+    assert int(sizes[comp_id]) >= 18
+    assert int(labels[2, 24, 36]) == comp_id
+    assert int(labels[1, 4, 4]) == 0
+
+
+def test_branch_sensitivity_slider_affects_branch_retention() -> None:
+    arr = np.zeros((4, 40, 40), dtype=np.float32)
+    arr[1, 20, 20] = 0.35
+    arr[1, 20, 21] = 0.32
+    arr[1, 20, 22:31] = 0.11
+
+    labels_low, order_low, _ = compute_component_labels(
+        arr,
+        threshold=0.18,
+        min_voxels=4,
+        branch_sensitivity=0.5,
+    )
+    labels_high, order_high, _ = compute_component_labels(
+        arr,
+        threshold=0.18,
+        min_voxels=4,
+        branch_sensitivity=1.8,
+    )
+
+    assert len(order_high) >= 1
+    assert int(np.count_nonzero(labels_high)) >= int(np.count_nonzero(labels_low))
+
+
+def test_component_requires_visible_above_threshold_voxels() -> None:
+    arr = np.zeros((3, 24, 24), dtype=np.float32)
+    arr[1, 12, 12] = 0.25
+    arr[1, 12, 13:20] = 0.09  # connected but below render threshold
+
+    _, order, _ = compute_component_labels(
+        arr,
+        threshold=0.1,
+        min_voxels=6,
+        branch_sensitivity=1.2,
+    )
+    assert len(order) == 0
+
+
+def test_nearby_cells_not_merged_at_low_threshold() -> None:
+    """Many cells with bright cores and dim branches should remain separate.
+
+    Before the fix, binary_propagation merged nearby cells whose low-intensity
+    regions touched, producing ~4 components instead of 30+.
+    """
+    rng = np.random.default_rng(42)
+    arr = np.zeros((10, 128, 128), dtype=np.float32)
+
+    # Plant 36 well-separated microglia-like cells with bright cores and dim
+    # surrounding branches.  Cells are laid out in a 6x6 grid with spacing 20,
+    # starting at (10, 10).  The branch halos may touch at low thresholds but
+    # the cores are distinct.
+    n_planted = 0
+    for row in range(6):
+        for col in range(6):
+            cy, cx = 10 + row * 20, 10 + col * 20
+            z0 = rng.integers(3, 7)
+            # Bright core (soma)
+            arr[z0, cy, cx] = 0.6 + rng.random() * 0.15
+            arr[z0, cy + 1, cx] = 0.45 + rng.random() * 0.1
+            arr[z0, cy, cx + 1] = 0.42 + rng.random() * 0.1
+            arr[z0, cy - 1, cx] = 0.40 + rng.random() * 0.08
+            arr[z0, cy, cx - 1] = 0.38 + rng.random() * 0.08
+            # Branch-like extensions (dimmer)
+            for dy in range(-4, 5):
+                for dx in range(-4, 5):
+                    iy, ix = cy + dy, cx + dx
+                    if 0 <= iy < 128 and 0 <= ix < 128 and arr[z0, iy, ix] < 0.01:
+                        dist = abs(dy) + abs(dx)
+                        if dist <= 5:
+                            arr[z0, iy, ix] = max(0.0, 0.18 - 0.025 * dist + rng.random() * 0.03)
+            n_planted += 1
+
+    _, order, _ = compute_component_labels(
+        arr,
+        threshold=0.12,
+        min_voxels=4,
+        max_components=512,
+        smooth_sigma=(0.0, 0.0, 0.0),
+        branch_sensitivity=1.0,
+    )
+    # Should find at least 30 of the 36 planted cells as separate components.
+    assert len(order) >= 30, (
+        f"Expected >=30 components from {n_planted} planted cells, got {len(order)}"
+    )
