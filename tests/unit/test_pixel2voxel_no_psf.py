@@ -26,12 +26,17 @@ def test_pixel2voxel_no_psf_preserves_branch_signal() -> None:
     )
     out = preprocess_channel(channel, cfg)
 
-    branch_mean = float(out.data[2:4, 24, 14:34].mean())
-    background_mean = float(out.data[:, 5:11, 5:11].mean())
-    assert branch_mean > background_mean
+    assert np.allclose(out.data, arr, atol=0.0)
 
 
-def test_psf_pipeline_is_bypassed_for_pixel2voxel_strategy() -> None:
+def test_psf_pipeline_skips_green_and_processes_red_for_pixel2voxel_strategy(monkeypatch) -> None:
+    def _fake_deconvolve(volume, spacing, config, cancel_event=None, progress_callback=None):
+        if progress_callback is not None:
+            progress_callback(1, 1)
+        return np.asarray(volume, dtype=np.float32) + np.float32(0.123)
+
+    monkeypatch.setattr("nvap.pipeline.deconvolve_volume", _fake_deconvolve)
+
     rng = np.random.default_rng(17)
     green = np.clip(rng.random((4, 24, 24), dtype=np.float32) * 0.2, 0.0, 1.0)
     red = np.clip(rng.random((4, 24, 24), dtype=np.float32) * 0.2, 0.0, 1.0)
@@ -49,4 +54,32 @@ def test_psf_pipeline_is_bypassed_for_pixel2voxel_strategy() -> None:
     )
 
     assert np.allclose(out.green.data, green, atol=0.0)
-    assert np.allclose(out.red.data, red, atol=0.0)
+    assert np.allclose(out.red.data, red + np.float32(0.123), atol=0.0)
+
+
+def test_psf_pipeline_skips_green_and_processes_red_for_microglia_strategy(monkeypatch) -> None:
+    def _fake_deconvolve(volume, spacing, config, cancel_event=None, progress_callback=None):
+        if progress_callback is not None:
+            progress_callback(1, 1)
+        return np.asarray(volume, dtype=np.float32) + np.float32(0.05)
+
+    monkeypatch.setattr("nvap.pipeline.deconvolve_volume", _fake_deconvolve)
+
+    rng = np.random.default_rng(23)
+    green = np.clip(rng.random((3, 20, 20), dtype=np.float32) * 0.3, 0.0, 1.0)
+    red = np.clip(rng.random((3, 20, 20), dtype=np.float32) * 0.3, 0.0, 1.0)
+    spacing = VoxelSpacing()
+    dataset = DatasetVolume(
+        green=ChannelVolume("green", green.copy(), [0, 1, 2], spacing),
+        red=ChannelVolume("red", red.copy(), [0, 1, 2], spacing),
+        shared_z_range=(0, 2),
+    )
+    preprocess_cfg = PreprocessConfig(green_denoise_strategy="microglia_masking")
+    out = apply_psf_to_dataset(
+        dataset,
+        config=PSFConfig(enabled=True, iterations=6),
+        preprocess_config=preprocess_cfg,
+    )
+
+    assert np.allclose(out.green.data, green, atol=0.0)
+    assert np.allclose(out.red.data, red + np.float32(0.05), atol=0.0)

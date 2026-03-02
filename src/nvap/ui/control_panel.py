@@ -1,4 +1,4 @@
-"""Simplified NVAP control panel with single pixel2voxel_no_psf mode."""
+"""Simplified NVAP control panel with green-channel pass-through mode."""
 from __future__ import annotations
 
 import numpy as np
@@ -45,7 +45,7 @@ class ControlPanel(QWidget):
         self.show_advanced.setChecked(False)
         self.show_advanced.toggled.connect(self._set_advanced_visible)
         root.addWidget(self.show_advanced)
-        root.addWidget(QLabel("Mode: pixel2voxel_no_psf (PSF disabled)"))
+        root.addWidget(QLabel("Mode: green pass-through (no green masking/denoise)"))
 
         self.render_group = self._build_render_group()
         root.addWidget(self.render_group)
@@ -169,10 +169,10 @@ class ControlPanel(QWidget):
         return group
 
     def _build_preprocess_group(self) -> QGroupBox:
-        group = QGroupBox("Pixel No-PSF Denoise")
+        group = QGroupBox("Green Channel")
         form = QFormLayout(group)
 
-        self.preprocess_enabled = QCheckBox("Enable denoising")
+        self.preprocess_enabled = QCheckBox("Enable preprocessing")
         self.preprocess_enabled.setChecked(True)
         form.addRow(self.preprocess_enabled)
 
@@ -190,8 +190,9 @@ class ControlPanel(QWidget):
 
         form.addRow(
             QLabel(
-                "Single mode only: pixel2voxel_no_psf.\n"
-                "Defaults are tuned for branch retention."
+                "Single mode: green pass-through.\n"
+                "Green is pass-through (input used as-is).\n"
+                "Red keeps the existing workflow."
             )
         )
         return group
@@ -304,7 +305,6 @@ class ControlPanel(QWidget):
             enabled=self.preprocess_enabled.isChecked(),
             denoise_strength=float(self.noise_strength.value()),
             green_denoise_multiplier=float(self.noise_multiplier.value()),
-            green_denoise_strategy="pixel2voxel_no_psf",
             green_branch_protection=float(self.branch_protection.value()),
             green_speckle_attenuation=float(self.speckle_attenuation.value()),
         )

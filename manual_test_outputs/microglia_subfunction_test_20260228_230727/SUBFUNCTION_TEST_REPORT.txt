@@ -1,0 +1,31 @@
+﻿Microglia masking subfunction test report
+Timestamp: 2026-02-28 23:44:09
+Root: C:\Users\giaco\Documents\NVAP\NVAP\manual_test_outputs\microglia_subfunction_test_20260228_230727
+
+Test input artifacts (created):
+- input_stack.tif
+- input_slices/slice_z0000.png ... slice_z0005.png
+
+Subfunction invocation:
+- Python function: nvap.preprocess.microglia_masking.mask_green_volume_with_microglia_bundle(volume)
+- Result: timed out (no output stack produced)
+
+Bundle runner attempts:
+- bundle_run_output (TimeoutSeconds=300): timed out, files=0, pipeline_status.txt missing
+- bundle_run_output_retry (TimeoutSeconds=180): timed out, files=0, pipeline_status.txt missing
+- bundle_run_output_clean (TimeoutSeconds=240): timed out, files=0, pipeline_status.txt missing
+
+Fiji control macro attempt:
+- fiji_control_test/smoke_macro.ijm executed with --headless --console -macro
+- Result: process remained running/hung, expected output file not created
+
+Current artifact directories to inspect:
+- C:\Users\giaco\Documents\NVAP\NVAP\manual_test_outputs\microglia_subfunction_test_20260228_230727\input_slices
+- C:\Users\giaco\Documents\NVAP\NVAP\manual_test_outputs\microglia_subfunction_test_20260228_230727\bundle_run_output
+- C:\Users\giaco\Documents\NVAP\NVAP\manual_test_outputs\microglia_subfunction_test_20260228_230727\bundle_run_output_retry
+- C:\Users\giaco\Documents\NVAP\NVAP\manual_test_outputs\microglia_subfunction_test_20260228_230727\bundle_run_output_clean
+- C:\Users\giaco\Documents\NVAP\NVAP\manual_test_outputs\microglia_subfunction_test_20260228_230727\fiji_control_test
+
+Conclusion:
+- In this environment, Fiji launches but hangs before macro writes any output/status files.
+- The masking subfunction is wired correctly at code level but cannot complete runtime execution due Fiji headless runtime hang.

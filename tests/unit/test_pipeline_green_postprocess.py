@@ -22,7 +22,17 @@ def _make_dataset() -> DatasetVolume:
     )
 
 
-def test_apply_psf_uses_green_postprocess_when_configured() -> None:
+def test_apply_psf_keeps_green_unchanged_when_postprocess_is_disabled(monkeypatch) -> None:
+    call_count = {"count": 0}
+
+    def _fake_deconvolve(volume, spacing, config, cancel_event=None, progress_callback=None):
+        call_count["count"] += 1
+        if progress_callback is not None:
+            progress_callback(1, 1)
+        return np.asarray(volume, dtype=np.float32) + np.float32(0.01)
+
+    monkeypatch.setattr("nvap.pipeline.deconvolve_volume", _fake_deconvolve)
+
     dataset = _make_dataset()
     psf_cfg = PSFConfig(enabled=True, iterations=1)
 
@@ -37,5 +47,7 @@ def test_apply_psf_uses_green_postprocess_when_configured() -> None:
     )
 
     green_delta = float(np.mean(np.abs(out_post.green.data - out_no_post.green.data)))
-    assert green_delta > 1.0e-5
-    assert np.allclose(out_post.red.data, out_no_post.red.data)
+    assert green_delta == 0.0
+    assert np.allclose(out_post.green.data, dataset.green.data, atol=0.0)
+    assert np.allclose(out_post.red.data, out_no_post.red.data, atol=0.0)
+    assert call_count["count"] == 2

@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 CACHE_VERSION = 4
 CACHE_DIRNAME = ".nvap_cache"
+_SUPPORTED_IMAGE_EXTENSIONS = {".png", ".tif", ".tiff"}
 
 
 def cache_dir(base_dir: str | Path | None = None) -> Path:
@@ -53,8 +54,23 @@ def clear_processed_cache(base_dir: str | Path | None = None) -> tuple[int, Path
     return removed, target
 
 
-def _directory_signature(channel_dir: Path) -> str:
-    files = sorted(channel_dir.glob("*.png"), key=lambda p: p.name.lower())
+def _source_signature(channel_source: Path) -> str:
+    if channel_source.is_file():
+        stat = channel_source.stat()
+        h = sha256()
+        h.update(channel_source.name.encode("utf-8", errors="ignore"))
+        h.update(str(stat.st_size).encode("ascii"))
+        h.update(str(stat.st_mtime_ns).encode("ascii"))
+        return h.hexdigest()
+
+    files = sorted(
+        (
+            p
+            for p in channel_source.iterdir()
+            if p.is_file() and p.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS
+        ),
+        key=lambda p: p.name.lower(),
+    )
     h = sha256()
     for file_path in files:
         stat = file_path.stat()
@@ -72,7 +88,7 @@ def build_dataset_signature(channel_dirs: dict[str, Path]) -> str:
         channel_dir = channel_dirs[channel_name].resolve()
         h.update(channel_name.encode("ascii"))
         h.update(str(channel_dir).encode("utf-8", errors="ignore"))
-        h.update(_directory_signature(channel_dir).encode("ascii"))
+        h.update(_source_signature(channel_dir).encode("ascii"))
     return h.hexdigest()
 
 

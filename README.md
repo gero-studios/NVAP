@@ -19,20 +19,23 @@ Default voxel spacing is interpreted in micrometers:
 
 Default auto-detection expects either:
 
-- `Input/Segmented/Green/*.png`
-- `Input/Segmented/Red/*.png`
+- `Input/Segmented/Green/*.(png|tif|tiff)`
+- `Input/Segmented/Red/*.(png|tif|tiff)`
 
 or a selected root containing `Segmented/Green` and `Segmented/Red`.
 
-NVAP also supports a single user-selected folder of RGB PNG slices when:
+NVAP also supports a single user-selected folder of RGB PNG/TIFF slices when:
 
 - filenames include `_z###` (for example `sample_z030.png`), and
 - slice pixels are red/green-only (black background allowed; blue or mixed red+green pixels are ignored).
 
-Filenames should include z-index and channel marker, for example:
+Each `Green` or `Red` folder can also contain a single stack file (for example `green_stack.tif`, `red_stack.tif`)
+with all z-slices in one TIFF.
 
-- `..._z030c1.png` (green)
-- `..._z030c2.png` (red)
+Filenames should include z-index and channel marker for slice-per-file layouts, for example:
+
+- `..._z030c1.png` / `..._z030c1.tif` (green)
+- `..._z030c2.png` / `..._z030c2.tif` (red)
 
 ## Run from source
 
@@ -95,15 +98,17 @@ python -m pytest
 ## How to load dataset in NVAP
 
 1. Click `Load Dataset`.
-2. Choose a root folder that contains either:
-- `Segmented/Green` and `Segmented/Red`, or
-- `Input/Segmented/Green` and `Input/Segmented/Red`.
-  You can also choose a single folder of RGB `_z###.png` slices that use only red/green pixels.
-3. If auto-detection fails, NVAP prompts you to select Green and Red folders manually.
+2. Select channels in this order when prompted:
+- Vasculature (Red)
+- Microglia (Green)
+  For each channel, choose either:
+  - a single stack file (`.tif/.tiff/.png`), or
+  - an image-sequence folder (`.png/.tif/.tiff` slices).
+3. NVAP loads those selected sources directly (no root auto-detection step in UI).
 4. Wait for loading dialogs to complete:
 - channel stack load
 - missing z-slice interpolation
-- pixel2voxel_no_psf processing
+- MicrogliaMaskIsolate masking + processing
 - initial render + metrics
   During this step, NVAP shows `Elapsed` and estimated `ETA`.
 5. Use threshold/opacity/isosurface controls in the left panel.
@@ -112,7 +117,7 @@ python -m pytest
 ### Simplified controls
 
 - NVAP now starts in a simple mode by default.
-- Toggle `Show advanced controls` only when you need denoise expert settings.
+- Toggle `Show advanced controls` only when you need masking/preprocess expert settings.
 - Core workflow in simple mode: `Load Dataset` -> adjust thresholds -> export.
 
 ### Individual microglia viewer
@@ -124,7 +129,7 @@ python -m pytest
 
 ### Processing note
 
-- NVAP now runs a single denoise mode: `pixel2voxel_no_psf`.
+- NVAP now runs a single green masking mode: `microglia_masking`.
 - PSF deconvolution controls are removed from normal workflow.
 - Dataset processing runs in background threads with elapsed-time and ETA dialogs.
 
@@ -134,11 +139,12 @@ NVAP now applies a preprocessing chain before visualization:
 
 - Flat-field/background correction
 - Per-slice contrast normalization
-- Branch-preserving pixel-to-voxel denoise (stronger on green channel)
+- Green channel masking using the bundled MicrogliaMaskIsolate pipeline
+- Existing preprocessing path for red vasculature
 
-Green channel denoising uses only:
+Green channel processing uses only:
 
-- `pixel2voxel_no_psf` (single default mode)
+- `microglia_masking` (single default mode)
 
 In advanced controls, you can tune noise strength, noise multiplier, branch protection, and speckle attenuation.
 
@@ -171,11 +177,10 @@ Script alternative:
 python scripts/benchmark_green_denoise.py --input Input --output report.json
 ```
 
-### Green denoise cookbook
+### Green masking notes
 
-- Default workflow: `pixel2voxel_no_psf` with unchanged defaults.
-- Faint branches, noisy stack: increase `Branch protect` to `0.75-0.85` and keep `Noise multiplier` around `1.9-2.3`.
-- Speckle-heavy output: lower `Speckle attenuation` and slightly increase `Noise strength`.
+- Default workflow: `microglia_masking` with bundled Fiji runtime.
+- Green denoise controls are no longer used in this mode.
 
 ### Auto-save cache
 

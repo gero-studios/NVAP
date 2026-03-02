@@ -551,6 +551,15 @@ def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> Chan
             spacing=channel.spacing,
         )
 
+    if channel.name == "green":
+        logger.info("Preprocess[green] passthrough enabled; returning input unchanged.")
+        return ChannelVolume(
+            name=channel.name,
+            data=np.asarray(channel.data, dtype=np.float32).copy(),
+            z_indices=list(channel.z_indices),
+            spacing=channel.spacing,
+        )
+
     denoise_strength = float(config.denoise_strength)
     if channel.name == "green":
         denoise_strength *= float(max(config.green_denoise_multiplier, 0.1))
@@ -704,61 +713,8 @@ def postprocess_green_after_deconvolution(
     dataset: DatasetVolume,
     config: PreprocessConfig,
 ) -> DatasetVolume:
-    if not config.enabled or float(config.green_post_deconv_strength) <= 0.0:
-        return dataset
-
-    t0 = time.perf_counter()
-    green = dataset.green
-    green_data = np.clip(np.asarray(green.data, dtype=np.float32), 0.0, 1.0)
-    legacy_green = config.green_denoise_strategy == "legacy_anisotropic"
-    if legacy_green:
-        branch_map = np.zeros((1, 1, 1), dtype=np.float32)
-        logger.info("Post-deconvolution green stage=branch_map skipped (legacy_anisotropic)")
-    else:
-        branch_map = stage_branch_map_estimation(green_data, config, "green")
-    strength = (
-        float(config.denoise_strength)
-        * float(max(config.green_denoise_multiplier, 0.1))
-        * float(max(config.green_post_deconv_strength, 0.0))
-    )
-    if legacy_green:
-        strength *= 0.72
-    if config.green_denoise_strategy == "classical_branch_aware":
-        strength = max(strength, 0.014)
-    denoised, backend = stage_denoise_main(
-        green_data,
-        "green",
-        config=config,
-        denoise_strength=strength,
-        branch_map=branch_map,
-    )
-    logger.info("Post-deconvolution green denoise backend=%s strength=%.5f", backend, strength)
-    if legacy_green:
-        denoised = stage_restore_branches_near_bright_pixels(green_data, denoised)
-        denoised = stage_legacy_light_speckle_control(denoised)
-        logger.info("Post-deconvolution green speckle mode=legacy_light")
-    else:
-        if config.preserve_branches:
-            denoised = _apply_green_branch_preservation(
-                green_data,
-                denoised,
-                branch_map,
-                config,
-                mode="pre_speckle",
-            )
-        denoised = stage_speckle_control(denoised, branch_map, config, "green")
-    logger.info(
-        "Post-deconvolution green cleanup complete dt=%.2fs shape=%s",
-        time.perf_counter() - t0,
-        denoised.shape,
-    )
-    out_green = ChannelVolume(
-        name="green",
-        data=np.asarray(denoised, dtype=np.float32),
-        z_indices=list(green.z_indices),
-        spacing=green.spacing,
-    )
-    return DatasetVolume(green=out_green, red=dataset.red, shared_z_range=dataset.shared_z_range)
+    logger.info("Post-deconvolution green cleanup disabled; using green input unchanged.")
+    return dataset
 
 
 def suggest_green_threshold(volume: np.ndarray, fallback: float = 0.15) -> float:

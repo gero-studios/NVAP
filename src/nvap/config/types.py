@@ -65,6 +65,7 @@ class PreprocessConfig:
     green_denoise_multiplier: float = 1.9
     preserve_branches: bool = True
     green_denoise_strategy: Literal[
+        "microglia_masking",
         "hybrid_auto",
         "classical_branch_aware",
         "pixel2voxel_no_psf",

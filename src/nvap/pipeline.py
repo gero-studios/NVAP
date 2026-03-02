@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
 import logging
 import os
 import threading
@@ -22,6 +21,10 @@ from nvap.preprocess.psf import deconvolve_volume
 from nvap.preprocess.resample import prepare_mesh_dataset
 
 logger = logging.getLogger(__name__)
+
+
+def _green_bypasses_psf(_preprocess_config: PreprocessConfig | None) -> bool:
+    return True
 
 
 def _resolve_psf_channel_workers() -> int:
@@ -71,13 +74,9 @@ def apply_psf_to_dataset(
     t0 = time.perf_counter()
     channel_workers = _resolve_psf_channel_workers()
     effective_config = config
-    if (
-        preprocess_config is not None
-        and preprocess_config.green_denoise_strategy == "pixel2voxel_no_psf"
-        and (config.enabled or config.iterations > 0)
-    ):
-        logger.info("PSF bypass enabled by preprocess strategy=pixel2voxel_no_psf.")
-        effective_config = replace(config, enabled=False, iterations=0)
+    green_passthrough = _green_bypasses_psf(preprocess_config)
+    if green_passthrough:
+        logger.info("Green pass-through enabled: skipping PSF deconvolution for green channel.")
 
     progress_seen: dict[str, int] = {"green": 0, "red": 0}
     progress_lock = threading.Lock()
@@ -105,6 +104,9 @@ def apply_psf_to_dataset(
 
     def _run_channel(channel_name: str, channel: ChannelVolume) -> tuple[str, np.ndarray, float]:
         t = time.perf_counter()
+        if channel_name == "green" and green_passthrough:
+            logger.info("PSF channel skipped: %s passthrough", channel_name)
+            return channel_name, np.asarray(channel.data, dtype=np.float32).copy(), (time.perf_counter() - t)
         logger.info("PSF channel start: %s shape=%s", channel_name, channel.data.shape)
         data = deconvolve_volume(
             channel.data,
@@ -153,6 +155,7 @@ def apply_psf_to_dataset(
         preprocess_config is not None
         and bool(effective_config.enabled)
         and int(effective_config.iterations) > 0
+        and not green_passthrough
     ):
         out = postprocess_green_after_deconvolution(out, preprocess_config)
     logger.info("PSF pipeline complete total_dt=%.2fs", time.perf_counter() - t0)

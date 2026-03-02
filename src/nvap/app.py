@@ -37,11 +37,11 @@ def run_headless_smoke(input_path: str | Path) -> int:
     dataset = load_dataset(source, spacing=DEFAULT_SPACING)
     dataset = fill_and_sync_dataset(dataset)
 
-    # Preprocess with branch-preserving denoising
+    # Green is pass-through; only non-green preprocessing paths remain active.
     preprocess_cfg = PreprocessConfig(enabled=True)
     dataset = preprocess_dataset(dataset, preprocess_cfg)
 
-    # Final processing stage (PSF explicitly disabled in pixel2voxel_no_psf mode)
+    # Final processing stage
     processed = apply_psf_to_dataset(dataset, PSFConfig(enabled=False, iterations=0), preprocess_config=preprocess_cfg)
 
     render = RenderConfig(
@@ -64,7 +64,7 @@ def run_headless_smoke(input_path: str | Path) -> int:
 
 
 def run_mesh_export(input_path: str | Path, output_dir: str | Path, fmt: str = "ply") -> int:
-    """Full headless pipeline: load -> denoise -> process -> mesh export."""
+    """Full headless pipeline: load -> preprocess -> process -> mesh export."""
     source = Path(input_path).resolve()
     out = Path(output_dir).resolve()
     logger.info("Mesh export pipeline: input=%s output=%s format=%s", source, out, fmt)
@@ -76,7 +76,7 @@ def run_mesh_export(input_path: str | Path, output_dir: str | Path, fmt: str = "
     preprocess_cfg = PreprocessConfig(enabled=True)
     dataset = preprocess_dataset(dataset, preprocess_cfg)
 
-    # Final processing stage (PSF explicitly disabled in pixel2voxel_no_psf mode)
+    # Final processing stage
     processed = apply_psf_to_dataset(dataset, PSFConfig(enabled=False, iterations=0), preprocess_config=preprocess_cfg)
 
     # Prepare for mesh

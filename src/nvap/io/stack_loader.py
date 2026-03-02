@@ -12,8 +12,15 @@ from nvap.config.types import DEFAULT_SPACING, ChannelVolume, DatasetVolume, Vox
 
 logger = logging.getLogger(__name__)
 
-FILE_PATTERN = re.compile(r"_z(?P<z>\d+)(?P<channel>c[12])\.png$", re.IGNORECASE)
-COMBINED_FILE_PATTERN = re.compile(r"_z(?P<z>\d+)(?:c[12])?\.png$", re.IGNORECASE)
+SUPPORTED_IMAGE_EXTENSIONS = (".png", ".tif", ".tiff")
+FILE_PATTERN = re.compile(
+    r"_z(?P<z>\d+)(?P<channel>c[12])(?:\.png|\.tif|\.tiff)$",
+    re.IGNORECASE,
+)
+COMBINED_FILE_PATTERN = re.compile(
+    r"_z(?P<z>\d+)(?:c[12])?(?:\.png|\.tif|\.tiff)$",
+    re.IGNORECASE,
+)
 CHANNEL_DIR = {"green": "Green", "red": "Red"}
 CHANNEL_ID = {"green": "c1", "red": "c2"}
 CHANNEL_RGB_INDEX = {"green": 1, "red": 0}
@@ -72,7 +79,7 @@ def _candidate_segmented_roots(input_root: Path) -> list[Path]:
 
 def _find_channel_dir(segmented_root: Path, channel_name: str) -> Path | None:
     target = CHANNEL_DIR[channel_name].lower()
-    if not segmented_root.exists():
+    if not segmented_root.exists() or not segmented_root.is_dir():
         return None
     for child in segmented_root.iterdir():
         if child.is_dir() and child.name.lower() == target:
@@ -101,6 +108,22 @@ def _extract_and_normalize_plane(image: np.ndarray, channel_name: str) -> np.nda
     return np.clip(normalized, 0.0, 1.0)
 
 
+def _iter_image_files(channel_source: Path) -> list[Path]:
+    if channel_source.is_file():
+        if channel_source.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+            return [channel_source]
+        return []
+    if not channel_source.exists() or not channel_source.is_dir():
+        return []
+    files = [
+        p
+        for p in channel_source.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    ]
+    files.sort(key=lambda p: p.name.lower())
+    return files
+
+
 def _is_red_green_only_image(image: np.ndarray) -> bool:
     if image.ndim != 3 or image.shape[-1] < 3:
         return False
@@ -118,9 +141,21 @@ def _is_red_green_only_image(image: np.ndarray) -> bool:
     return not bool(np.any(blue | (red & green)))
 
 
-def _list_combined_rg_files(channel_dir: Path) -> list[tuple[int, Path]]:
+def _is_red_green_only_stack(image: np.ndarray) -> bool:
+    arr = np.asarray(image)
+    if arr.ndim == 3 and arr.shape[-1] >= 3:
+        return _is_red_green_only_image(arr)
+    if arr.ndim == 4 and arr.shape[-1] >= 3:
+        for idx in range(arr.shape[0]):
+            if not _is_red_green_only_image(arr[idx]):
+                return False
+        return True
+    return False
+
+
+def _list_combined_rg_files(channel_source: Path) -> list[tuple[int, Path]]:
     pairs: list[tuple[int, Path]] = []
-    for file_path in channel_dir.glob("*.png"):
+    for file_path in _iter_image_files(channel_source):
         match = COMBINED_FILE_PATTERN.search(file_path.name)
         if not match:
             continue
@@ -133,10 +168,10 @@ def _list_combined_rg_files(channel_dir: Path) -> list[tuple[int, Path]]:
     return pairs
 
 
-def _list_channel_files(channel_dir: Path, channel_name: str) -> list[tuple[int, Path]]:
+def _list_channel_files(channel_source: Path, channel_name: str) -> list[tuple[int, Path]]:
     pairs: list[tuple[int, Path]] = []
     expected_channel = CHANNEL_ID[channel_name]
-    for file_path in channel_dir.glob("*.png"):
+    for file_path in _iter_image_files(channel_source):
         match = FILE_PATTERN.search(file_path.name)
         if not match:
             continue
@@ -149,31 +184,94 @@ def _list_channel_files(channel_dir: Path, channel_name: str) -> list[tuple[int,
     if pairs:
         return pairs
 
-    pairs = _list_combined_rg_files(channel_dir)
+    pairs = _list_combined_rg_files(channel_source)
     if not pairs:
         raise FileNotFoundError(
-            f"No channel files found for '{channel_name}' in {channel_dir}."
+            f"No channel files found for '{channel_name}' in {channel_source}."
         )
     logger.info(
         "Using combined red/green RGB slices for channel '%s' from %s (count=%d).",
         channel_name,
-        channel_dir,
+        channel_source,
         len(pairs),
     )
     return pairs
 
 
-def _load_channel(
-    channel_name: str, channel_dir: Path, spacing: VoxelSpacing
-) -> ChannelVolume:
-    logger.debug("Loading channel '%s' from %s", channel_name, channel_dir)
-    z_and_files = _list_channel_files(channel_dir, channel_name)
-    z_indices = [z for z, _ in z_and_files]
-    slices = []
-    for _, file_path in z_and_files:
-        img = iio.imread(file_path)
-        slices.append(_extract_and_normalize_plane(img, channel_name))
+def _load_volume_from_stack_file(stack_path: Path, channel_name: str) -> tuple[list[int], np.ndarray]:
+    image = iio.imread(stack_path)
+    arr = np.asarray(image)
+
+    if arr.ndim == 2:
+        planes = arr[np.newaxis, ...]
+    elif arr.ndim == 3:
+        # Either grayscale stack (z, y, x) or single RGB plane (y, x, c).
+        if arr.shape[-1] in (3, 4):
+            planes = arr[np.newaxis, ...]
+        else:
+            planes = arr
+    elif arr.ndim == 4 and arr.shape[-1] in (3, 4):
+        # RGB/RGBA stack (z, y, x, c)
+        planes = arr
+    else:
+        raise ValueError(f"Unsupported stack dimensions: {arr.shape}")
+
+    slices: list[np.ndarray] = []
+    for idx in range(int(planes.shape[0])):
+        slices.append(_extract_and_normalize_plane(np.asarray(planes[idx]), channel_name))
     volume = np.stack(slices, axis=0).astype(np.float32, copy=False)
+    z_indices = list(range(1, int(volume.shape[0]) + 1))
+    return z_indices, volume
+
+
+def _load_channel_from_single_stack(channel_name: str, channel_source: Path) -> ChannelVolume:
+    image_files = _iter_image_files(channel_source)
+    if not image_files:
+        raise FileNotFoundError(f"No image files found in {channel_source}.")
+    if len(image_files) != 1:
+        raise FileNotFoundError(
+            f"No z-indexed files found for '{channel_name}' in {channel_source}, and "
+            f"cannot infer a single stack from {len(image_files)} image files."
+        )
+
+    stack_path = image_files[0]
+    z_indices, volume = _load_volume_from_stack_file(stack_path, channel_name)
+    logger.info(
+        "Loaded channel '%s' from stack file: %s slices=%d shape=%s",
+        channel_name,
+        stack_path,
+        len(z_indices),
+        volume.shape,
+    )
+    return ChannelVolume(
+        name=channel_name,
+        data=volume,
+        z_indices=z_indices,
+        spacing=DEFAULT_SPACING,
+    )
+
+
+def _load_channel(
+    channel_name: str, channel_source: Path, spacing: VoxelSpacing
+) -> ChannelVolume:
+    logger.debug("Loading channel '%s' from %s", channel_name, channel_source)
+    try:
+        z_and_files = _list_channel_files(channel_source, channel_name)
+        z_indices = [z for z, _ in z_and_files]
+        slices = []
+        for _, file_path in z_and_files:
+            img = iio.imread(file_path)
+            slices.append(_extract_and_normalize_plane(img, channel_name))
+        volume = np.stack(slices, axis=0).astype(np.float32, copy=False)
+    except FileNotFoundError:
+        stack_channel = _load_channel_from_single_stack(channel_name, channel_source)
+        return ChannelVolume(
+            name=channel_name,
+            data=stack_channel.data,
+            z_indices=list(stack_channel.z_indices),
+            spacing=spacing,
+        )
+
     logger.info(
         "Loaded channel '%s': slices=%d, shape=%s, z_range=(%d,%d)",
         channel_name,
@@ -200,32 +298,46 @@ def _shared_z_range(green: ChannelVolume, red: ChannelVolume) -> tuple[int, int]
     return shared_min, shared_max
 
 
-def _channel_stack_stats(channel_name: str, channel_dir: Path) -> ChannelStackStats:
-    z_and_files = _list_channel_files(channel_dir, channel_name)
-    z_values = [z for z, _ in z_and_files]
-    z_min = min(z_values)
-    z_max = max(z_values)
-    full_slice_count = z_max - z_min + 1
-    missing_count = full_slice_count - len(z_values)
+def _channel_stack_stats(channel_name: str, channel_source: Path) -> ChannelStackStats:
+    try:
+        z_and_files = _list_channel_files(channel_source, channel_name)
+        z_values = [z for z, _ in z_and_files]
+        z_min = min(z_values)
+        z_max = max(z_values)
+        full_slice_count = z_max - z_min + 1
+        missing_count = full_slice_count - len(z_values)
 
-    first_image = iio.imread(z_and_files[0][1])
-    if first_image.ndim == 2:
-        height, width = first_image.shape
-    elif first_image.ndim == 3:
-        height, width = first_image.shape[0], first_image.shape[1]
-    else:
-        raise ValueError(f"Unsupported image dimensions for stats: {first_image.shape}")
+        first_image = iio.imread(z_and_files[0][1])
+        if first_image.ndim == 2:
+            height, width = first_image.shape
+        elif first_image.ndim == 3:
+            height, width = first_image.shape[0], first_image.shape[1]
+        else:
+            raise ValueError(f"Unsupported image dimensions for stats: {first_image.shape}")
 
-    return ChannelStackStats(
-        name=channel_name,
-        slice_count=len(z_values),
-        z_min=z_min,
-        z_max=z_max,
-        full_slice_count=full_slice_count,
-        missing_count=missing_count,
-        width=int(width),
-        height=int(height),
-    )
+        return ChannelStackStats(
+            name=channel_name,
+            slice_count=len(z_values),
+            z_min=z_min,
+            z_max=z_max,
+            full_slice_count=full_slice_count,
+            missing_count=missing_count,
+            width=int(width),
+            height=int(height),
+        )
+    except FileNotFoundError:
+        stack_channel = _load_channel_from_single_stack(channel_name, channel_source)
+        depth, height, width = stack_channel.data.shape
+        return ChannelStackStats(
+            name=channel_name,
+            slice_count=int(depth),
+            z_min=int(min(stack_channel.z_indices)),
+            z_max=int(max(stack_channel.z_indices)),
+            full_slice_count=int(depth),
+            missing_count=0,
+            width=int(width),
+            height=int(height),
+        )
 
 
 def load_dataset(
@@ -250,6 +362,12 @@ def resolve_channel_dirs(
 ) -> dict[str, Path]:
     root = Path(input_root).resolve()
     channel_dirs: dict[str, Path] = {}
+
+    if root.is_file() and root.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+        channel_dirs["green"] = root
+        channel_dirs["red"] = root
+        logger.info("Using single stack source for both channels: %s", root)
+        return channel_dirs
 
     if channel_overrides:
         logger.info("Using manual channel overrides.")
@@ -278,19 +396,35 @@ def resolve_channel_dirs(
             if not candidate.exists() or not candidate.is_dir():
                 continue
             combined_files = _list_combined_rg_files(candidate)
-            if not combined_files:
-                continue
-            channel_dirs["green"] = candidate
-            channel_dirs["red"] = candidate
-            logger.info(
-                "Auto-detected combined red/green RGB dataset under: %s (slices=%d)",
-                candidate,
-                len(combined_files),
-            )
-            return channel_dirs
+            if combined_files:
+                channel_dirs["green"] = candidate
+                channel_dirs["red"] = candidate
+                logger.info(
+                    "Auto-detected combined red/green RGB dataset under: %s (slices=%d)",
+                    candidate,
+                    len(combined_files),
+                )
+                return channel_dirs
+            # Also allow a single combined RGB stack TIFF/PNG file.
+            image_files = _iter_image_files(candidate)
+            if len(image_files) == 1:
+                try:
+                    img = iio.imread(image_files[0])
+                except Exception:
+                    img = None
+                if img is not None and _is_red_green_only_stack(np.asarray(img)):
+                    channel_dirs["green"] = candidate
+                    channel_dirs["red"] = candidate
+                    logger.info(
+                        "Auto-detected combined red/green stack under: %s (file=%s)",
+                        candidate,
+                        image_files[0].name,
+                    )
+                    return channel_dirs
         raise FileNotFoundError(
             f"Could not auto-detect channel folders or combined red/green RGB slices under: {root}. "
-            "Expected Green and Red directories in a Segmented folder, or RGB PNG slices with only red/green pixels."
+            "Expected Green and Red directories in a Segmented folder, RGB PNG/TIFF slices, "
+            "or a single RGB PNG/TIFF stack with red/green-only pixels."
         )
     green_dir = _find_channel_dir(selected_root, "green")
     red_dir = _find_channel_dir(selected_root, "red")

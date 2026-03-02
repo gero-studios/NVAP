@@ -28,6 +28,7 @@ src/nvap/plugins/registry.py
 src/nvap/preprocess/__init__.py
 src/nvap/preprocess/denoisers.py
 src/nvap/preprocess/enhancement.py
+src/nvap/preprocess/microglia_masking.py
 src/nvap/preprocess/missing_slices.py
 src/nvap/preprocess/psf.py
 src/nvap/preprocess/resample.py

@@ -58,6 +58,10 @@ from nvap.ui.control_panel import ControlPanel
 logger = logging.getLogger(__name__)
 
 
+def _green_no_psf_mode(_config: PreprocessConfig) -> bool:
+    return True
+
+
 @dataclass
 class _LoadTaskResult:
     synced_dataset: DatasetVolume
@@ -173,7 +177,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_plugin_panel()
         self.statusBar().showMessage("Load a dataset to begin. Preprocessing is ON by default.")
-        self._log_info("NVAP UI initialized: pixel2voxel_no_psf mode active.")
+        self._log_info("NVAP UI initialized: green pass-through mode active.")
 
     def closeEvent(self, event) -> None:
         if self._active_thread is not None and self._active_thread.isRunning():
@@ -420,11 +424,7 @@ class MainWindow(QMainWindow):
                 total_voxels * 2.1e-7 if preprocess_cfg.enabled else 0.0
             )
             psf_seconds = 0.0
-            if (
-                preprocess_cfg.green_denoise_strategy != "pixel2voxel_no_psf"
-                and psf_cfg.enabled
-                and psf_cfg.iterations > 0
-            ):
+            if (not _green_no_psf_mode(preprocess_cfg)) and psf_cfg.enabled and psf_cfg.iterations > 0:
                 psf_seconds = total_voxels * psf_cfg.iterations * 1.2e-7
         threshold_seconds = total_voxels * 5.0e-8
         resample_seconds = (
@@ -458,11 +458,7 @@ class MainWindow(QMainWindow):
         preprocess_cfg: PreprocessConfig,
         dataset_signature: str | None = None,
     ) -> float | None:
-        if (
-            preprocess_cfg.green_denoise_strategy == "pixel2voxel_no_psf"
-            or not psf_cfg.enabled
-            or psf_cfg.iterations <= 0
-        ):
+        if _green_no_psf_mode(preprocess_cfg) or not psf_cfg.enabled or psf_cfg.iterations <= 0:
             total_voxels = int(dataset.green.data.size + dataset.red.data.size)
             preprocess_seconds = total_voxels * 1.8e-7
             threshold_seconds = total_voxels * 5.0e-8
@@ -471,7 +467,7 @@ class MainWindow(QMainWindow):
             total = max(8.0, total)
             self._log_info(
                 "Estimated reprocess ETA="
-                f"{total:.1f}s (scale={self._eta_scale_psf:.2f}, mode=pixel2voxel_no_psf)"
+                f"{total:.1f}s (scale={self._eta_scale_psf:.2f}, mode={preprocess_cfg.green_denoise_strategy})"
             )
             return total
         cache_hit = False
@@ -739,40 +735,77 @@ class MainWindow(QMainWindow):
         self._log_info(f"Discovered {len(plugins)} plugin descriptor(s).")
         self.controls.set_plugin_text("\n".join(lines))
 
+    def _prompt_channel_source(self, channel_label: str, start_dir: Path) -> str | None:
+        chooser = QMessageBox(self)
+        chooser.setWindowTitle("Select Channel Source Type")
+        chooser.setText(f"Choose source type for {channel_label}.")
+        chooser.setInformativeText(
+            "Use a single TIFF/PNG stack file, or a folder of sequenced images."
+        )
+        file_btn = chooser.addButton("Single Stack File", QMessageBox.ButtonRole.AcceptRole)
+        folder_btn = chooser.addButton("Image Sequence Folder", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = chooser.addButton(QMessageBox.StandardButton.Cancel)
+        chooser.exec()
+
+        clicked = chooser.clickedButton()
+        if clicked is None or clicked == cancel_btn:
+            return None
+        if clicked == file_btn:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                f"Select {channel_label} Stack File",
+                str(start_dir),
+                "Image files (*.tif *.tiff *.png);;All files (*.*)",
+            )
+            return file_path or None
+
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            f"Select {channel_label} Image Sequence Folder",
+            str(start_dir),
+        )
+        return folder_path or None
+
+    def _prompt_channel_sources_in_order(self, start_dir: Path) -> dict[str, str] | None:
+        QMessageBox.information(
+            self,
+            "Select Image Sequences",
+            (
+                "Select channels in this order:\n\n"
+                "1. Vasculature (Red)\n"
+                "2. Microglia (Green)\n\n"
+                "Each channel can be either:\n"
+                "- a single TIFF/PNG stack file, or\n"
+                "- a folder of sequenced images."
+            ),
+        )
+
+        red_source = self._prompt_channel_source("Vasculature (Red)", start_dir)
+        if not red_source:
+            return None
+
+        red_path = Path(red_source).resolve()
+        green_start = red_path.parent if red_path.is_file() else red_path
+        green_source = self._prompt_channel_source("Microglia (Green)", green_start)
+        if not green_source:
+            return None
+
+        return {"red": red_source, "green": green_source}
+
     def _on_load_requested(self) -> None:
         base = self.dataset_root or (Path.cwd() / "Input")
-        selected = QFileDialog.getExistingDirectory(
-            self,
-            "Select Dataset Root",
-            str(base),
-        )
-        if not selected:
+        channel_overrides = self._prompt_channel_sources_in_order(base)
+        if channel_overrides is None:
             return
-        self.dataset_root = Path(selected)
-        self._log_info(f"Dataset root selected: {self.dataset_root}")
 
-        channel_overrides: dict[str, str | Path] | None = None
         channel_dirs: dict[str, Path]
-        try:
-            channel_dirs = resolve_channel_dirs(self.dataset_root)
-        except FileNotFoundError:
-            self._log_info("Auto-detection failed; requesting manual channel mapping.")
-            QMessageBox.information(
-                self,
-                "Manual Channel Mapping",
-                (
-                    "Auto-detection failed.\n\n"
-                    "Select Green channel folder, then Red channel folder."
-                ),
-            )
-            green_dir = QFileDialog.getExistingDirectory(self, "Select Green Channel Folder", str(self.dataset_root))
-            if not green_dir:
-                return
-            red_dir = QFileDialog.getExistingDirectory(self, "Select Red Channel Folder", str(self.dataset_root))
-            if not red_dir:
-                return
-            channel_overrides = {"green": green_dir, "red": red_dir}
-            channel_dirs = resolve_channel_dirs(self.dataset_root, channel_overrides=channel_overrides)
+        first_red = Path(channel_overrides["red"]).resolve()
+        self.dataset_root = first_red.parent
+        self._log_info(
+            f"Channel sources selected: red={Path(channel_overrides['red']).resolve()} "
+            f"green={Path(channel_overrides['green']).resolve()}"
+        )
+        channel_dirs = resolve_channel_dirs(self.dataset_root, channel_overrides=channel_overrides)
 
         self._dataset_signature = build_dataset_signature(channel_dirs)
         self._log_debug(f"Dataset signature set: {self._dataset_signature}")
@@ -817,9 +850,9 @@ class MainWindow(QMainWindow):
         self._log_info("Load step 2/6: filling missing slices...")
         synced_dataset = fill_and_sync_dataset(dataset)
         self._log_info("Load step 2/6 complete.")
-        self._publish_busy_progress(percent=26.0, message="Preprocessing (denoise + branch preservation)...")
+        self._publish_busy_progress(percent=26.0, message="Preprocessing (green pass-through + red cleanup)...")
 
-        self._log_info("Load step 3/6: preprocessing (denoise + branch preservation)...")
+        self._log_info("Load step 3/6: preprocessing (green pass-through + red cleanup)...")
         self.preprocess_config = preprocess_cfg
         if preprocess_cfg.enabled:
             preprocessed_dataset = preprocess_dataset(synced_dataset, preprocess_cfg)
@@ -986,25 +1019,14 @@ class MainWindow(QMainWindow):
             self._log_debug("Attempting dataset auto-detection.")
             return load_dataset(root, spacing=self.spacing)
         except FileNotFoundError:
-            self._log_info("Auto-detection failed; requesting manual channel mapping.")
-            QMessageBox.information(
-                self,
-                "Manual Channel Mapping",
-                (
-                    "Auto-detection failed.\n\n"
-                    "Select Green channel folder, then Red channel folder."
-                ),
-            )
-            green_dir = QFileDialog.getExistingDirectory(self, "Select Green Channel Folder", str(root))
-            if not green_dir:
-                raise RuntimeError("Green channel directory selection canceled.")
-            red_dir = QFileDialog.getExistingDirectory(self, "Select Red Channel Folder", str(root))
-            if not red_dir:
-                raise RuntimeError("Red channel directory selection canceled.")
+            self._log_info("Auto-detection failed; requesting channel sources in explicit order.")
+            channel_overrides = self._prompt_channel_sources_in_order(root)
+            if channel_overrides is None:
+                raise RuntimeError("Channel source selection canceled.")
             return load_dataset(
                 root,
                 spacing=self.spacing,
-                channel_overrides={"green": green_dir, "red": red_dir},
+                channel_overrides=channel_overrides,
             )
 
     def _on_psf_config_changed(self, config: PSFConfig) -> None:
@@ -1019,10 +1041,10 @@ class MainWindow(QMainWindow):
         self._log_info("Preprocessing controls are disabled; configuration change ignored.")
 
     def _on_preview_green_denoise_requested(self) -> None:
-        self.statusBar().showMessage("Pixel no-PSF mode is always active.", 5000)
+        self.statusBar().showMessage("Green pass-through mode is always active.", 5000)
 
     def _on_apply_green_denoise_requested(self) -> None:
-        self.statusBar().showMessage("Use dataset load/reprocess to apply pixel no-PSF settings.", 5000)
+        self.statusBar().showMessage("Green denoise/masking is disabled in pass-through mode.", 5000)
 
     def _on_apply_psf_requested(self) -> None:
         if self.synced_dataset is None:
@@ -1041,7 +1063,7 @@ class MainWindow(QMainWindow):
             preprocess_cfg,
             dataset_signature=dataset_signature,
         )
-        no_psf_mode = preprocess_cfg.green_denoise_strategy == "pixel2voxel_no_psf"
+        no_psf_mode = _green_no_psf_mode(preprocess_cfg)
 
         def _reprocess_task():
             preprocessed = preprocess_dataset(synced_dataset, preprocess_cfg) if preprocess_cfg.enabled else synced_dataset
@@ -1057,7 +1079,7 @@ class MainWindow(QMainWindow):
         self._start_background_task(
             title="Reprocess Dataset",
             message=(
-                "Applying pixel2voxel_no_psf pipeline (PSF bypassed)..."
+                "Applying pass-through pipeline (green unchanged, red processed)..."
                 if no_psf_mode
                 else (
                     f"Running Richardson-Lucy (iterations={psf_cfg.iterations})...\n"
@@ -1078,7 +1100,7 @@ class MainWindow(QMainWindow):
     def _apply_psf_and_refresh(self, update_thresholds: bool) -> None:
         # Kept for compatibility with older code paths.
         assert self.synced_dataset is not None
-        self._set_busy_message("Applying pixel2voxel_no_psf processing...")
+        self._set_busy_message("Applying pass-through/processing pipeline...")
         psf_cfg = self._effective_psf_config(self.current_psf)
         preprocessed = preprocess_dataset(self.synced_dataset, self.preprocess_config) if self.preprocess_config.enabled else self.synced_dataset
         self.processed_dataset = apply_psf_to_dataset(
