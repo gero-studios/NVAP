@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 src/nvap/__init__.py
+src/nvap/accelerate.py
 src/nvap/app.py
 src/nvap/pipeline.py
 src/nvap.egg-info/PKG-INFO
@@ -13,6 +14,7 @@ src/nvap/analysis/__init__.py
 src/nvap/analysis/green_benchmark.py
 src/nvap/analysis/metrics.py
 src/nvap/analysis/microglia_components.py
+src/nvap/analysis/microglia_vessel_report.py
 src/nvap/cache/__init__.py
 src/nvap/cache/processed_cache.py
 src/nvap/config/__init__.py
@@ -37,3 +39,4 @@ src/nvap/render/vtk_scene.py
 src/nvap/ui/__init__.py
 src/nvap/ui/control_panel.py
 src/nvap/ui/main_window.py
+src/nvap/ui/theme.py

@@ -212,8 +212,10 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     from nvap.ui.main_window import MainWindow
+    from nvap.ui.theme import DARK_THEME_QSS
 
     app = QApplication([])
+    app.setStyleSheet(DARK_THEME_QSS)
     window = MainWindow()
     window.show()
     return app.exec()

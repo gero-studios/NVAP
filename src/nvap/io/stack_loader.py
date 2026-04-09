@@ -24,6 +24,10 @@ COMBINED_FILE_PATTERN = re.compile(
 CHANNEL_DIR = {"green": "Green", "red": "Red"}
 CHANNEL_ID = {"green": "c1", "red": "c2"}
 CHANNEL_RGB_INDEX = {"green": 1, "red": 0}
+_COMBINED_RG_CACHE_MAX = 8
+_combined_rg_cache: dict[tuple[str, tuple[int, int, str, str]], list[tuple[int, Path]]] = {}
+_COMBINED_RG_PRESENT_CACHE_MAX = 16
+_combined_rg_present_cache: dict[tuple[str, tuple[int, int, str, str]], bool] = {}
 
 
 @dataclass(frozen=True)
@@ -124,6 +128,31 @@ def _iter_image_files(channel_source: Path) -> list[Path]:
     return files
 
 
+def _image_file_signature(files: list[Path]) -> tuple[int, int, str, str]:
+    if not files:
+        return (0, 0, "", "")
+    newest_mtime_ns = 0
+    for path in files:
+        try:
+            newest_mtime_ns = max(newest_mtime_ns, int(path.stat().st_mtime_ns))
+        except OSError:
+            continue
+    return (
+        int(len(files)),
+        int(newest_mtime_ns),
+        files[0].name.lower(),
+        files[-1].name.lower(),
+    )
+
+
+def _combined_cache_key(channel_source: Path, files: list[Path]) -> tuple[str, tuple[int, int, str, str]]:
+    try:
+        source_key = str(channel_source.resolve())
+    except OSError:
+        source_key = str(channel_source)
+    return (source_key, _image_file_signature(files))
+
+
 def _is_red_green_only_image(image: np.ndarray) -> bool:
     if image.ndim != 3 or image.shape[-1] < 3:
         return False
@@ -154,8 +183,17 @@ def _is_red_green_only_stack(image: np.ndarray) -> bool:
 
 
 def _list_combined_rg_files(channel_source: Path) -> list[tuple[int, Path]]:
+    files = _iter_image_files(channel_source)
+    if not files:
+        return []
+
+    cache_key = _combined_cache_key(channel_source, files)
+    cached = _combined_rg_cache.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     pairs: list[tuple[int, Path]] = []
-    for file_path in _iter_image_files(channel_source):
+    for file_path in files:
         match = COMBINED_FILE_PATTERN.search(file_path.name)
         if not match:
             continue
@@ -165,7 +203,46 @@ def _list_combined_rg_files(channel_source: Path) -> list[tuple[int, Path]]:
         z_index = int(match.group("z"))
         pairs.append((z_index, file_path))
     pairs.sort(key=lambda item: item[0])
+
+    if len(_combined_rg_cache) >= _COMBINED_RG_CACHE_MAX:
+        _combined_rg_cache.clear()
+    _combined_rg_cache[cache_key] = list(pairs)
+    if len(_combined_rg_present_cache) >= _COMBINED_RG_PRESENT_CACHE_MAX:
+        _combined_rg_present_cache.clear()
+    _combined_rg_present_cache[cache_key] = bool(pairs)
+
     return pairs
+
+
+def _has_combined_rg_files(channel_source: Path) -> bool:
+    files = _iter_image_files(channel_source)
+    if not files:
+        return False
+    cache_key = _combined_cache_key(channel_source, files)
+    cached_pairs = _combined_rg_cache.get(cache_key)
+    if cached_pairs is not None:
+        return bool(cached_pairs)
+    cached_present = _combined_rg_present_cache.get(cache_key)
+    if cached_present is not None:
+        return bool(cached_present)
+
+    has_valid = False
+    for file_path in files:
+        match = COMBINED_FILE_PATTERN.search(file_path.name)
+        if not match:
+            continue
+        try:
+            image = iio.imread(file_path)
+        except Exception:
+            continue
+        if _is_red_green_only_image(image):
+            has_valid = True
+            break
+
+    if len(_combined_rg_present_cache) >= _COMBINED_RG_PRESENT_CACHE_MAX:
+        _combined_rg_present_cache.clear()
+    _combined_rg_present_cache[cache_key] = has_valid
+    return has_valid
 
 
 def _list_channel_files(channel_source: Path, channel_name: str) -> list[tuple[int, Path]]:
@@ -288,6 +365,101 @@ def _load_channel(
     )
 
 
+def _load_combined_channels(
+    channel_source: Path,
+    spacing: VoxelSpacing,
+) -> tuple[ChannelVolume, ChannelVolume] | None:
+    if channel_source.is_file():
+        if channel_source.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            return None
+        image = iio.imread(channel_source)
+        arr = np.asarray(image)
+        if not _is_red_green_only_stack(arr):
+            return None
+
+        if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+            planes = arr[np.newaxis, ...]
+        elif arr.ndim == 4 and arr.shape[-1] in (3, 4):
+            planes = arr
+        else:
+            return None
+
+        green_slices: list[np.ndarray] = []
+        red_slices: list[np.ndarray] = []
+        depth = int(planes.shape[0])
+        for idx in range(depth):
+            plane = np.asarray(planes[idx])
+            green_slices.append(_extract_and_normalize_plane(plane, "green"))
+            red_slices.append(_extract_and_normalize_plane(plane, "red"))
+
+        z_indices = list(range(1, depth + 1))
+        green_volume = np.stack(green_slices, axis=0).astype(np.float32, copy=False)
+        red_volume = np.stack(red_slices, axis=0).astype(np.float32, copy=False)
+        logger.info(
+            "Loaded combined red/green stack once: %s slices=%d shape=%s",
+            channel_source,
+            depth,
+            green_volume.shape,
+        )
+        return (
+            ChannelVolume(
+                name="green",
+                data=green_volume,
+                z_indices=z_indices,
+                spacing=spacing,
+            ),
+            ChannelVolume(
+                name="red",
+                data=red_volume,
+                z_indices=z_indices,
+                spacing=spacing,
+            ),
+        )
+
+    image_files = _iter_image_files(channel_source)
+    if len(image_files) == 1:
+        return _load_combined_channels(image_files[0], spacing)
+
+    z_and_files = _list_combined_rg_files(channel_source)
+    if not z_and_files:
+        return None
+
+    z_indices = [z for z, _ in z_and_files]
+    if len(set(z_indices)) != len(z_indices):
+        # Repeated z-indices usually indicate channel-tagged c1/c2 files.
+        return None
+
+    green_slices: list[np.ndarray] = []
+    red_slices: list[np.ndarray] = []
+    for _, file_path in z_and_files:
+        img = iio.imread(file_path)
+        green_slices.append(_extract_and_normalize_plane(img, "green"))
+        red_slices.append(_extract_and_normalize_plane(img, "red"))
+
+    green_volume = np.stack(green_slices, axis=0).astype(np.float32, copy=False)
+    red_volume = np.stack(red_slices, axis=0).astype(np.float32, copy=False)
+    logger.info(
+        "Loaded combined red/green slices once: source=%s slices=%d shape=%s",
+        channel_source,
+        len(z_indices),
+        green_volume.shape,
+    )
+    return (
+        ChannelVolume(
+            name="green",
+            data=green_volume,
+            z_indices=z_indices,
+            spacing=spacing,
+        ),
+        ChannelVolume(
+            name="red",
+            data=red_volume,
+            z_indices=z_indices,
+            spacing=spacing,
+        ),
+    )
+
+
 def _shared_z_range(green: ChannelVolume, red: ChannelVolume) -> tuple[int, int]:
     green_min, green_max = min(green.z_indices), max(green.z_indices)
     red_min, red_max = min(red.z_indices), max(red.z_indices)
@@ -349,8 +521,18 @@ def load_dataset(
     logger.info("Loading dataset from root: %s", root)
     channel_dirs = resolve_channel_dirs(root, channel_overrides=channel_overrides)
 
-    green = _load_channel("green", channel_dirs["green"], spacing)
-    red = _load_channel("red", channel_dirs["red"], spacing)
+    green_source = channel_dirs["green"]
+    red_source = channel_dirs["red"]
+    combined = (
+        _load_combined_channels(green_source, spacing)
+        if green_source == red_source
+        else None
+    )
+    if combined is not None:
+        green, red = combined
+    else:
+        green = _load_channel("green", green_source, spacing)
+        red = _load_channel("red", red_source, spacing)
     shared = _shared_z_range(green, red)
     logger.info("Shared z range: %s", shared)
     return DatasetVolume(green=green, red=red, shared_z_range=shared)
@@ -395,14 +577,12 @@ def resolve_channel_dirs(
         for candidate in _candidate_segmented_roots(root):
             if not candidate.exists() or not candidate.is_dir():
                 continue
-            combined_files = _list_combined_rg_files(candidate)
-            if combined_files:
+            if _has_combined_rg_files(candidate):
                 channel_dirs["green"] = candidate
                 channel_dirs["red"] = candidate
                 logger.info(
-                    "Auto-detected combined red/green RGB dataset under: %s (slices=%d)",
+                    "Auto-detected combined red/green RGB dataset under: %s",
                     candidate,
-                    len(combined_files),
                 )
                 return channel_dirs
             # Also allow a single combined RGB stack TIFF/PNG file.

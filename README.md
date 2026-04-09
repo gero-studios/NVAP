@@ -43,10 +43,12 @@ Filenames should include z-index and channel marker for slice-per-file layouts, 
 
 ```powershell
 # From repo root
+cd nvap
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+nvap
 ```
 
 Optional model backend:
@@ -61,12 +63,6 @@ If activation is blocked:
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
-```
-
-Launch GUI:
-
-```powershell
-nvap
 ```
 
 Launch GUI with verbose debug logs:

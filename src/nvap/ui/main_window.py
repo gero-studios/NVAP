@@ -72,6 +72,16 @@ class _LoadTaskResult:
     threshold_red: float
 
 
+@dataclass
+class _MicrogliaComponentsTaskResult:
+    labels: np.ndarray
+    order: np.ndarray
+    sizes: np.ndarray
+    threshold: float
+    branch_sensitivity: float
+    shape: tuple[int, int, int]
+
+
 class _LogBridge(QObject):
     message = Signal(str)
 
@@ -175,6 +185,8 @@ class MainWindow(QMainWindow):
         self.controls.export_snapshot_requested.connect(self._on_export_snapshot_requested)
         self.controls.export_mesh_requested.connect(self._on_export_mesh_requested)
 
+        self._setup_keyboard_shortcuts()
+
         self._refresh_plugin_panel()
         self.statusBar().showMessage("Load a dataset to begin. Preprocessing is ON by default.")
         self._log_info("NVAP UI initialized: green pass-through mode active.")
@@ -185,6 +197,60 @@ class MainWindow(QMainWindow):
             self._active_thread.wait(2000)
         logging.getLogger("nvap").removeHandler(self._log_handler)
         super().closeEvent(event)
+
+    def _setup_keyboard_shortcuts(self) -> None:
+        """Setup keyboard shortcuts for common operations."""
+        from PySide6.QtGui import QAction, QKeySequence
+
+        # Load dataset
+        load_action = QAction("Load Dataset", self)
+        load_action.setShortcut(QKeySequence("Ctrl+L"))
+        load_action.triggered.connect(self._on_load_requested)
+        self.addAction(load_action)
+
+        # Export metrics
+        export_metrics_action = QAction("Export Metrics", self)
+        export_metrics_action.setShortcut(QKeySequence("Ctrl+E"))
+        export_metrics_action.triggered.connect(self._on_export_metrics_requested)
+        self.addAction(export_metrics_action)
+
+        # Export snapshot
+        snapshot_action = QAction("Export Snapshot", self)
+        snapshot_action.setShortcut(QKeySequence("Ctrl+S"))
+        snapshot_action.triggered.connect(self._on_export_snapshot_requested)
+        self.addAction(snapshot_action)
+
+        # Export mesh
+        mesh_action = QAction("Export Mesh", self)
+        mesh_action.setShortcut(QKeySequence("Ctrl+M"))
+        mesh_action.triggered.connect(self._on_export_mesh_requested)
+        self.addAction(mesh_action)
+
+        # Toggle auto-apply
+        toggle_auto_action = QAction("Toggle Auto-Apply", self)
+        toggle_auto_action.setShortcut(QKeySequence("Ctrl+A"))
+        toggle_auto_action.triggered.connect(
+            lambda: self.controls.auto_apply_checkbox.setChecked(
+                not self.controls.auto_apply_checkbox.isChecked()
+            )
+        )
+        self.addAction(toggle_auto_action)
+
+        # Apply changes (F5 or Enter when apply button is visible)
+        apply_action = QAction("Apply Changes", self)
+        apply_action.setShortcut(QKeySequence("F5"))
+        apply_action.triggered.connect(lambda: self.controls._on_apply_clicked())
+        self.addAction(apply_action)
+
+        # Apply changes with Return
+        apply_return_action = QAction("Apply Changes (Return)", self)
+        apply_return_action.setShortcut(QKeySequence("Return"))
+        apply_return_action.triggered.connect(
+            lambda: self.controls._on_apply_clicked()
+            if self.controls.apply_btn.isVisible()
+            else None
+        )
+        self.addAction(apply_return_action)
 
     def _log_info(self, message: str) -> None:
         logger.info(message)
@@ -219,6 +285,27 @@ class MainWindow(QMainWindow):
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         branch_sense = float(self.controls.current_microglia_branch_sensitivity())
         base_min_voxels = max(64, int(self.preprocess_config.green_speckle_min_voxels) * 4)
+        spacing_zyx: tuple[float, float, float] | None = None
+        if self.visual_dataset is not None:
+            spacing = self.visual_dataset.green.spacing
+            spacing_zyx = (float(spacing.z_um), float(spacing.y_um), float(spacing.x_um))
+        return self._compute_microglia_components_from_params(
+            green,
+            threshold=threshold,
+            branch_sense=branch_sense,
+            base_min_voxels=base_min_voxels,
+            spacing=spacing_zyx,
+        )
+
+    def _compute_microglia_components_from_params(
+        self,
+        green: np.ndarray,
+        *,
+        threshold: float,
+        branch_sense: float,
+        base_min_voxels: int,
+        spacing: tuple[float, float, float] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         min_voxels = int(round(base_min_voxels / (0.85 + (0.35 * branch_sense))))
         min_voxels = max(32, min_voxels)
         if green.size >= 120 * 1024 * 1024:
@@ -230,6 +317,134 @@ class MainWindow(QMainWindow):
             max_components=256,
             smooth_sigma=(0.2, 0.45, 0.45),
             branch_sensitivity=branch_sense,
+            spacing=spacing,
+        )
+
+    def _cache_microglia_components(
+        self,
+        labels: np.ndarray,
+        order: np.ndarray,
+        sizes: np.ndarray,
+        *,
+        threshold: float,
+        branch_sensitivity: float,
+        shape: tuple[int, int, int],
+        selected_index: int,
+    ) -> None:
+        label_count = int(len(order))
+        if label_count <= int(np.iinfo(np.uint8).max):
+            label_dtype = np.uint8
+        elif label_count <= int(np.iinfo(np.uint16).max):
+            label_dtype = np.uint16
+        else:
+            label_dtype = np.uint32
+        estimated_bytes = int(np.prod(shape) * np.dtype(label_dtype).itemsize)
+        self._green_component_sparse = {}
+        if estimated_bytes <= self._microglia_label_cache_max_bytes:
+            self._green_component_labels = labels.astype(label_dtype, copy=False)
+        else:
+            # Avoid keeping a very large dense label volume resident in memory.
+            self._green_component_labels = None
+            if label_count > 0:
+                objects = ndi.find_objects(np.asarray(labels, dtype=np.int32))
+                for component_id in order:
+                    idx = int(component_id) - 1
+                    if idx < 0 or idx >= len(objects):
+                        continue
+                    comp_slice = objects[idx]
+                    if comp_slice is None:
+                        continue
+                    local_mask = np.asarray(labels[comp_slice] == int(component_id), dtype=bool)
+                    if not np.any(local_mask):
+                        continue
+                    self._green_component_sparse[int(component_id)] = (comp_slice, local_mask)
+        self._green_component_order = order
+        self._green_component_sizes = sizes
+        self._green_component_threshold = threshold
+        self._green_component_branch_sensitivity = branch_sensitivity
+        self._green_component_shape = shape
+        selected = min(selected_index, int(len(order)))
+        selected_voxels = int(sizes[int(order[selected - 1])]) if selected > 0 else 0
+        self.controls.set_microglia_component_summary(
+            count=int(len(order)),
+            selected_index=selected,
+            selected_voxels=selected_voxels,
+        )
+
+    def _start_microglia_refresh_task(self) -> None:
+        if self.visual_dataset is None:
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+
+        threshold = float(self.current_render.threshold_green)
+        branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
+        selected_index = int(self.controls.microglia_view_state()[1])
+        green = np.asarray(self.visual_dataset.green.data, dtype=np.float32)
+        spacing = self.visual_dataset.green.spacing
+        spacing_zyx = (float(spacing.z_um), float(spacing.y_um), float(spacing.x_um))
+        base_min_voxels = max(64, int(self.preprocess_config.green_speckle_min_voxels) * 4)
+
+        if (
+            self._green_component_sizes is not None
+            and self._green_component_threshold is not None
+            and self._green_component_branch_sensitivity is not None
+            and np.isclose(self._green_component_threshold, threshold, atol=1.0e-6)
+            and np.isclose(self._green_component_branch_sensitivity, branch_sensitivity, atol=1.0e-6)
+            and self._green_component_shape == green.shape
+        ):
+            self._push_scene_channels(green_only=True)
+            self.scene.apply_render_config(self.current_render)
+            return
+
+        def _compute_task() -> _MicrogliaComponentsTaskResult:
+            self._publish_busy_progress(percent=10.0, message="Detecting microglia components...")
+            labels, order, sizes = self._compute_microglia_components_from_params(
+                green,
+                threshold=threshold,
+                branch_sense=branch_sensitivity,
+                base_min_voxels=base_min_voxels,
+                spacing=spacing_zyx,
+            )
+            self._publish_busy_progress(percent=75.0, message="Preparing isolate cache...")
+            return _MicrogliaComponentsTaskResult(
+                labels=labels,
+                order=order,
+                sizes=sizes,
+                threshold=threshold,
+                branch_sensitivity=branch_sensitivity,
+                shape=green.shape,
+            )
+
+        def _on_success(result: object) -> None:
+            if not isinstance(result, _MicrogliaComponentsTaskResult):
+                raise TypeError("Invalid microglia task result payload.")
+            isolate_enabled, current_selected = self.controls.microglia_view_state()
+            if not isolate_enabled:
+                return
+            self._publish_busy_progress(percent=85.0, message="Updating component cache...")
+            self._cache_microglia_components(
+                result.labels,
+                result.order,
+                result.sizes,
+                threshold=result.threshold,
+                branch_sensitivity=result.branch_sensitivity,
+                shape=result.shape,
+                selected_index=int(current_selected if current_selected > 0 else selected_index),
+            )
+            self._publish_busy_progress(percent=92.0, message="Updating 3D view...")
+            self._push_scene_channels(green_only=True)
+            self.scene.apply_render_config(self.current_render)
+            self._publish_busy_progress(percent=100.0, message="Microglia view updated.")
+
+        self._start_background_task(
+            title="Microglia Separation",
+            message="Separating microglia components...",
+            fn=_compute_task,
+            on_success=_on_success,
+            error_title="Microglia separation failed",
+            success_status="Microglia view updated.",
         )
 
     def _refresh_microglia_components_if_needed(self) -> None:
@@ -254,44 +469,14 @@ class MainWindow(QMainWindow):
             return
 
         labels, order, sizes = self._compute_microglia_components(green, threshold)
-        label_count = int(len(order))
-        if label_count <= int(np.iinfo(np.uint8).max):
-            label_dtype = np.uint8
-        elif label_count <= int(np.iinfo(np.uint16).max):
-            label_dtype = np.uint16
-        else:
-            label_dtype = np.uint32
-        estimated_bytes = int(green.size * np.dtype(label_dtype).itemsize)
-        self._green_component_sparse = {}
-        if estimated_bytes <= self._microglia_label_cache_max_bytes:
-            self._green_component_labels = labels.astype(label_dtype, copy=False)
-        else:
-            # Avoid keeping a very large dense label volume resident in memory.
-            self._green_component_labels = None
-            if label_count > 0:
-                objects = ndi.find_objects(np.asarray(labels, dtype=np.int32))
-                for component_id in order:
-                    idx = int(component_id) - 1
-                    if idx < 0 or idx >= len(objects):
-                        continue
-                    comp_slice = objects[idx]
-                    if comp_slice is None:
-                        continue
-                    local_mask = np.asarray(labels[comp_slice] == int(component_id), dtype=bool)
-                    if not np.any(local_mask):
-                        continue
-                    self._green_component_sparse[int(component_id)] = (comp_slice, local_mask)
-        self._green_component_order = order
-        self._green_component_sizes = sizes
-        self._green_component_threshold = threshold
-        self._green_component_branch_sensitivity = branch_sensitivity
-        self._green_component_shape = green.shape
-        selected = min(selected_index, int(len(order)))
-        selected_voxels = int(sizes[int(order[selected - 1])]) if selected > 0 else 0
-        self.controls.set_microglia_component_summary(
-            count=int(len(order)),
-            selected_index=selected,
-            selected_voxels=selected_voxels,
+        self._cache_microglia_components(
+            labels,
+            order,
+            sizes,
+            threshold=threshold,
+            branch_sensitivity=branch_sensitivity,
+            shape=green.shape,
+            selected_index=selected_index,
         )
 
     def _current_green_volume_for_view(self) -> np.ndarray:
@@ -359,13 +544,22 @@ class MainWindow(QMainWindow):
         ]
 
         eta_total = self._busy_eta_total
-        if progress_percent >= 1.0 and elapsed >= 1.0:
+        # Early low-percent stages are too noisy for reliable pace extrapolation.
+        # Keep ETA stable until enough progress has accumulated.
+        if progress_percent >= 15.0 and elapsed >= 1.0:
             pace_total = elapsed / max(1.0e-3, progress_percent / 100.0)
             if eta_total is None:
-                eta_total = pace_total
+                # When no model ETA exists, wait for more progress before showing one.
+                if progress_percent >= 30.0:
+                    eta_total = pace_total
             else:
-                # Blend model estimate with observed pace so ETA can both increase and decrease.
-                eta_total = (0.35 * float(eta_total)) + (0.65 * float(pace_total))
+                model_eta = float(eta_total)
+                # Limit early-stage pace influence to prevent extreme ETA spikes.
+                if progress_percent < 35.0:
+                    pace_total = float(np.clip(pace_total, 0.5 * model_eta, 2.0 * model_eta))
+                # Increase trust in observed pace as progress advances.
+                alpha = float(np.clip((progress_percent - 15.0) / 70.0, 0.15, 0.65))
+                eta_total = ((1.0 - alpha) * model_eta) + (alpha * float(pace_total))
         if eta_total is not None:
             remaining = max(0.0, eta_total - elapsed)
             lines.append(f"ETA: {self._format_seconds(remaining)}")
@@ -1148,12 +1342,17 @@ class MainWindow(QMainWindow):
         if threshold_changed:
             self._invalidate_microglia_components()
         isolate_enabled, _ = self.controls.microglia_view_state()
+        if isolate_enabled and threshold_changed:
+            if z_scale_changed:
+                self._push_scene_channels()
+            self._start_microglia_refresh_task()
+            self.scene.apply_render_config(config)
+            self._refresh_metrics()
+            return
         if isolate_enabled:
             self._refresh_microglia_components_if_needed()
         if z_scale_changed:
             self._push_scene_channels()
-        elif isolate_enabled and threshold_changed:
-            self._push_scene_channels(green_only=True)
         self.scene.apply_render_config(config)
         self._refresh_metrics()
 
@@ -1164,8 +1363,8 @@ class MainWindow(QMainWindow):
         was_enabled = bool(self._microglia_isolate_active)
         self._microglia_isolate_active = bool(isolate_enabled)
         if isolate_enabled:
-            self._refresh_microglia_components_if_needed()
-            self._push_scene_channels(green_only=True)
+            self._start_microglia_refresh_task()
+            return
         elif was_enabled:
             # Only push full green when isolate mode is being turned OFF.
             self._push_scene_channels(green_only=True)

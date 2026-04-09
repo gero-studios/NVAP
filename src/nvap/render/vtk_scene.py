@@ -10,6 +10,7 @@ from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPiecewiseFunction
 from vtkmodules.vtkFiltersCore import vtkMarchingCubes
+from vtkmodules.vtkImagingCore import vtkImageResample
 from vtkmodules.vtkIOImage import vtkPNGWriter
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
@@ -28,10 +29,66 @@ from nvap.config.types import RenderConfig, VoxelSpacing
 
 logger = logging.getLogger(__name__)
 
+_RENDER_CUBIC_MAX_AXIS_UPSAMPLE = 2.0
+_RENDER_CUBIC_MAX_TOTAL_UPSAMPLE = 3.0
+
+
+def _cubic_render_spacing(
+    shape: tuple[int, int, int],
+    spacing: VoxelSpacing,
+) -> VoxelSpacing:
+    if len(shape) != 3 or any(int(axis) <= 0 for axis in shape):
+        return spacing
+
+    spacing_xyz = np.array(
+        [float(spacing.x_um), float(spacing.y_um), float(spacing.z_um)],
+        dtype=np.float32,
+    )
+    finest = float(np.min(spacing_xyz))
+    if finest <= 0.0:
+        return arr, spacing
+
+    desired_zoom = np.array(
+        [
+            float(spacing.z_um) / finest,
+            float(spacing.y_um) / finest,
+            float(spacing.x_um) / finest,
+        ],
+        dtype=np.float32,
+    )
+    zoom = np.clip(desired_zoom, 1.0, _RENDER_CUBIC_MAX_AXIS_UPSAMPLE)
+
+    active = zoom > 1.0 + 1.0e-3
+    if np.any(active):
+        log_sum = float(np.sum(np.log(zoom[active])))
+        if log_sum > 0.0:
+            max_log = float(np.log(_RENDER_CUBIC_MAX_TOTAL_UPSAMPLE))
+            if log_sum > max_log:
+                scale = max_log / log_sum
+                zoom[active] = np.power(zoom[active], scale)
+
+    if not np.any(zoom > 1.0 + 1.0e-3):
+        return spacing
+
+    return VoxelSpacing(
+        x_um=float(spacing.x_um) / float(zoom[2]),
+        y_um=float(spacing.y_um) / float(zoom[1]),
+        z_um=float(spacing.z_um) / float(zoom[0]),
+    )
+
+
+def _same_spacing(left: VoxelSpacing, right: VoxelSpacing) -> bool:
+    return bool(
+        np.isclose(left.x_um, right.x_um)
+        and np.isclose(left.y_um, right.y_um)
+        and np.isclose(left.z_um, right.z_um)
+    )
+
 
 @dataclass
 class _ChannelActors:
     image: vtkImageData
+    resample: vtkImageResample | None
     volume_actor: vtkVolume
     volume_mapper: object
     volume_property: vtkVolumeProperty
@@ -85,17 +142,32 @@ class VTKScene:
             raise ValueError("channel must be 'green' or 'red'.")
         if volume.ndim != 3:
             raise ValueError("volume must have shape (z, y, x).")
-        logger.info("VTK set_channel_data: channel=%s shape=%s", channel, volume.shape)
+        render_spacing = _cubic_render_spacing(volume.shape, spacing)
+        needs_resample = not _same_spacing(render_spacing, spacing)
+        logger.info(
+            "VTK set_channel_data: channel=%s raw_shape=%s render_spacing=(%.4f, %.4f, %.4f)",
+            channel,
+            volume.shape,
+            render_spacing.x_um,
+            render_spacing.y_um,
+            render_spacing.z_um,
+        )
 
         if channel in self._actors:
             actor = self._actors[channel]
             expected_dims = (int(volume.shape[2]), int(volume.shape[1]), int(volume.shape[0]))
-            if tuple(actor.image.GetDimensions()) == expected_dims:
+            actor_has_resample = actor.resample is not None
+            if tuple(actor.image.GetDimensions()) == expected_dims and actor_has_resample == needs_resample:
                 # Fast path: keep actors/mappers and only replace scalar data.
                 self._update_vtk_image(actor.image, volume, spacing)
-                unit_distance = float(max(spacing.x_um, spacing.y_um, spacing.z_um) * 1.5)
+                if actor.resample is not None:
+                    self._configure_resample(actor.resample, render_spacing)
+                unit_distance = float(max(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um) * 1.5)
                 actor.volume_property.SetScalarOpacityUnitDistance(max(0.08, unit_distance))
-                self._spacing[channel] = spacing
+                # Re-sync sample distance to current spacing.
+                min_sp = min(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um)
+                actor.volume_mapper.SetSampleDistance(max(0.25 * min_sp, 0.02))
+                self._spacing[channel] = render_spacing
                 self.apply_render_config(self._current)
                 logger.info("VTK set_channel_data fast-update: channel=%s shape=%s", channel, volume.shape)
                 return
@@ -105,7 +177,8 @@ class VTKScene:
             self._renderer.RemoveActor(old.iso_actor)
 
         image = self._numpy_to_vtk_image(volume, spacing)
-        mapper = self._build_volume_mapper(image)
+        mapper_input, resample = self._build_render_input(image, render_spacing)
+        mapper = self._build_volume_mapper(mapper_input, render_spacing)
         prop = vtkVolumeProperty()
         prop.ShadeOn()
         prop.SetInterpolationTypeToLinear()
@@ -115,14 +188,14 @@ class VTKScene:
         prop.SetDiffuse(0.82)
         prop.SetSpecular(0.3)
         prop.SetSpecularPower(24.0)
-        unit_distance = float(max(spacing.x_um, spacing.y_um, spacing.z_um) * 1.5)
+        unit_distance = float(max(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um) * 1.5)
         prop.SetScalarOpacityUnitDistance(max(0.08, unit_distance))
         volume_actor = vtkVolume()
         volume_actor.SetMapper(mapper)
         volume_actor.SetProperty(prop)
 
         marching = vtkMarchingCubes()
-        marching.SetInputData(image)
+        self._set_pipeline_input(marching, mapper_input)
         marching.SetValue(0, self._current.iso_green if channel == "green" else self._current.iso_red)
         marching.ComputeNormalsOn()
         marching.ComputeGradientsOn()
@@ -149,17 +222,49 @@ class VTKScene:
 
         self._actors[channel] = _ChannelActors(
             image=image,
+            resample=resample,
             volume_actor=volume_actor,
             volume_mapper=mapper,
             volume_property=prop,
             iso_actor=iso_actor,
             marching=marching,
         )
-        self._spacing[channel] = spacing
+        self._spacing[channel] = render_spacing
         self.apply_render_config(self._current)
         self._renderer.ResetCamera()
         self.render()
         self.activate_interaction()
+
+    def _build_render_input(
+        self,
+        image: vtkImageData,
+        render_spacing: VoxelSpacing,
+    ):
+        input_spacing = image.GetSpacing()
+        source_spacing = VoxelSpacing(
+            x_um=float(input_spacing[0]),
+            y_um=float(input_spacing[1]),
+            z_um=float(input_spacing[2]),
+        )
+        if _same_spacing(render_spacing, source_spacing):
+            return image, None
+
+        resample = vtkImageResample()
+        resample.SetInputData(image)
+        self._configure_resample(resample, render_spacing)
+        return resample.GetOutputPort(), resample
+
+    def _configure_resample(self, resample: vtkImageResample, render_spacing: VoxelSpacing) -> None:
+        resample.SetInterpolationModeToCubic()
+        resample.SetAxisOutputSpacing(0, float(render_spacing.x_um))
+        resample.SetAxisOutputSpacing(1, float(render_spacing.y_um))
+        resample.SetAxisOutputSpacing(2, float(render_spacing.z_um))
+
+    def _set_pipeline_input(self, consumer, image_input) -> None:
+        if isinstance(image_input, vtkImageData):
+            consumer.SetInputData(image_input)
+            return
+        consumer.SetInputConnection(image_input)
 
     def _numpy_to_vtk_image(self, volume: np.ndarray, spacing: VoxelSpacing) -> vtkImageData:
         z, y, x = volume.shape
@@ -182,10 +287,17 @@ class VTKScene:
         image.GetPointData().SetScalars(self._numpy_to_vtk_scalars(volume))
         image.Modified()
 
-    def _build_volume_mapper(self, image: vtkImageData):
+    def _build_volume_mapper(self, image_input, render_spacing: VoxelSpacing):
         mapper = vtkSmartVolumeMapper()
-        mapper.SetInputData(image)
+        self._set_pipeline_input(mapper, image_input)
         mapper.SetBlendModeToComposite()
+        # Prevent quality degradation during camera rotation / angled views.
+        mapper.SetAutoAdjustSampleDistances(False)
+        mapper.SetInteractiveAdjustSampleDistances(False)
+        # Compute a tight sample distance from the voxel spacing so rays
+        # take enough samples even at oblique angles.
+        min_sp = min(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um)
+        mapper.SetSampleDistance(max(0.25 * min_sp, 0.02))
         return mapper
 
     def apply_render_config(self, config: RenderConfig) -> None:

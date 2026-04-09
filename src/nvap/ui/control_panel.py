@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -32,14 +32,61 @@ class ControlPanel(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+
+        # Debounce timer to batch rapid changes
+        self._render_update_timer = QTimer(self)
+        self._render_update_timer.setSingleShot(True)
+        self._render_update_timer.setInterval(250)  # 250ms delay
+        self._render_update_timer.timeout.connect(self._emit_render_config_delayed)
+
+        self._microglia_update_timer = QTimer(self)
+        self._microglia_update_timer.setSingleShot(True)
+        self._microglia_update_timer.setInterval(400)  # 400ms delay for heavier operation
+        self._microglia_update_timer.timeout.connect(self._emit_microglia_view_change_delayed)
+
+        self._auto_apply_enabled = True
+        self._pending_render_update = False
+        self._pending_microglia_update = False
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
         load_btn = QPushButton("Load Dataset")
-        load_btn.setStyleSheet("font-weight: bold; padding: 6px;")
+        load_btn.setObjectName("primaryAction")
+        load_btn.setStyleSheet("font-weight: bold; padding: 8px 12px; font-size: 14px;")
+        load_btn.setToolTip("Load a dataset from disk (Ctrl+L)")
         load_btn.clicked.connect(self.load_requested.emit)
         root.addWidget(load_btn)
+
+        # Auto-apply controls
+        apply_group = QGroupBox("Update Mode")
+        apply_layout = QVBoxLayout(apply_group)
+        apply_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.auto_apply_checkbox = QCheckBox("Auto-apply changes")
+        self.auto_apply_checkbox.setChecked(True)
+        self.auto_apply_checkbox.setToolTip(
+            "When enabled, changes update the view automatically after a brief delay.\n"
+            "When disabled, click Apply to update the view.\n"
+            "Toggle with Ctrl+A"
+        )
+        self.auto_apply_checkbox.toggled.connect(self._on_auto_apply_toggled)
+        apply_layout.addWidget(self.auto_apply_checkbox)
+
+        self.apply_btn = QPushButton("Apply Changes")
+        self.apply_btn.setObjectName("primaryAction")
+        self.apply_btn.setStyleSheet("font-weight: bold; padding: 6px 10px;")
+        self.apply_btn.setToolTip("Apply pending changes to the view (F5 or Return)")
+        self.apply_btn.setVisible(False)
+        self.apply_btn.clicked.connect(self._on_apply_clicked)
+        apply_layout.addWidget(self.apply_btn)
+
+        self.pending_label = QLabel("")
+        self.pending_label.setStyleSheet("color: #ff8800; font-style: italic;")
+        self.pending_label.setVisible(False)
+        apply_layout.addWidget(self.pending_label)
+
+        root.addWidget(apply_group)
 
         self.show_advanced = QCheckBox("Show advanced controls")
         self.show_advanced.setChecked(False)
@@ -59,11 +106,14 @@ class ControlPanel(QWidget):
         export_group = QGroupBox("Export")
         export_layout = QHBoxLayout(export_group)
         csv_btn = QPushButton("Metrics CSV")
+        csv_btn.setToolTip("Export metrics to CSV file (Ctrl+E)")
         csv_btn.clicked.connect(self.export_metrics_requested.emit)
         png_btn = QPushButton("Snapshot PNG")
+        png_btn.setToolTip("Export current 3D view as PNG (Ctrl+S)")
         png_btn.clicked.connect(self.export_snapshot_requested.emit)
         mesh_btn = QPushButton("3D Mesh")
-        mesh_btn.setStyleSheet("font-weight: bold;")
+        mesh_btn.setObjectName("primaryAction")
+        mesh_btn.setToolTip("Export 3D mesh files (Ctrl+M)")
         mesh_btn.clicked.connect(self.export_mesh_requested.emit)
         export_layout.addWidget(csv_btn)
         export_layout.addWidget(png_btn)
@@ -110,61 +160,63 @@ class ControlPanel(QWidget):
         row = QHBoxLayout()
         self.show_green = QCheckBox("Green")
         self.show_green.setChecked(True)
-        self.show_green.stateChanged.connect(self._emit_render_config)
+        self.show_green.stateChanged.connect(self._on_render_setting_changed)
         self.show_red = QCheckBox("Red")
         self.show_red.setChecked(True)
-        self.show_red.stateChanged.connect(self._emit_render_config)
+        self.show_red.stateChanged.connect(self._on_render_setting_changed)
         row.addWidget(self.show_green)
         row.addWidget(self.show_red)
         form.addRow("Channels", row)
 
         iso_row = QHBoxLayout()
         self.show_iso_green = QCheckBox("Green")
-        self.show_iso_green.stateChanged.connect(self._emit_render_config)
+        self.show_iso_green.stateChanged.connect(self._on_render_setting_changed)
         self.show_iso_red = QCheckBox("Red")
-        self.show_iso_red.stateChanged.connect(self._emit_render_config)
+        self.show_iso_red.stateChanged.connect(self._on_render_setting_changed)
         iso_row.addWidget(self.show_iso_green)
         iso_row.addWidget(self.show_iso_red)
         form.addRow("Isosurfaces", iso_row)
 
         self.threshold_green = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.15)
-        self.threshold_green.valueChanged.connect(self._emit_render_config)
+        self.threshold_green.setToolTip("Minimum intensity to visualize green channel (microglia)")
+        self.threshold_green.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Threshold G", self.threshold_green)
 
         self.threshold_red = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.15)
-        self.threshold_red.valueChanged.connect(self._emit_render_config)
+        self.threshold_red.setToolTip("Minimum intensity to visualize red channel (vasculature)")
+        self.threshold_red.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Threshold R", self.threshold_red)
 
         self.opacity_green = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.40)
-        self.opacity_green.valueChanged.connect(self._emit_render_config)
+        self.opacity_green.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Opacity G", self.opacity_green)
 
         self.opacity_red = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.40)
-        self.opacity_red.valueChanged.connect(self._emit_render_config)
+        self.opacity_red.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Opacity R", self.opacity_red)
 
         self.iso_green = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.20)
-        self.iso_green.valueChanged.connect(self._emit_render_config)
+        self.iso_green.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Iso level G", self.iso_green)
 
         self.iso_red = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.20)
-        self.iso_red.valueChanged.connect(self._emit_render_config)
+        self.iso_red.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Iso level R", self.iso_red)
 
         self.display_z_scale = self._make_unit_spinbox(0.2, 3.0, 0.05, 2.0 / 3.0)
-        self.display_z_scale.valueChanged.connect(self._emit_render_config)
+        self.display_z_scale.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Z height scale", self.display_z_scale)
 
         self.offset_x = self._make_offset_spinbox()
-        self.offset_x.valueChanged.connect(self._emit_render_config)
+        self.offset_x.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Offset X um", self.offset_x)
 
         self.offset_y = self._make_offset_spinbox()
-        self.offset_y.valueChanged.connect(self._emit_render_config)
+        self.offset_y.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Offset Y um", self.offset_y)
 
         self.offset_z = self._make_offset_spinbox()
-        self.offset_z.valueChanged.connect(self._emit_render_config)
+        self.offset_z.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Offset Z um", self.offset_z)
         return group
 
@@ -202,7 +254,7 @@ class ControlPanel(QWidget):
         form = QFormLayout(group)
 
         self.microglia_isolate = QCheckBox("View one microglia")
-        self.microglia_isolate.toggled.connect(self._emit_microglia_view_change)
+        self.microglia_isolate.toggled.connect(self._on_microglia_setting_changed)
         form.addRow(self.microglia_isolate)
 
         row = QHBoxLayout()
@@ -214,7 +266,7 @@ class ControlPanel(QWidget):
         self.microglia_index = QSpinBox()
         self.microglia_index.setRange(0, 0)
         self.microglia_index.setSpecialValueText("All")
-        self.microglia_index.valueChanged.connect(self._emit_microglia_view_change)
+        self.microglia_index.valueChanged.connect(self._on_microglia_setting_changed)
         row.addWidget(self.microglia_index)
 
         self.microglia_next = QPushButton(">")
@@ -227,7 +279,7 @@ class ControlPanel(QWidget):
         form.addRow(self.microglia_info)
 
         self.microglia_branch_sensitivity = self._make_unit_spinbox(0.4, 2.0, 0.05, 1.0)
-        self.microglia_branch_sensitivity.valueChanged.connect(self._emit_microglia_view_change)
+        self.microglia_branch_sensitivity.valueChanged.connect(self._on_microglia_setting_changed)
         form.addRow("Branch sensitivity", self.microglia_branch_sensitivity)
 
         self._set_microglia_navigation_enabled(False)
@@ -240,6 +292,7 @@ class ControlPanel(QWidget):
         spin.setSingleStep(step)
         spin.setDecimals(3)
         spin.setValue(value)
+        spin.setKeyboardTracking(False)  # Only emit valueChanged when editing finishes
         return spin
 
     @staticmethod
@@ -249,16 +302,90 @@ class ControlPanel(QWidget):
         spin.setSingleStep(0.1)
         spin.setDecimals(3)
         spin.setValue(0.0)
+        spin.setKeyboardTracking(False)  # Only emit valueChanged when editing finishes
         return spin
 
     def _emit_render_config(self) -> None:
         self.render_config_changed.emit(self.current_render_config())
+        self._pending_render_update = False
+        self._update_pending_label()
 
     def _emit_psf_config(self) -> None:
         self.psf_config_changed.emit(self.current_psf_config())
 
     def _emit_microglia_view_change(self) -> None:
         self.microglia_view_changed.emit()
+        self._pending_microglia_update = False
+        self._update_pending_label()
+
+    def _on_render_setting_changed(self) -> None:
+        """Handle any render setting change with debouncing or manual apply."""
+        if self._auto_apply_enabled:
+            self._pending_render_update = True
+            self._update_pending_label()
+            # Restart timer on each change (debounce)
+            self._render_update_timer.start()
+        else:
+            self._pending_render_update = True
+            self._update_pending_label()
+
+    def _on_microglia_setting_changed(self) -> None:
+        """Handle microglia setting change with debouncing or manual apply."""
+        if self._auto_apply_enabled:
+            self._pending_microglia_update = True
+            self._update_pending_label()
+            # Restart timer on each change (debounce)
+            self._microglia_update_timer.start()
+        else:
+            self._pending_microglia_update = True
+            self._update_pending_label()
+
+    def _emit_render_config_delayed(self) -> None:
+        """Called by timer after debounce delay."""
+        if self._pending_render_update:
+            self._emit_render_config()
+
+    def _emit_microglia_view_change_delayed(self) -> None:
+        """Called by timer after debounce delay."""
+        if self._pending_microglia_update:
+            self._emit_microglia_view_change()
+
+    def _on_auto_apply_toggled(self, checked: bool) -> None:
+        """Handle auto-apply checkbox toggle."""
+        self._auto_apply_enabled = bool(checked)
+        self.apply_btn.setVisible(not checked)
+        if checked:
+            # When re-enabling auto-apply, immediately apply any pending changes
+            if self._pending_render_update or self._pending_microglia_update:
+                self._on_apply_clicked()
+        self._update_pending_label()
+
+    def _on_apply_clicked(self) -> None:
+        """Handle manual Apply button click."""
+        # Stop any running timers
+        self._render_update_timer.stop()
+        self._microglia_update_timer.stop()
+
+        # Apply pending changes immediately
+        if self._pending_render_update:
+            self._emit_render_config()
+        if self._pending_microglia_update:
+            self._emit_microglia_view_change()
+
+    def _update_pending_label(self) -> None:
+        """Update the pending changes label."""
+        if not self._auto_apply_enabled and (self._pending_render_update or self._pending_microglia_update):
+            changes = []
+            if self._pending_render_update:
+                changes.append("rendering")
+            if self._pending_microglia_update:
+                changes.append("microglia")
+            self.pending_label.setText(f"Pending: {', '.join(changes)}")
+            self.pending_label.setVisible(True)
+            self.apply_btn.setStyleSheet("font-weight: bold; padding: 4px; background-color: #ff8800;")
+        else:
+            self.pending_label.setVisible(False)
+            self.apply_btn.setStyleSheet("font-weight: bold; padding: 4px;")
 
     def _on_microglia_prev(self) -> None:
         current = int(self.microglia_index.value())
@@ -370,3 +497,18 @@ class ControlPanel(QWidget):
 
     def clear_debug_text(self) -> None:
         self.debug_text.clear()
+
+    def force_apply_pending_changes(self) -> None:
+        """Force immediate application of any pending changes.
+
+        This is useful when loading a new dataset or performing operations
+        that require the latest settings to be applied.
+        """
+        self._render_update_timer.stop()
+        self._microglia_update_timer.stop()
+
+        # Clear pending flags without emitting signals
+        # (the caller will handle the update)
+        self._pending_render_update = False
+        self._pending_microglia_update = False
+        self._update_pending_label()

@@ -74,6 +74,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+nvap
 ```
 
 Optional model backend:
@@ -88,12 +89,6 @@ If activation is blocked:
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
-```
-
-Launch GUI:
-
-```powershell
-nvap
 ```
 
 Launch GUI with verbose debug logs:
@@ -125,12 +120,13 @@ python -m pytest
 ## How to load dataset in NVAP
 
 1. Click `Load Dataset`.
-2. Choose a root folder that contains either:
-- `Segmented/Green` and `Segmented/Red`, or
-- `Input/Segmented/Green` and `Input/Segmented/Red`.
-  Folders can contain either z-slice image files (`.png/.tif/.tiff`) or a single stack TIFF.
-  You can also choose a single folder of RGB `_z###.(png|tif|tiff)` slices that use only red/green pixels.
-3. If auto-detection fails, NVAP prompts you to select Green and Red folders manually.
+2. Select channels in this order when prompted:
+- Vasculature (Red)
+- Microglia (Green)
+  For each channel, choose either:
+  - a single stack file (`.tif/.tiff/.png`), or
+  - an image-sequence folder (`.png/.tif/.tiff` slices).
+3. NVAP loads those selected sources directly (no root auto-detection step in UI).
 4. Wait for loading dialogs to complete:
 - channel stack load
 - missing z-slice interpolation

@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Setup & Launch NVAP",
+            "type": "python",
+            "request": "launch",
+            "module": "nvap",
+            "console": "integratedTerminal",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "justMyCode": false
+        }
+    ],
+    "compounds": [
+        {
+            "name": "NVAP",
+            "configurations": ["Setup & Launch NVAP"],
+            "preLaunchTask": "nvap-setup",
+            "stopAll": true
+        }
+    ]
+}

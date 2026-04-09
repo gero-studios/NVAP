@@ -2,7 +2,21 @@ from __future__ import annotations
 
 import numpy as np
 
+from nvap.analysis import microglia_components
 from nvap.analysis.microglia_components import compute_component_labels, isolate_component
+
+
+def test_mask_bounds_avoids_full_nonzero_coordinate_allocation(monkeypatch) -> None:
+    mask = np.zeros((5, 8, 9), dtype=bool)
+    mask[1:4, 2:6, 3:8] = True
+
+    def _fail_nonzero(*_args, **_kwargs):
+        raise AssertionError("_mask_bounds should not call np.nonzero")
+
+    monkeypatch.setattr(microglia_components.np, "nonzero", _fail_nonzero)
+    bounds = microglia_components._mask_bounds(mask)
+
+    assert bounds == (slice(1, 4), slice(2, 6), slice(3, 8))
 
 
 def test_compute_component_labels_orders_by_size_desc() -> None:
@@ -193,3 +207,66 @@ def test_nearby_cells_not_merged_at_low_threshold() -> None:
     assert len(order) >= 30, (
         f"Expected >=30 components from {n_planted} planted cells, got {len(order)}"
     )
+
+
+def test_single_soma_not_split_by_patchy_bright_core() -> None:
+    arr = np.zeros((5, 64, 64), dtype=np.float32)
+    z = 2
+
+    # One soma-like blob with a moderate-intensity body and two bright islands.
+    arr[z, 28:37, 28:37] = 0.34
+    arr[z, 30:32, 30:32] = 0.64
+    arr[z, 33:35, 33:35] = 0.66
+    arr[z, 31:34, 31:34] = np.maximum(arr[z, 31:34, 31:34], 0.48)
+
+    # Dim branches should stay attached to the single soma.
+    arr[z, 32, 37:47] = 0.20
+    arr[z, 20:28, 32] = 0.19
+
+    labels, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.18,
+        min_voxels=20,
+        max_components=8,
+        smooth_sigma=(0.0, 0.0, 0.0),
+    )
+
+    assert len(order) == 1
+    comp_id = int(order[0])
+    assert int(sizes[comp_id]) >= 90
+    assert int(labels[z, 32, 43]) == comp_id
+    assert int(labels[z, 24, 32]) == comp_id
+
+
+def test_nearby_somas_connected_by_dim_bridge_stay_separate() -> None:
+    arr = np.zeros((5, 80, 80), dtype=np.float32)
+    z = 2
+
+    # Two nearby somas with broad halos and bright cores.
+    left_x, right_x = 30, 40
+    arr[z, 24:37, left_x - 6:left_x + 7] = 0.28
+    arr[z, 27:34, left_x - 3:left_x + 4] = 0.56
+    arr[z, 24:37, right_x - 6:right_x + 7] = np.maximum(
+        arr[z, 24:37, right_x - 6:right_x + 7], 0.28
+    )
+    arr[z, 27:34, right_x - 3:right_x + 4] = np.maximum(
+        arr[z, 27:34, right_x - 3:right_x + 4], 0.56
+    )
+
+    # Dim bridge should not collapse both somas into one component.
+    arr[z, 30, 33:37] = np.maximum(arr[z, 30, 33:37], 0.16)
+
+    labels, order, _ = compute_component_labels(
+        arr,
+        threshold=0.12,
+        min_voxels=40,
+        max_components=16,
+        smooth_sigma=(0.0, 0.0, 0.0),
+    )
+
+    assert len(order) >= 2
+    left_id = int(labels[z, 30, left_x])
+    right_id = int(labels[z, 30, right_x])
+    assert left_id > 0
+    assert right_id > 0
+    assert left_id != right_id
