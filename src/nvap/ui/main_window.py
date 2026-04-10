@@ -196,6 +196,11 @@ class MainWindow(QMainWindow):
             self._log_info("Waiting briefly for active background task to finish before close.")
             self._active_thread.wait(2000)
         logging.getLogger("nvap").removeHandler(self._log_handler)
+        # Clean up VTK resources to avoid GPU/memory leaks.
+        try:
+            self.scene.cleanup()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def _setup_keyboard_shortcuts(self) -> None:
@@ -381,7 +386,9 @@ class MainWindow(QMainWindow):
         threshold = float(self.current_render.threshold_green)
         branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
         selected_index = int(self.controls.microglia_view_state()[1])
-        green = np.asarray(self.visual_dataset.green.data, dtype=np.float32)
+        green = self.visual_dataset.green.data
+        if green.dtype != np.float32:
+            green = np.asarray(green, dtype=np.float32)
         spacing = self.visual_dataset.green.spacing
         spacing_zyx = (float(spacing.z_um), float(spacing.y_um), float(spacing.x_um))
         base_min_voxels = max(64, int(self.preprocess_config.green_speckle_min_voxels) * 4)
@@ -543,7 +550,8 @@ class MainWindow(QMainWindow):
             f"Elapsed: {self._format_seconds(elapsed)}",
         ]
 
-        eta_total = self._busy_eta_total
+        with self._busy_progress_lock:
+            eta_total = self._busy_eta_total
         # Early low-percent stages are too noisy for reliable pace extrapolation.
         # Keep ETA stable until enough progress has accumulated.
         if progress_percent >= 15.0 and elapsed >= 1.0:
@@ -727,7 +735,8 @@ class MainWindow(QMainWindow):
         if message:
             self._busy_base_message = message
         if eta_hint is not None:
-            self._busy_eta_total = eta_hint
+            with self._busy_progress_lock:
+                self._busy_eta_total = eta_hint
         elapsed = time.perf_counter() - self._busy_start
         self._busy_dialog.setValue(int(round(progress_percent)))
         self._busy_dialog.setLabelText(self._compose_busy_label(elapsed, progress_percent))
@@ -1343,9 +1352,11 @@ class MainWindow(QMainWindow):
             self._invalidate_microglia_components()
         isolate_enabled, _ = self.controls.microglia_view_state()
         if isolate_enabled and threshold_changed:
-            if z_scale_changed:
-                self._push_scene_channels()
+            # Start background microglia refresh which will also push scene
+            # channels when done — avoid synchronous watershed here.
             self._start_microglia_refresh_task()
+            if z_scale_changed and not threshold_changed:
+                self._push_scene_channels()
             self.scene.apply_render_config(config)
             self._refresh_metrics()
             return

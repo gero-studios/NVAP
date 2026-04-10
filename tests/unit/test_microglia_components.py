@@ -19,6 +19,45 @@ def test_mask_bounds_avoids_full_nonzero_coordinate_allocation(monkeypatch) -> N
     assert bounds == (slice(1, 4), slice(2, 6), slice(3, 8))
 
 
+def test_detect_soma_blobs_updates_peak_mask_in_place(monkeypatch) -> None:
+    arr = np.zeros((3, 16, 16), dtype=np.float32)
+    arr[1, 8, 8] = 1.0
+    arr[1, 8, 9] = 0.9
+
+    real_subtract = np.subtract
+    real_greater_equal = np.greater_equal
+    saw_in_place_compare = False
+
+    def _subtract(*args, **kwargs):
+        return real_subtract(*args, **kwargs)
+
+    def _greater_equal(a, b, *args, **kwargs):
+        nonlocal saw_in_place_compare
+        out = kwargs.get("out")
+        where = kwargs.get("where")
+        if (
+            isinstance(out, np.ndarray)
+            and out.dtype == np.bool_
+            and out.shape == np.asarray(a).shape
+            and where is out
+        ):
+            saw_in_place_compare = True
+        return real_greater_equal(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(microglia_components.np, "subtract", _subtract)
+    monkeypatch.setattr(microglia_components.np, "greater_equal", _greater_equal)
+
+    seed = microglia_components._detect_soma_blobs(
+        arr,
+        threshold=0.1,
+        branch_sensitivity=1.0,
+        spacing=(1.0, 1.0, 1.0),
+    )
+
+    assert np.any(seed)
+    assert saw_in_place_compare
+
+
 def test_compute_component_labels_orders_by_size_desc() -> None:
     arr = np.zeros((4, 16, 16), dtype=np.float32)
     arr[1:3, 8, 2:12] = 0.2  # large component

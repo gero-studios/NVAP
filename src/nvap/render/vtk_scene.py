@@ -44,9 +44,13 @@ def _cubic_render_spacing(
         [float(spacing.x_um), float(spacing.y_um), float(spacing.z_um)],
         dtype=np.float32,
     )
+    if not np.all(np.isfinite(spacing_xyz)):
+        logger.warning("VTK cubic spacing fallback: non-finite spacing=%s", spacing)
+        return spacing
     finest = float(np.min(spacing_xyz))
     if finest <= 0.0:
-        return arr, spacing
+        logger.warning("VTK cubic spacing fallback: non-positive spacing=%s", spacing)
+        return spacing
 
     desired_zoom = np.array(
         [
@@ -277,8 +281,10 @@ class VTKScene:
         return vtk_img
 
     def _numpy_to_vtk_scalars(self, volume: np.ndarray):
-        flat = np.ascontiguousarray(volume.transpose(2, 1, 0).ravel(order="F"))
-        vtk_array = numpy_to_vtk(flat, deep=True)
+        # VTK expects Fortran-order (x varies fastest) from a (z, y, x) volume.
+        # Use a single contiguous copy instead of transpose + ravel + deep-copy.
+        flat = np.ascontiguousarray(volume.ravel(order='F'), dtype=np.float32)
+        vtk_array = numpy_to_vtk(flat, deep=False)
         vtk_array.SetName("intensity")
         return vtk_array
 
@@ -392,4 +398,15 @@ class VTKScene:
 
     def render(self) -> None:
         self._render_window.Render()
-        self.activate_interaction()
+
+    def cleanup(self) -> None:
+        """Release VTK resources to avoid GPU/memory leaks on window close."""
+        for actor in self._actors.values():
+            self._renderer.RemoveVolume(actor.volume_actor)
+            self._renderer.RemoveActor(actor.iso_actor)
+        self._actors.clear()
+        self._spacing.clear()
+        if self._interactor is not None:
+            self._interactor.TerminateApp()
+        if self._render_window is not None:
+            self._render_window.Finalize()

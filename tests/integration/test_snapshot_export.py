@@ -39,6 +39,32 @@ def test_cubic_render_spacing_keeps_isotropic_volume_unchanged() -> None:
 
 
 @pytest.mark.integration
+def test_cubic_render_spacing_falls_back_for_nonpositive_spacing() -> None:
+    pytest.importorskip("vtkmodules")
+
+    from nvap.render.vtk_scene import _cubic_render_spacing
+
+    spacing = VoxelSpacing(x_um=0.33, y_um=0.33, z_um=0.0)
+    render_spacing = _cubic_render_spacing((8, 16, 16), spacing)
+
+    assert render_spacing == spacing
+
+
+@pytest.mark.integration
+def test_cubic_render_spacing_falls_back_for_nonfinite_spacing() -> None:
+    pytest.importorskip("vtkmodules")
+
+    from nvap.render.vtk_scene import _cubic_render_spacing
+
+    spacing = VoxelSpacing(x_um=0.33, y_um=float("nan"), z_um=0.66)
+    render_spacing = _cubic_render_spacing((8, 16, 16), spacing)
+
+    assert np.isnan(render_spacing.y_um)
+    assert render_spacing.x_um == pytest.approx(0.33)
+    assert render_spacing.z_um == pytest.approx(0.66)
+
+
+@pytest.mark.integration
 def test_scene_uses_vtk_cubic_resample_for_anisotropic_volume() -> None:
     QtWidgets = pytest.importorskip("PySide6.QtWidgets")
     pytest.importorskip("vtkmodules")

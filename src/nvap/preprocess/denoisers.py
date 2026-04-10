@@ -318,22 +318,45 @@ def denoise_pixel2voxel_no_psf(
     voxel_strength = float(np.clip(0.85 + denoise_strength, 0.65, 1.6))
     slicewise = denoise_wavelet_slicewise(arr, noise_sigma, config, strength=slice_strength, workers=workers)
     volumetric = denoise_wavelet_3d(arr, noise_sigma, config, strength=voxel_strength)
-    axial = ndi.gaussian_filter(volumetric, sigma=(0.65, 0.0, 0.0), mode="nearest")
+    # Apply axial smoothing in-place to volumetric (reuse buffer).
+    ndi.gaussian_filter(volumetric, sigma=(0.65, 0.0, 0.0), mode="nearest", output=volumetric)
 
     # Estimate how coherent signal is across neighboring slices.
     z_delta = np.abs(np.diff(arr, axis=0, prepend=arr[:1]))
-    z_consistency = np.exp(-z_delta / float(max(noise_sigma * 2.5, 1.0e-4)))
-    z_consistency = ndi.gaussian_filter(z_consistency, sigma=(0.45, 0.7, 0.7), mode="nearest")
+    np.exp(-z_delta / float(max(noise_sigma * 2.5, 1.0e-4)), out=z_delta)  # reuse as z_consistency
+    ndi.gaussian_filter(z_delta, sigma=(0.45, 0.7, 0.7), mode="nearest", output=z_delta)
 
     # Protect branch-like structures with higher slice-wise contribution.
-    slice_weight = np.clip(0.2 + (0.65 * branch) + (0.25 * (1.0 - z_consistency)), 0.2, 0.95)
-    fused = (slice_weight * slicewise) + ((1.0 - slice_weight) * axial)
+    # Compute slice_weight in-place reusing z_delta buffer.
+    # slice_weight = clip(0.2 + 0.65*branch + 0.25*(1 - z_consistency), 0.2, 0.95)
+    np.subtract(1.0, z_delta, out=z_delta)
+    z_delta *= 0.25
+    z_delta += 0.2
+    z_delta += 0.65 * branch
+    np.clip(z_delta, 0.2, 0.95, out=z_delta)
+    # fused = slice_weight * slicewise + (1 - slice_weight) * volumetric
+    # Compute in-place: reuse slicewise as fused output.
+    slicewise *= z_delta
+    np.subtract(1.0, z_delta, out=z_delta)
+    volumetric *= z_delta
+    slicewise += volumetric
+    del volumetric, z_delta  # free memory early
 
     # Background-only extra suppression to reduce speckle without thinning branches.
-    bg_weight = 1.0 - branch
-    bg_suppressed = ndi.median_filter(fused, size=(1, 3, 3), mode="nearest")
-    fused = (branch * fused) + (bg_weight * ((0.74 * fused) + (0.26 * bg_suppressed)))
-    fused = np.clip(fused, 0.0, 1.0).astype(np.float32, copy=False)
+    bg_suppressed = ndi.median_filter(slicewise, size=(1, 3, 3), mode="nearest")
+    # fused = branch * fused + (1 - branch) * (0.74 * fused + 0.26 * bg_suppressed)
+    bg_suppressed *= 0.26
+    # blend: result = branch*fused + (1–branch)*(0.74*fused + bg_suppressed)
+    #       = fused*(branch + 0.74*(1–branch)) + (1–branch)*bg_suppressed
+    #       = fused*(0.74 + 0.26*branch)       + (1–branch)*bg_suppressed
+    blend_factor = 0.74 + 0.26 * branch
+    slicewise *= blend_factor
+    np.subtract(1.0, branch, out=blend_factor)
+    bg_suppressed *= blend_factor
+    slicewise += bg_suppressed
+    del bg_suppressed, blend_factor
+
+    np.clip(slicewise, 0.0, 1.0, out=slicewise)
 
     logger.info(
         "Pixel2Voxel denoise complete dt=%.2fs sigma=%.4f workers=%d",
@@ -341,7 +364,7 @@ def denoise_pixel2voxel_no_psf(
         noise_sigma,
         workers,
     )
-    return fused
+    return slicewise
 
 
 # ---------------------------------------------------------------------------

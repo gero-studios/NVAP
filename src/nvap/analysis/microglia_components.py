@@ -118,7 +118,8 @@ def _detect_soma_blobs(
     peak_mask = finite & (detect >= peak_floor)
     if np.any(peak_mask):
         peak_max = ndi.maximum_filter(detect, size=max_size, mode="nearest")
-        peak_mask &= detect >= (peak_max - 1.0e-6)
+        np.subtract(peak_max, 1.0e-6, out=peak_max)
+        np.greater_equal(detect, peak_max, out=peak_mask, where=peak_mask)
 
     peak_labels, n_peaks = ndi.label(peak_mask, structure=_CC_STRUCTURE)
     # Vectorised: find one max-intensity centre per peak region — O(N) not O(N×K).
@@ -161,7 +162,8 @@ def _detect_soma_blobs(
     fallback_mask = finite & (detect >= fallback_floor)
     if np.any(fallback_mask):
         fallback_max = ndi.maximum_filter(detect, size=(3, 5, 5), mode="nearest")
-        fallback_mask &= detect >= (fallback_max - 1.0e-6)
+        np.subtract(fallback_max, 1.0e-6, out=fallback_max)
+        np.greater_equal(detect, fallback_max, out=fallback_mask, where=fallback_mask)
     if np.any(fallback_mask):
         fallback_labels, n_fallback = ndi.label(fallback_mask, structure=_CC_STRUCTURE)
         # Vectorised: one max-intensity centre per fallback region.
@@ -280,9 +282,15 @@ def compute_component_labels(
     # need to iterate over multiple candidate thresholds.
     low_scale = float(np.clip(0.46 - (0.16 * (branch_sense - 1.0)), 0.22, 0.68))
     core_scale = float(np.clip(0.32 - (0.08 * (branch_sense - 1.0)), 0.16, 0.46))
+    # Use a data-driven floor so near-zero thresholds don't make the growth
+    # mask include background noise and merge adjacent cells.  The floor is
+    # kept modest (5th-10th percentile of positive values) to avoid trimming
+    # legitimate dim branches.
+    data_floor_quantile = float(np.clip(0.05 - 0.02 * (branch_sense - 1.0), 0.03, 0.10))
+    data_floor = float(np.quantile(positive, data_floor_quantile))
     low_t = float(
         np.clip(
-            max(0.01, min(t * low_scale, high_t * core_scale)),
+            max(0.01, data_floor, min(t * low_scale, high_t * core_scale)),
             0.0,
             max(0.0, high_t - 1.0e-4),
         )
@@ -410,7 +418,13 @@ def isolate_component(
     component = int(component_id)
     if component <= 0:
         return arr.copy()
+
+    # Use bounding box to avoid allocating a full-volume zeros array.
+    bounds = _mask_bounds(lbl == component)
+    if bounds is None:
+        return np.zeros_like(arr, dtype=np.float32)
+
     out = np.zeros_like(arr, dtype=np.float32)
-    mask = lbl == component
-    out[mask] = arr[mask]
+    local_mask = lbl[bounds] == component
+    out[bounds][local_mask] = arr[bounds][local_mask]
     return out

@@ -70,6 +70,7 @@ Filenames should include z-index and channel marker for slice-per-file layouts, 
 
 ```powershell
 # From repo root
+cd nvap
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip

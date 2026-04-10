@@ -309,7 +309,8 @@ def _estimate_seed_count(
     if not np.any(peak_mask):
         return 0
     peak_max = ndi.maximum_filter(seed_source, size=(3, 5, 5), mode="nearest")
-    peak_mask &= seed_source >= (peak_max - 1.0e-6)
+    np.subtract(peak_max, 1.0e-6, out=peak_max)
+    np.greater_equal(seed_source, peak_max, out=peak_mask, where=peak_mask)
     _, count = ndi.label(peak_mask, structure=_CC_STRUCTURE)
     return int(count)
 

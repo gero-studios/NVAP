@@ -546,7 +546,7 @@ def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> Chan
     if not config.enabled:
         return ChannelVolume(
             name=channel.name,
-            data=np.asarray(channel.data, dtype=np.float32).copy(),
+            data=np.asarray(channel.data, dtype=np.float32),
             z_indices=list(channel.z_indices),
             spacing=channel.spacing,
         )
@@ -555,27 +555,17 @@ def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> Chan
         logger.info("Preprocess[green] passthrough enabled; returning input unchanged.")
         return ChannelVolume(
             name=channel.name,
-            data=np.asarray(channel.data, dtype=np.float32).copy(),
+            data=np.asarray(channel.data, dtype=np.float32),
             z_indices=list(channel.z_indices),
             spacing=channel.spacing,
         )
 
     denoise_strength = float(config.denoise_strength)
-    if channel.name == "green":
-        denoise_strength *= float(max(config.green_denoise_multiplier, 0.1))
-        denoise_strength *= float(max(config.green_pre_deconv_strength, 0.0))
-    legacy_green = channel.name == "green" and config.green_denoise_strategy == "legacy_anisotropic"
-    if legacy_green:
-        # Keep legacy path visibly less aggressive to preserve branch texture.
-        denoise_strength *= 0.72
-    if channel.name == "green" and config.green_denoise_strategy == "classical_branch_aware":
-        # Keep dedicated classical mode distinct from fast legacy defaults.
-        denoise_strength = max(denoise_strength, 0.022)
 
     logger.info(
         "Preprocessing channel '%s' strategy=%s strength=%.5f worker_threads=%d",
         channel.name,
-        config.green_denoise_strategy if channel.name == "green" else config.denoise_method,
+        config.denoise_method,
         denoise_strength,
         _resolve_worker_threads(config),
     )
@@ -611,18 +601,14 @@ def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> Chan
     )
 
     t = time.perf_counter()
-    if legacy_green:
-        branch_map = np.zeros((1, 1, 1), dtype=np.float32)
-        logger.info("Preprocess[%s] stage=branch_map skipped (legacy_anisotropic)", channel.name)
-    else:
-        logger.info("Preprocess[%s] stage=branch_map start", channel.name)
-        branch_map = stage_branch_map_estimation(stabilized, config, channel.name)
-        logger.info(
-            "Preprocess[%s] stage=branch_map dt=%.2fs nonzero=%.2f%%",
-            channel.name,
-            time.perf_counter() - t,
-            100.0 * float(np.count_nonzero(branch_map)) / max(1, int(branch_map.size)),
-        )
+    logger.info("Preprocess[%s] stage=branch_map start", channel.name)
+    branch_map = stage_branch_map_estimation(stabilized, config, channel.name)
+    logger.info(
+        "Preprocess[%s] stage=branch_map dt=%.2fs nonzero=%.2f%%",
+        channel.name,
+        time.perf_counter() - t,
+        100.0 * float(np.count_nonzero(branch_map)) / max(1, int(branch_map.size)),
+    )
 
     t = time.perf_counter()
     logger.info("Preprocess[%s] stage=denoise_main start", channel.name)
@@ -643,51 +629,13 @@ def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> Chan
     )
 
     t = time.perf_counter()
-    if config.preserve_branches and channel.name == "green" and not legacy_green:
-        denoised = _apply_green_branch_preservation(
-            stabilized,
-            denoised,
-            branch_map,
-            config,
-            mode="pre_speckle",
-        )
-    if channel.name == "green" and not legacy_green:
-        logger.info(
-            "Preprocess[%s] stage=branch_preserve dt=%.2fs boosted=%.2f%%",
-            channel.name,
-            time.perf_counter() - t,
-            (
-                100.0
-                * float(np.count_nonzero(denoised > stabilized))
-                / max(1, int(denoised.size))
-            ),
-        )
-
-    t = time.perf_counter()
-    if legacy_green:
-        denoised = stage_restore_branches_near_bright_pixels(stabilized, denoised)
-        logger.info(
-            "Preprocess[%s] stage=legacy_branch_restore dt=%.2fs %s",
-            channel.name,
-            time.perf_counter() - t,
-            _fmt_stage_stats(denoised),
-        )
-        t = time.perf_counter()
-        denoised = stage_legacy_light_speckle_control(denoised)
-        logger.info(
-            "Preprocess[%s] stage=speckle_control dt=%.2fs mode=legacy_light %s",
-            channel.name,
-            time.perf_counter() - t,
-            _fmt_stage_stats(denoised),
-        )
-    else:
-        denoised = stage_speckle_control(denoised, branch_map, config, channel.name)
-        logger.info(
-            "Preprocess[%s] stage=speckle_control dt=%.2fs %s",
-            channel.name,
-            time.perf_counter() - t,
-            _fmt_stage_stats(denoised),
-        )
+    denoised = stage_speckle_control(denoised, branch_map, config, channel.name)
+    logger.info(
+        "Preprocess[%s] stage=speckle_control dt=%.2fs %s",
+        channel.name,
+        time.perf_counter() - t,
+        _fmt_stage_stats(denoised),
+    )
     logger.info(
         "Preprocess[%s] complete dt=%.2fs",
         channel.name,

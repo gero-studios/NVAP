@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-
 from nvap.analysis.microglia_vessel_report import (
     MICROGLIA_CELL_REPORT_COLUMNS,
     MicrogliaCellReport,
