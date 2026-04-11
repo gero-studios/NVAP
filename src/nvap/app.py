@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 from pathlib import Path
 
+from nvap.analysis.microglia_vessel_report import (
+    MICROGLIA_CELL_REPORT_COLUMNS,
+    analyze_microglia_vessel,
+    microglia_cell_report_to_csv_rows,
+)
 from nvap.analysis.metrics import compute_metrics
 from nvap.analysis.green_benchmark import run_green_denoise_benchmark
 from nvap.cache.processed_cache import clear_processed_cache
@@ -133,6 +139,51 @@ def run_benchmark_denoise(
     return 0
 
 
+def run_microglia_analysis(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    segmentation_mode: str = "auto",
+    threshold_source: str = "adaptive",
+) -> int:
+    """Run microglia-vessel analysis and export the result as CSV."""
+    source = Path(input_path).resolve()
+    out = Path(output_path).resolve()
+    logger.info(
+        "Microglia analysis: input=%s output=%s segmentation_mode=%s threshold_source=%s",
+        source,
+        out,
+        segmentation_mode,
+        threshold_source,
+    )
+
+    dataset = load_dataset(source, spacing=DEFAULT_SPACING)
+    dataset = fill_and_sync_dataset(dataset)
+    preprocess_cfg = PreprocessConfig(enabled=True)
+    dataset = preprocess_dataset(dataset, preprocess_cfg)
+    report = analyze_microglia_vessel(
+        dataset,
+        RenderConfig(),
+        preprocess_cfg,
+        segmentation_mode=segmentation_mode,
+        threshold_source=threshold_source,
+    )
+
+    rows = microglia_cell_report_to_csv_rows(report)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(rows[0].keys()) if rows else list(MICROGLIA_CELL_REPORT_COLUMNS),
+        )
+        writer.writeheader()
+        if rows:
+            writer.writerows(rows)
+
+    print(f"NVAP microglia analysis complete - output={out} rows={len(rows)}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="NVAP - NeuroVascular Analytics Program")
     parser.add_argument(
@@ -191,6 +242,28 @@ def main() -> int:
         default="default",
         help="Denoise profile for benchmark: default, low_snr, high_snr.",
     )
+    parser.add_argument(
+        "--microglia-analysis",
+        action="store_true",
+        help="Run microglia-vessel analysis and export CSV output.",
+    )
+    parser.add_argument(
+        "--analysis-output",
+        default="microglia_analysis.csv",
+        help="Output CSV path for --microglia-analysis (default: microglia_analysis.csv).",
+    )
+    parser.add_argument(
+        "--segmentation-mode",
+        default="auto",
+        choices=["auto", "internal", "fiji"],
+        help="Segmentation engine selection for --microglia-analysis.",
+    )
+    parser.add_argument(
+        "--analysis-threshold-source",
+        default="adaptive",
+        choices=["adaptive", "render"],
+        help="Threshold source for --microglia-analysis.",
+    )
     args = parser.parse_args()
     configure_logging(args.debug)
     logger.info("NVAP startup (debug=%s)", args.debug)
@@ -208,6 +281,14 @@ def main() -> int:
 
     if args.export_mesh:
         return run_mesh_export(args.input, args.mesh_output, args.mesh_format)
+
+    if args.microglia_analysis:
+        return run_microglia_analysis(
+            args.input,
+            args.analysis_output,
+            segmentation_mode=args.segmentation_mode,
+            threshold_source=args.analysis_threshold_source,
+        )
 
     from PySide6.QtWidgets import QApplication
 

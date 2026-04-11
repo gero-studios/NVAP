@@ -58,6 +58,26 @@ def test_detect_soma_blobs_updates_peak_mask_in_place(monkeypatch) -> None:
     assert saw_in_place_compare
 
 
+def test_detect_soma_blobs_avoids_scipy_maximum_position(monkeypatch) -> None:
+    arr = np.zeros((4, 32, 32), dtype=np.float32)
+    arr[1, 8, 8] = 0.8
+    arr[2, 22, 22] = 0.7
+
+    def _fail_maximum_position(*_args, **_kwargs):
+        raise AssertionError("large-volume seed detection should not call maximum_position")
+
+    monkeypatch.setattr(microglia_components.ndi, "maximum_position", _fail_maximum_position)
+
+    seed = microglia_components._detect_soma_blobs(
+        arr,
+        threshold=0.1,
+        branch_sensitivity=1.0,
+        spacing=(1.0, 1.0, 1.0),
+    )
+
+    assert int(np.count_nonzero(seed)) >= 1
+
+
 def test_compute_component_labels_orders_by_size_desc() -> None:
     arr = np.zeros((4, 16, 16), dtype=np.float32)
     arr[1:3, 8, 2:12] = 0.2  # large component
@@ -277,6 +297,36 @@ def test_single_soma_not_split_by_patchy_bright_core() -> None:
     assert int(labels[z, 24, 32]) == comp_id
 
 
+def test_single_soma_with_two_close_lobes_stays_one_component() -> None:
+    arr = np.zeros((5, 72, 72), dtype=np.float32)
+    z = 2
+
+    # One soma with two bright lobes and a moderate-intensity body between
+    # them. These should not be treated as two neighboring microglia.
+    arr[z, 31:40, 29:42] = 0.30
+    arr[z, 33:37, 30:34] = 0.68
+    arr[z, 33:37, 37:41] = 0.65
+    arr[z, 34:36, 34:38] = np.maximum(arr[z, 34:36, 34:38], 0.42)
+    arr[z - 1, 34:37, 33:39] = 0.24
+    arr[z + 1, 34:37, 33:39] = 0.24
+    arr[z, 35, 42:50] = 0.16
+
+    labels, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.14,
+        min_voxels=20,
+        max_components=8,
+        smooth_sigma=(0.0, 0.0, 0.0),
+        branch_sensitivity=1.0,
+    )
+
+    assert len(order) == 1
+    comp_id = int(order[0])
+    assert int(sizes[comp_id]) >= 100
+    assert int(labels[z, 35, 31]) == comp_id
+    assert int(labels[z, 35, 39]) == comp_id
+
+
 def test_nearby_somas_connected_by_dim_bridge_stay_separate() -> None:
     arr = np.zeros((5, 80, 80), dtype=np.float32)
     z = 2
@@ -309,3 +359,35 @@ def test_nearby_somas_connected_by_dim_bridge_stay_separate() -> None:
     assert left_id > 0
     assert right_id > 0
     assert left_id != right_id
+
+
+def test_faint_bridge_branch_gets_single_soma_owner() -> None:
+    arr = np.zeros((5, 96, 96), dtype=np.float32)
+    z = 2
+
+    # Two clear somas with one faint branch-like bridge between them. The
+    # left soma has a stronger local connection to the bridge.
+    arr[z, 42:51, 24:33] = 0.54
+    arr[z, 42:51, 64:73] = 0.42
+    arr[z, 46, 33:64] = 0.15
+    arr[z, 45:48, 33:40] = np.maximum(arr[z, 45:48, 33:40], 0.22)
+
+    labels, order, _ = compute_component_labels(
+        arr,
+        threshold=0.12,
+        min_voxels=20,
+        max_components=16,
+        smooth_sigma=(0.0, 0.0, 0.0),
+        branch_sensitivity=1.4,
+    )
+
+    assert len(order) >= 2
+    left_id = int(labels[z, 46, 28])
+    right_id = int(labels[z, 46, 68])
+    bridge_ids = set(np.unique(labels[z, 46, 33:64]).tolist())
+    bridge_ids.discard(0)
+
+    assert left_id > 0
+    assert right_id > 0
+    assert left_id != right_id
+    assert len(bridge_ids) == 1

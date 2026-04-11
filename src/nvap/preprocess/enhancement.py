@@ -551,8 +551,18 @@ def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> Chan
             spacing=channel.spacing,
         )
 
-    if channel.name == "green":
-        logger.info("Preprocess[green] passthrough enabled; returning input unchanged.")
+    green_passthrough = channel.name == "green" and (
+        config.green_denoise_strategy == "microglia_masking"
+        or (
+            config.green_denoise_strategy == "pixel2voxel_no_psf"
+            and config.denoise_method == "wavelet"
+        )
+    )
+    if green_passthrough:
+        logger.info(
+            "Preprocess[green] passthrough strategy=%s; returning input unchanged.",
+            config.green_denoise_strategy,
+        )
         return ChannelVolume(
             name=channel.name,
             data=np.asarray(channel.data, dtype=np.float32),
@@ -561,11 +571,14 @@ def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> Chan
         )
 
     denoise_strength = float(config.denoise_strength)
+    if channel.name == "green":
+        denoise_strength *= float(max(0.1, config.green_denoise_multiplier))
 
     logger.info(
-        "Preprocessing channel '%s' strategy=%s strength=%.5f worker_threads=%d",
+        "Preprocessing channel '%s' strategy=%s green_strategy=%s strength=%.5f worker_threads=%d",
         channel.name,
         config.denoise_method,
+        config.green_denoise_strategy,
         denoise_strength,
         _resolve_worker_threads(config),
     )
@@ -680,4 +693,6 @@ def suggest_green_threshold(volume: np.ndarray, fallback: float = 0.15) -> float
         return float(np.clip(otsu, 0.0, 1.0))
     floor = float(np.percentile(branch_vals, 35))
     result = min(otsu, floor * 1.2)
-    return float(np.clip(max(0.03, result), 0.0, 1.0))
+    # Keep the adaptive floor slightly above the noise regime so nearby dim
+    # cells are less likely to merge into a single component.
+    return float(np.clip(max(0.04, result), 0.0, 1.0))

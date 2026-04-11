@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import scipy.ndimage as ndi
 from skimage.segmentation import watershed as _watershed
 
 
+logger = logging.getLogger(__name__)
 _CC_STRUCTURE = ndi.generate_binary_structure(3, 2).astype(np.uint8, copy=False)
+_MAX_PEAK_CENTER_CANDIDATES = 16384
 
 
 def _empty_labels(shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -75,6 +79,184 @@ def _select_seed_centers(
     return np.asarray(selected, dtype=np.int32)
 
 
+def _peak_centers_from_mask(
+    values: np.ndarray,
+    peak_mask: np.ndarray,
+    *,
+    max_candidates: int = _MAX_PEAK_CENTER_CANDIDATES,
+) -> np.ndarray:
+    coords = np.argwhere(np.asarray(peak_mask, dtype=bool))
+    if coords.size == 0:
+        return np.empty((0, 3), dtype=np.int32)
+
+    candidate_count = int(coords.shape[0])
+    if candidate_count > int(max_candidates):
+        peak_values = np.asarray(values[tuple(coords.T)], dtype=np.float32)
+        keep_count = int(max(1, max_candidates))
+        keep_idx = np.argpartition(peak_values, -keep_count)[-keep_count:]
+        coords = coords[keep_idx]
+        logger.info(
+            "Microglia seed detection: capped peak candidates %d -> %d.",
+            candidate_count,
+            int(coords.shape[0]),
+        )
+    return np.asarray(coords, dtype=np.int32)
+
+
+def _max_positions_for_labels(
+    values: np.ndarray,
+    labels: np.ndarray,
+    label_ids: list[int],
+) -> list[tuple[int, int, int]]:
+    if not label_ids:
+        return []
+    objects = ndi.find_objects(np.asarray(labels))
+    positions: list[tuple[int, int, int]] = []
+    for label_id in label_ids:
+        obj_idx = int(label_id) - 1
+        if obj_idx < 0 or obj_idx >= len(objects):
+            continue
+        comp_slice = objects[obj_idx]
+        if comp_slice is None:
+            continue
+        local_mask = np.asarray(labels[comp_slice] == int(label_id), dtype=bool)
+        if not np.any(local_mask):
+            continue
+        local_values = np.asarray(values[comp_slice], dtype=np.float32)
+        masked_values = np.where(local_mask, local_values, -np.inf)
+        local_pos = np.unravel_index(int(np.argmax(masked_values)), masked_values.shape)
+        positions.append(
+            (
+                int(local_pos[0]) + int(comp_slice[0].start or 0),
+                int(local_pos[1]) + int(comp_slice[1].start or 0),
+                int(local_pos[2]) + int(comp_slice[2].start or 0),
+            )
+        )
+    return positions
+
+
+def _merge_close_soma_marker_positions(
+    positions: list[tuple[int, int, int]],
+    working: np.ndarray,
+    *,
+    low_floor: float,
+    high_t: float,
+    branch_sensitivity: float,
+) -> list[tuple[int, int, int]]:
+    if len(positions) <= 1:
+        return positions
+
+    pts = np.asarray(positions, dtype=np.int32)
+    body_t = float(max(low_floor, high_t * 0.45))
+    body_mask = np.asarray(working >= body_t, dtype=bool)
+    body_labels, _ = ndi.label(body_mask, structure=_CC_STRUCTURE)
+    body_ids = body_labels[pts[:, 0], pts[:, 1], pts[:, 2]]
+
+    merge_radius = float(np.clip(7.0 / max(0.5, branch_sensitivity), 4.5, 9.0))
+    parent = list(range(len(positions)))
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(left: int, right: int) -> None:
+        root_left = find(left)
+        root_right = find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    for i in range(len(positions)):
+        if int(body_ids[i]) <= 0:
+            continue
+        for j in range(i + 1, len(positions)):
+            if int(body_ids[i]) != int(body_ids[j]):
+                continue
+            dist = float(np.linalg.norm(pts[i].astype(np.float32) - pts[j].astype(np.float32)))
+            if dist <= merge_radius:
+                union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for idx in range(len(positions)):
+        groups.setdefault(find(idx), []).append(idx)
+    if all(len(group) == 1 for group in groups.values()):
+        return positions
+
+    merged: list[tuple[int, int, int]] = []
+    for group in groups.values():
+        if len(group) == 1:
+            merged.append(positions[group[0]])
+            continue
+        group_pts = pts[group]
+        group_values = working[group_pts[:, 0], group_pts[:, 1], group_pts[:, 2]]
+        best = int(group[int(np.argmax(group_values))])
+        merged.append(positions[best])
+
+    logger.info(
+        "Microglia seed merge: collapsed %d close soma peak marker(s) into %d marker(s).",
+        len(positions),
+        len(merged),
+    )
+    return merged
+
+
+def _assign_low_confidence_branches_to_one_owner(
+    labels: np.ndarray,
+    working: np.ndarray,
+    *,
+    low_t: float,
+    high_t: float,
+    max_branch_voxels: int,
+) -> np.ndarray:
+    branch_mask = (labels > 0) & (working >= low_t) & (working < high_t)
+    if not np.any(branch_mask):
+        return labels
+
+    branch_labels, n_branch = ndi.label(branch_mask, structure=_CC_STRUCTURE)
+    if n_branch <= 0:
+        return labels
+
+    out = np.asarray(labels, dtype=np.int32).copy()
+    objects = ndi.find_objects(branch_labels)
+    reassigned = 0
+    for branch_id, comp_slice in enumerate(objects, start=1):
+        if comp_slice is None:
+            continue
+        local_branch = branch_labels[comp_slice] == int(branch_id)
+        branch_voxels = int(np.count_nonzero(local_branch))
+        if branch_voxels <= 0 or branch_voxels > int(max_branch_voxels):
+            continue
+
+        local_labels = out[comp_slice]
+        current_ids = np.unique(local_labels[local_branch])
+        current_ids = current_ids[current_ids > 0]
+        if current_ids.size <= 1:
+            continue
+
+        # Score branch ownership by integrated intensity already assigned to
+        # each label; this favors the soma with the strongest 3D connection.
+        scores: list[tuple[float, int]] = []
+        local_values = np.asarray(working[comp_slice], dtype=np.float32)
+        for label_id in current_ids.tolist():
+            owned = local_branch & (local_labels == int(label_id))
+            if np.any(owned):
+                scores.append((float(np.sum(local_values[owned])), int(label_id)))
+        if not scores:
+            continue
+        owner = max(scores)[1]
+        local_labels[local_branch] = owner
+        out[comp_slice] = local_labels
+        reassigned += 1
+
+    if reassigned > 0:
+        logger.info(
+            "Microglia branch ownership: reassigned %d faint branch segment(s) to one soma owner.",
+            reassigned,
+        )
+    return out
+
+
 def _detect_soma_blobs(
     volume: np.ndarray,
     *,
@@ -121,17 +303,22 @@ def _detect_soma_blobs(
         np.subtract(peak_max, 1.0e-6, out=peak_max)
         np.greater_equal(detect, peak_max, out=peak_mask, where=peak_mask)
 
-    peak_labels, n_peaks = ndi.label(peak_mask, structure=_CC_STRUCTURE)
-    # Vectorised: find one max-intensity centre per peak region — O(N) not O(N×K).
-    if n_peaks > 0:
-        positions = ndi.maximum_position(detect, peak_labels, list(range(1, n_peaks + 1)))
-        if not isinstance(positions, list):
-            positions = [positions]
-        local_centers = np.array(positions, dtype=np.int32)
-    else:
-        local_centers = np.empty((0, 3), dtype=np.int32)
-
     max_centers = int(np.clip((arr.shape[1] * arr.shape[2]) // 36, 32, 1024))
+    local_centers = _peak_centers_from_mask(
+        detect,
+        peak_mask,
+        max_candidates=max(_MAX_PEAK_CENTER_CANDIDATES, max_centers * 8),
+    )
+    logger.info(
+        "Microglia seed detection: volume_shape=%s threshold=%.5f peak_floor=%.5f "
+        "peak_candidates=%d max_centers=%d spacing=%s",
+        arr.shape,
+        float(threshold),
+        peak_floor,
+        int(local_centers.shape[0]),
+        max_centers,
+        spacing,
+    )
     min_sep = int(max(2, round(3.0 / sensitivity_scale)))
     selected = _select_seed_centers(
         detect,
@@ -165,14 +352,24 @@ def _detect_soma_blobs(
         np.subtract(fallback_max, 1.0e-6, out=fallback_max)
         np.greater_equal(detect, fallback_max, out=fallback_mask, where=fallback_mask)
     if np.any(fallback_mask):
-        fallback_labels, n_fallback = ndi.label(fallback_mask, structure=_CC_STRUCTURE)
-        # Vectorised: one max-intensity centre per fallback region.
-        if n_fallback > 0:
-            positions = ndi.maximum_position(detect, fallback_labels, list(range(1, n_fallback + 1)))
-            if not isinstance(positions, list):
-                positions = [positions]
-            for pos in positions:
-                seed_mask[int(pos[0]), int(pos[1]), int(pos[2])] = True
+        fallback_candidates = _peak_centers_from_mask(
+            detect,
+            fallback_mask,
+            max_candidates=max(_MAX_PEAK_CENTER_CANDIDATES, max_centers * 8),
+        )
+        fallback_centers = _select_seed_centers(
+            detect,
+            fallback_candidates,
+            min_sep=min_sep,
+            max_centers=max_centers,
+        )
+        logger.info(
+            "Microglia seed fallback: candidates=%d selected=%d.",
+            int(fallback_candidates.shape[0]),
+            int(fallback_centers.shape[0]),
+        )
+        for pos in fallback_centers:
+            seed_mask[int(pos[0]), int(pos[1]), int(pos[2])] = True
         if np.any(seed_mask):
             return seed_mask
 
@@ -196,35 +393,37 @@ def _seed_labels_from_soma_candidates(
     merge_scale = float(np.clip(0.72 - (0.08 * (branch_sensitivity - 1.0)), 0.56, 0.80))
     merge_t = float(np.clip(max(low_floor, high_t * merge_scale), 0.0, max(high_t, low_floor)))
     soma_mask = finite & (working >= merge_t)
+    marker_mask = np.asarray(seed, dtype=bool).copy()
     if np.any(soma_mask):
-        merge_mask = soma_mask
-        if int(np.count_nonzero(soma_mask)) >= 64:
-            merge_mask = ndi.binary_closing(soma_mask, structure=_CC_STRUCTURE, iterations=1)
-        merged_seed = ndi.binary_propagation(seed, structure=_CC_STRUCTURE, mask=merge_mask)
-        if np.any(merged_seed):
-            seed = np.asarray(merged_seed, dtype=bool)
-
-        # Guarantee one seed in each disconnected high-confidence island.
+        # Keep one marker per disconnected high-confidence soma island. Faint
+        # bridges are assigned later by watershed instead of being allowed to
+        # merge distinct somas during marker construction.
         soma_labels, n_soma = ndi.label(soma_mask, structure=_CC_STRUCTURE)
         if n_soma > 0:
             min_island_voxels = max(2, int(min_keep // 2))
             island_sizes = np.bincount(soma_labels.ravel(), minlength=n_soma + 1)
-            # Count seed voxels per island in one vectorised pass — O(N) not O(N×K).
-            seed_per_island = np.bincount(
-                soma_labels[seed].ravel(), minlength=n_soma + 1
-            )
-            need_ids = [
+            valid_ids = [
                 i for i in range(1, n_soma + 1)
-                if island_sizes[i] >= min_island_voxels and seed_per_island[i] == 0
+                if island_sizes[i] >= min_island_voxels
             ]
-            if need_ids:
-                positions = ndi.maximum_position(working, soma_labels, need_ids)
-                if not isinstance(positions, list):
-                    positions = [positions]
+            if valid_ids:
+                positions = _max_positions_for_labels(working, soma_labels, valid_ids)
+                positions = _merge_close_soma_marker_positions(
+                    positions,
+                    working,
+                    low_floor=low_floor,
+                    high_t=high_t,
+                    branch_sensitivity=branch_sensitivity,
+                )
+                logger.info(
+                    "Microglia seed merge: using %d high-confidence soma island marker(s).",
+                    len(positions),
+                )
+                marker_mask &= ~soma_mask
                 for pos in positions:
-                    seed[int(pos[0]), int(pos[1]), int(pos[2])] = True
+                    marker_mask[int(pos[0]), int(pos[1]), int(pos[2])] = True
 
-    seed_labels, _ = ndi.label(seed, structure=_CC_STRUCTURE)
+    seed_labels, _ = ndi.label(marker_mask, structure=_CC_STRUCTURE)
     return np.asarray(seed_labels, dtype=np.int32)
 
 
@@ -295,6 +494,8 @@ def compute_component_labels(
             max(0.0, high_t - 1.0e-4),
         )
     )
+    merge_scale = float(np.clip(0.72 - (0.08 * (branch_sense - 1.0)), 0.56, 0.80))
+    merge_t = float(np.clip(max(low_t, high_t * merge_scale), 0.0, max(high_t, low_t)))
 
     active_bounds = _mask_bounds(finite & (working >= low_t))
     if active_bounds is None:
@@ -337,6 +538,13 @@ def compute_component_labels(
     raw_labels = np.asarray(
         _watershed(-working_roi, markers=seed_labels, mask=candidate, connectivity=2),
         dtype=np.int32,
+    )
+    raw_labels = _assign_low_confidence_branches_to_one_owner(
+        raw_labels,
+        working_roi,
+        low_t=low_t,
+        high_t=merge_t,
+        max_branch_voxels=max(int(min_keep) * 128, int(arr.size * 0.015)),
     )
 
     # --- Quality filtering ---

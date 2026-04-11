@@ -123,3 +123,28 @@ def test_scene_enables_volume_shading_for_depth_cues() -> None:
 
     scene.widget().close()
     app.processEvents()
+
+
+@pytest.mark.integration
+def test_numpy_to_vtk_scalar_order_preserves_zyx_layout() -> None:
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    pytest.importorskip("vtkmodules")
+
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    from nvap.render.vtk_scene import VTKScene
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scene = VTKScene()
+    volume = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+    image = scene._numpy_to_vtk_image(volume, VoxelSpacing())
+    scalars = vtk_to_numpy(image.GetPointData().GetScalars())
+
+    assert tuple(image.GetDimensions()) == (4, 3, 2)
+    assert scalars[0] == volume[0, 0, 0]
+    assert scalars[1] == volume[0, 0, 1]
+    assert scalars[4] == volume[0, 1, 0]
+    assert scalars[12] == volume[1, 0, 0]
+
+    scene.widget().close()
+    app.processEvents()

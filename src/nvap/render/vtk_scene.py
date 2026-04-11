@@ -33,6 +33,28 @@ _RENDER_CUBIC_MAX_AXIS_UPSAMPLE = 2.0
 _RENDER_CUBIC_MAX_TOTAL_UPSAMPLE = 3.0
 
 
+def _volume_debug_summary(volume: np.ndarray) -> str:
+    arr = np.asarray(volume)
+    if arr.size == 0:
+        return (
+            f"shape={arr.shape} dtype={arr.dtype} empty "
+            f"c_contiguous={arr.flags.c_contiguous} f_contiguous={arr.flags.f_contiguous}"
+        )
+    finite = np.asarray(arr[np.isfinite(arr)], dtype=np.float32)
+    if finite.size == 0:
+        stats = "all_nonfinite"
+    else:
+        stats = (
+            f"min={float(np.min(finite)):.5f} mean={float(np.mean(finite)):.5f} "
+            f"max={float(np.max(finite)):.5f} positive={100.0 * float(np.count_nonzero(finite > 0.0)) / max(1, int(finite.size)):.2f}%"
+        )
+    nonfinite = int(arr.size - finite.size)
+    return (
+        f"shape={arr.shape} dtype={arr.dtype} {stats} nonfinite={nonfinite} "
+        f"c_contiguous={arr.flags.c_contiguous} f_contiguous={arr.flags.f_contiguous}"
+    )
+
+
 def _cubic_render_spacing(
     shape: tuple[int, int, int],
     spacing: VoxelSpacing,
@@ -149,12 +171,17 @@ class VTKScene:
         render_spacing = _cubic_render_spacing(volume.shape, spacing)
         needs_resample = not _same_spacing(render_spacing, spacing)
         logger.info(
-            "VTK set_channel_data: channel=%s raw_shape=%s render_spacing=(%.4f, %.4f, %.4f)",
+            "VTK set_channel_data: channel=%s %s input_spacing=(%.4f, %.4f, %.4f) "
+            "render_spacing=(%.4f, %.4f, %.4f) resample=%s",
             channel,
-            volume.shape,
+            _volume_debug_summary(volume),
+            float(spacing.x_um),
+            float(spacing.y_um),
+            float(spacing.z_um),
             render_spacing.x_um,
             render_spacing.y_um,
             render_spacing.z_um,
+            needs_resample,
         )
 
         if channel in self._actors:
@@ -173,7 +200,12 @@ class VTKScene:
                 actor.volume_mapper.SetSampleDistance(max(0.25 * min_sp, 0.02))
                 self._spacing[channel] = render_spacing
                 self.apply_render_config(self._current)
-                logger.info("VTK set_channel_data fast-update: channel=%s shape=%s", channel, volume.shape)
+                logger.info(
+                    "VTK set_channel_data fast-update: channel=%s vtk_dims=%s scalar_count=%d",
+                    channel,
+                    actor.image.GetDimensions(),
+                    actor.image.GetPointData().GetScalars().GetNumberOfTuples(),
+                )
                 return
 
             old = self._actors[channel]
@@ -278,12 +310,18 @@ class VTKScene:
         vtk_img.SetOrigin(0.0, 0.0, 0.0)
 
         vtk_img.GetPointData().SetScalars(self._numpy_to_vtk_scalars(volume))
+        logger.debug(
+            "VTK image created: dims=%s spacing=%s scalar_count=%d",
+            vtk_img.GetDimensions(),
+            vtk_img.GetSpacing(),
+            vtk_img.GetPointData().GetScalars().GetNumberOfTuples(),
+        )
         return vtk_img
 
     def _numpy_to_vtk_scalars(self, volume: np.ndarray):
-        # VTK expects Fortran-order (x varies fastest) from a (z, y, x) volume.
-        # Use a single contiguous copy instead of transpose + ravel + deep-copy.
-        flat = np.ascontiguousarray(volume.ravel(order='F'), dtype=np.float32)
+        # vtkImageData point ids advance x fastest, then y, then z. A C-order
+        # flatten of a (z, y, x) numpy volume preserves that exact order.
+        flat = np.ascontiguousarray(volume.ravel(order="C"), dtype=np.float32)
         vtk_array = numpy_to_vtk(flat, deep=False)
         vtk_array.SetName("intensity")
         return vtk_array
@@ -292,6 +330,13 @@ class VTKScene:
         image.SetSpacing(spacing.x_um, spacing.y_um, spacing.z_um)
         image.GetPointData().SetScalars(self._numpy_to_vtk_scalars(volume))
         image.Modified()
+        logger.debug(
+            "VTK image updated: dims=%s spacing=%s scalar_count=%d %s",
+            image.GetDimensions(),
+            image.GetSpacing(),
+            image.GetPointData().GetScalars().GetNumberOfTuples(),
+            _volume_debug_summary(volume),
+        )
 
     def _build_volume_mapper(self, image_input, render_spacing: VoxelSpacing):
         mapper = vtkSmartVolumeMapper()
@@ -304,6 +349,13 @@ class VTKScene:
         # take enough samples even at oblique angles.
         min_sp = min(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um)
         mapper.SetSampleDistance(max(0.25 * min_sp, 0.02))
+        logger.debug(
+            "VTK volume mapper configured: sample_distance=%.5f render_spacing=(%.4f, %.4f, %.4f)",
+            mapper.GetSampleDistance(),
+            render_spacing.x_um,
+            render_spacing.y_um,
+            render_spacing.z_um,
+        )
         return mapper
 
     def apply_render_config(self, config: RenderConfig) -> None:

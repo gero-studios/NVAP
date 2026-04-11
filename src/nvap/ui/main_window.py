@@ -22,6 +22,11 @@ from PySide6.QtWidgets import (
 )
 
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
+from nvap.analysis.microglia_vessel_report import (
+    MicrogliaCellReport,
+    analyze_microglia_vessel,
+    microglia_cell_report_to_csv_rows,
+)
 from nvap.cache.processed_cache import (
     build_dataset_signature,
     build_processed_cache_key,
@@ -117,6 +122,20 @@ class _FunctionThread(QThread):
 
 
 class MainWindow(QMainWindow):
+    @staticmethod
+    def _build_process_task_result(
+        processed_dataset: DatasetVolume,
+        preprocess_config: PreprocessConfig,
+    ) -> _LoadTaskResult:
+        return _LoadTaskResult(
+            synced_dataset=processed_dataset,
+            raw_dataset=processed_dataset,
+            processed_dataset=processed_dataset,
+            visual_dataset=processed_dataset,
+            threshold_green=default_green_threshold(processed_dataset.green.data),
+            threshold_red=default_threshold(processed_dataset.red.data),
+        )
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("NVAP - NeuroVascular Analytics Program")
@@ -140,6 +159,7 @@ class MainWindow(QMainWindow):
         self.current_psf = self.controls.current_psf_config()
         self.current_render = self.controls.current_render_config()
         self.latest_metrics: MetricsComputation | None = None
+        self.latest_microglia_report: MicrogliaCellReport | None = None
         self.dataset_root: Path | None = None
         self._dataset_signature: str | None = None
         self._busy_dialog: QProgressDialog | None = None
@@ -174,13 +194,21 @@ class MainWindow(QMainWindow):
         self._log_handler.setFormatter(
             logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
         )
-        logging.getLogger("nvap").addHandler(self._log_handler)
+        nvap_logger = logging.getLogger("nvap")
+        nvap_logger.setLevel(logging.INFO)
+        nvap_logger.addHandler(self._log_handler)
 
         self.controls.load_requested.connect(self._on_load_requested)
         self.controls.apply_psf_requested.connect(self._on_apply_psf_requested)
         self.controls.psf_config_changed.connect(self._on_psf_config_changed)
         self.controls.render_config_changed.connect(self._on_render_config_changed)
         self.controls.microglia_view_changed.connect(self._on_microglia_view_changed)
+        self.controls.run_microglia_analysis_requested.connect(
+            self._on_run_microglia_analysis_requested
+        )
+        self.controls.export_microglia_analysis_requested.connect(
+            self._on_export_microglia_analysis_requested
+        )
         self.controls.export_metrics_requested.connect(self._on_export_metrics_requested)
         self.controls.export_snapshot_requested.connect(self._on_export_snapshot_requested)
         self.controls.export_mesh_requested.connect(self._on_export_mesh_requested)
@@ -1109,6 +1137,8 @@ class MainWindow(QMainWindow):
         self.raw_dataset = result.raw_dataset
         self.processed_dataset = result.processed_dataset
         self.visual_dataset = result.visual_dataset
+        self.latest_microglia_report = None
+        self.controls.clear_microglia_analysis_table()
         self._invalidate_microglia_components()
         self._push_scene_channels()
         self._publish_busy_progress(percent=97.0, message="Applying initial thresholds + metrics...")
@@ -1126,6 +1156,8 @@ class MainWindow(QMainWindow):
         self._microglia_isolate_active = bool(self.controls.microglia_view_state()[0])
         self.processed_dataset = result
         self.visual_dataset = prepare_dataset_for_mesh(self.processed_dataset, self.preprocess_config)
+        self.latest_microglia_report = None
+        self.controls.clear_microglia_analysis_table()
         self._publish_busy_progress(percent=94.0, message="Uploading channels to VTK...")
         self._invalidate_microglia_components()
         self._push_scene_channels()
@@ -1355,8 +1387,6 @@ class MainWindow(QMainWindow):
             # Start background microglia refresh which will also push scene
             # channels when done — avoid synchronous watershed here.
             self._start_microglia_refresh_task()
-            if z_scale_changed and not threshold_changed:
-                self._push_scene_channels()
             self.scene.apply_render_config(config)
             self._refresh_metrics()
             return
@@ -1430,6 +1460,74 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_info(f"Metrics export failed: {exc}")
             self._show_error("Export failed", str(exc))
+
+    def _on_run_microglia_analysis_requested(self) -> None:
+        if self.processed_dataset is None:
+            self._show_error("No dataset", "Load a dataset before running microglia analysis.")
+            return
+        dataset = self.processed_dataset
+        preprocess_cfg = self.preprocess_config
+        render = self.current_render
+        segmentation_mode = "internal"
+        threshold_source = self.controls.current_microglia_analysis_threshold_mode()
+
+        def _run_analysis() -> MicrogliaCellReport:
+            self._publish_busy_progress(percent=15.0, message="Analyzing microglia vs vasculature...")
+            report = analyze_microglia_vessel(
+                dataset,
+                render,
+                preprocess_cfg,
+                segmentation_mode=segmentation_mode,
+                branch_sensitivity=float(self.controls.current_microglia_branch_sensitivity()),
+                threshold_source=threshold_source,
+            )
+            self._publish_busy_progress(percent=100.0, message="Microglia analysis complete.")
+            return report
+
+        def _on_success(result: object) -> None:
+            if not isinstance(result, MicrogliaCellReport):
+                raise TypeError("Invalid microglia analysis result payload.")
+            self.latest_microglia_report = result
+            self.controls.set_microglia_analysis_report(result)
+            self.statusBar().showMessage(
+                f"Microglia analysis complete: {result.cell_count} cell(s) detected.",
+                5000,
+            )
+
+        self._start_background_task(
+            title="Microglia Analysis",
+            message="Computing per-cell microglia to vessel distances...",
+            fn=_run_analysis,
+            on_success=_on_success,
+            error_title="Microglia analysis failed",
+            success_status="Microglia analysis complete.",
+        )
+
+    def _on_export_microglia_analysis_requested(self) -> None:
+        if self.latest_microglia_report is None:
+            self._show_error("No analysis", "Run microglia analysis before exporting.")
+            return
+        start = str((self.dataset_root or Path.cwd()) / "microglia_analysis.csv")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Microglia Analysis CSV",
+            start,
+            "CSV files (*.csv)",
+        )
+        if not file_path:
+            return
+        try:
+            with self._busy("Export Microglia Analysis", "Writing CSV..."):
+                self._publish_busy_progress(percent=20.0, message="Collecting analysis rows...")
+                rows = microglia_cell_report_to_csv_rows(self.latest_microglia_report)
+                self._publish_busy_progress(percent=70.0, message="Writing CSV file...")
+                out = export_metrics_csv(rows, file_path)
+                self._publish_busy_progress(percent=100.0, message="Analysis export complete.")
+            self.statusBar().showMessage(f"Microglia analysis exported to {out}", 5000)
+            self._log_info(f"Microglia analysis exported: {out}")
+        except Exception as exc:
+            self._log_info(f"Microglia analysis export failed: {exc}")
+            self._show_error("Microglia analysis export failed", str(exc))
 
     def _on_export_snapshot_requested(self) -> None:
         start = str((self.dataset_root or Path.cwd()) / "snapshot.png")

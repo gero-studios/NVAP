@@ -49,11 +49,39 @@ def _shared_range(green: ChannelVolume, red: ChannelVolume) -> tuple[int, int]:
     return start, end
 
 
+def _align_channel_to_range(
+    channel: ChannelVolume,
+    *,
+    z_start: int,
+    z_end: int,
+) -> ChannelVolume:
+    full_z = list(range(int(z_start), int(z_end) + 1))
+    index_map = {int(z): idx for idx, z in enumerate(channel.z_indices)}
+    plane_shape = channel.data.shape[1:]
+    out = np.zeros((len(full_z),) + plane_shape, dtype=np.float32)
+    for out_idx, z in enumerate(full_z):
+        src_idx = index_map.get(int(z))
+        if src_idx is None:
+            continue
+        out[out_idx] = np.asarray(channel.data[src_idx], dtype=np.float32)
+    return ChannelVolume(
+        name=channel.name,
+        data=out,
+        z_indices=full_z,
+        spacing=channel.spacing,
+    )
+
+
 def fill_and_sync_dataset(dataset: DatasetVolume) -> DatasetVolume:
     logger.info("Filling missing slices and syncing channel z-ranges.")
     green = fill_channel_missing_slices(dataset.green)
     red = fill_channel_missing_slices(dataset.red)
     shared = _shared_range(green, red)
+    global_start = min(min(green.z_indices), min(red.z_indices))
+    global_end = max(max(green.z_indices), max(red.z_indices))
+    green = _align_channel_to_range(green, z_start=global_start, z_end=global_end)
+    red = _align_channel_to_range(red, z_start=global_start, z_end=global_end)
+    shared = (global_start, global_end)
     logger.info(
         "Synced dataset: green_z=%d red_z=%d shared_range=%s",
         len(green.z_indices),

@@ -5,6 +5,7 @@ import numpy as np
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -12,11 +13,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from nvap.analysis.microglia_vessel_report import MICROGLIA_CELL_REPORT_COLUMNS, MicrogliaCellReport
 from nvap.config.types import MeshExportConfig, PSFConfig, PreprocessConfig, RenderConfig
 
 
@@ -26,6 +30,8 @@ class ControlPanel(QWidget):
     render_config_changed = Signal(object)
     psf_config_changed = Signal(object)
     microglia_view_changed = Signal()
+    run_microglia_analysis_requested = Signal()
+    export_microglia_analysis_requested = Signal()
     export_metrics_requested = Signal()
     export_snapshot_requested = Signal()
     export_mesh_requested = Signal()
@@ -102,6 +108,9 @@ class ControlPanel(QWidget):
 
         self.microglia_group = self._build_microglia_group()
         root.addWidget(self.microglia_group)
+
+        self.microglia_analysis_group = self._build_microglia_analysis_group()
+        root.addWidget(self.microglia_analysis_group)
 
         export_group = QGroupBox("Export")
         export_layout = QHBoxLayout(export_group)
@@ -223,6 +232,18 @@ class ControlPanel(QWidget):
         self.display_z_scale.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Z height scale", self.display_z_scale)
 
+        self.trim_first_slices = QSpinBox()
+        self.trim_first_slices.setRange(0, 9999)
+        self.trim_first_slices.setValue(20)
+        self.trim_first_slices.valueChanged.connect(self._on_render_setting_changed)
+        form.addRow("Trim first Z", self.trim_first_slices)
+
+        self.trim_last_slices = QSpinBox()
+        self.trim_last_slices.setRange(0, 9999)
+        self.trim_last_slices.setValue(20)
+        self.trim_last_slices.valueChanged.connect(self._on_render_setting_changed)
+        form.addRow("Trim last Z", self.trim_last_slices)
+
         self.offset_x = self._make_offset_spinbox()
         self.offset_x.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Offset X um", self.offset_x)
@@ -263,6 +284,11 @@ class ControlPanel(QWidget):
                 "Red keeps the existing workflow."
             )
         )
+
+        self.reprocess_btn = QPushButton("Reprocess Dataset")
+        self.reprocess_btn.setToolTip("Run the preprocessing / processing pipeline again.")
+        self.reprocess_btn.clicked.connect(self.apply_psf_requested.emit)
+        form.addRow(self.reprocess_btn)
         return group
 
     def _build_microglia_group(self) -> QGroupBox:
@@ -299,6 +325,38 @@ class ControlPanel(QWidget):
         form.addRow("Branch sensitivity", self.microglia_branch_sensitivity)
 
         self._set_microglia_navigation_enabled(False)
+        return group
+
+    def _build_microglia_analysis_group(self) -> QGroupBox:
+        group = QGroupBox("Microglia Analysis")
+        layout = QVBoxLayout(group)
+
+        controls_row = QHBoxLayout()
+        self.microglia_analysis_threshold_mode = QComboBox()
+        self.microglia_analysis_threshold_mode.addItem("Adaptive thresholds", "adaptive")
+        self.microglia_analysis_threshold_mode.addItem("Use render thresholds", "render")
+        controls_row.addWidget(QLabel("Thresholds"))
+        controls_row.addWidget(self.microglia_analysis_threshold_mode)
+        layout.addLayout(controls_row)
+
+        action_row = QHBoxLayout()
+        self.run_microglia_analysis_btn = QPushButton("Run Analysis")
+        self.run_microglia_analysis_btn.clicked.connect(self.run_microglia_analysis_requested.emit)
+        action_row.addWidget(self.run_microglia_analysis_btn)
+
+        self.export_microglia_analysis_btn = QPushButton("Export Analysis CSV")
+        self.export_microglia_analysis_btn.setEnabled(False)
+        self.export_microglia_analysis_btn.clicked.connect(
+            self.export_microglia_analysis_requested.emit
+        )
+        action_row.addWidget(self.export_microglia_analysis_btn)
+        layout.addLayout(action_row)
+
+        self.microglia_analysis_table = QTableWidget(0, len(MICROGLIA_CELL_REPORT_COLUMNS))
+        self.microglia_analysis_table.setHorizontalHeaderLabels(MICROGLIA_CELL_REPORT_COLUMNS)
+        self.microglia_analysis_table.setAlternatingRowColors(True)
+        self.microglia_analysis_table.setMinimumHeight(140)
+        layout.addWidget(self.microglia_analysis_table)
         return group
 
     @staticmethod
@@ -431,6 +489,8 @@ class ControlPanel(QWidget):
             iso_green=float(self.iso_green.value()),
             iso_red=float(self.iso_red.value()),
             display_z_scale=float(self.display_z_scale.value()),
+            trim_first_slices=int(self.trim_first_slices.value()),
+            trim_last_slices=int(self.trim_last_slices.value()),
             offset_x_um=float(self.offset_x.value()),
             offset_y_um=float(self.offset_y.value()),
             offset_z_um=float(self.offset_z.value()),
@@ -482,6 +542,9 @@ class ControlPanel(QWidget):
     def current_microglia_branch_sensitivity(self) -> float:
         return float(self.microglia_branch_sensitivity.value())
 
+    def current_microglia_analysis_threshold_mode(self) -> str:
+        return str(self.microglia_analysis_threshold_mode.currentData())
+
     def set_microglia_component_summary(
         self,
         count: int,
@@ -507,6 +570,40 @@ class ControlPanel(QWidget):
 
     def set_plugin_text(self, text: str) -> None:
         self.plugin_text.setPlainText(text)
+
+    def set_microglia_analysis_report(self, report: MicrogliaCellReport) -> None:
+        self.microglia_analysis_table.setRowCount(0)
+        self.microglia_analysis_table.setRowCount(len(report.rows))
+        for row_idx, row in enumerate(report.rows):
+            values = {
+                "cell_index": row.cell_index,
+                "component_id": row.component_id,
+                "segmentation_engine_used": row.segmentation_engine_used,
+                "voxel_count": row.voxel_count,
+                "volume_um3": row.volume_um3,
+                "branch_endpoint_count": row.branch_endpoint_count,
+                "branch_junction_count": row.branch_junction_count,
+                "distance_to_vasculature_um": row.distance_to_vasculature_um,
+                "microglia_closest_x_um": row.microglia_closest_x_um,
+                "microglia_closest_y_um": row.microglia_closest_y_um,
+                "microglia_closest_z_um": row.microglia_closest_z_um,
+                "vessel_closest_x_um": row.vessel_closest_x_um,
+                "vessel_closest_y_um": row.vessel_closest_y_um,
+                "vessel_closest_z_um": row.vessel_closest_z_um,
+                "threshold_green_used": row.threshold_green_used,
+                "threshold_red_used": row.threshold_red_used,
+            }
+            for col_idx, key in enumerate(MICROGLIA_CELL_REPORT_COLUMNS):
+                self.microglia_analysis_table.setItem(
+                    row_idx,
+                    col_idx,
+                    QTableWidgetItem(str(values[key])),
+                )
+        self.export_microglia_analysis_btn.setEnabled(len(report.rows) > 0)
+
+    def clear_microglia_analysis_table(self) -> None:
+        self.microglia_analysis_table.setRowCount(0)
+        self.export_microglia_analysis_btn.setEnabled(False)
 
     def append_debug_text(self, text: str) -> None:
         self.debug_text.append(text)

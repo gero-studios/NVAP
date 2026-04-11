@@ -50,3 +50,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "integration: integration-level coverage for UI and pipeline behavior",
+]
