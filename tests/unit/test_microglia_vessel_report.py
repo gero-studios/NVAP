@@ -5,6 +5,7 @@ from nvap.analysis.microglia_vessel_report import (
     MICROGLIA_CELL_REPORT_COLUMNS,
     MicrogliaCellReport,
     analyze_microglia_vessel,
+    export_microglia_analysis_bundle,
     microglia_cell_report_to_csv_rows,
 )
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig, RenderConfig, VoxelSpacing
@@ -286,3 +287,114 @@ def test_adaptive_threshold_source_recovers_dim_microglia_when_render_threshold_
     assert report_render.cell_count == 0
     assert report_adaptive.cell_count == 1
     assert report_adaptive.threshold_green_used < 0.5
+
+
+def test_soma_branch_tip_and_debug_metrics_are_reported() -> None:
+    green = np.zeros((5, 64, 64), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[2, 28:35, 28:35] = 0.9
+    green[2, 31, 35:50] = 0.65
+    green[2, 16:28, 31] = 0.62
+    red[2, 31, 55:60] = 1.0
+    red[2, 13:18, 31] = 1.0
+    ds = _dataset(green, red)
+
+    report = analyze_microglia_vessel(
+        ds,
+        RenderConfig(threshold_green=0.5, threshold_red=0.5),
+        PreprocessConfig(),
+        segmentation_mode="internal",
+        threshold_source="render",
+    )
+
+    assert report.cell_count == 1
+    row = report.rows[0]
+    assert row.soma_voxel_count > 0
+    assert row.soma_volume_um3 > 0.0
+    assert row.soma_distance_to_vasculature_um >= 0.0
+    assert row.branch_count >= 1
+    assert len(report.branch_rows) >= 1
+    assert len(report.tip_rows) >= 1
+    assert report.branch_rows[0].component_id == row.component_id
+    assert report.tip_rows[0].cell_index == row.cell_index
+    assert "soma_core_labels" in report.debug_volumes
+    assert int(np.max(report.debug_volumes["tip_marker_labels"])) >= 1
+    assert report.debug_measurements["overlay_points"]
+
+
+def test_tip_reports_multiple_nearby_vessels_and_local_diameter() -> None:
+    green = np.zeros((5, 64, 64), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[2, 30:35, 20:25] = 0.9
+    green[2, 32, 25:45] = 0.7
+    red[2, 30:35, 50:55] = 1.0
+    red[1:4, 38:43, 42:47] = 1.0
+    ds = _dataset(green, red)
+
+    report = analyze_microglia_vessel(
+        ds,
+        RenderConfig(threshold_green=0.5, threshold_red=0.5),
+        PreprocessConfig(),
+        segmentation_mode="internal",
+        threshold_source="render",
+    )
+
+    assert report.tip_rows
+    assert max(tip.nearby_vessel_count for tip in report.tip_rows) >= 1
+    assert max(row.nearest_vessel_diameter_um for row in report.rows) >= 2.0
+
+
+def test_vessel_crossing_heuristic_reports_over_under() -> None:
+    green = np.zeros((7, 40, 40), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[3, 5, 5:30] = 1.0
+    red[2, 20, 8:32] = 1.0
+    red[5, 8:32, 20] = 1.0
+    ds = _dataset(green, red)
+
+    report = analyze_microglia_vessel(
+        ds,
+        RenderConfig(threshold_green=0.5, threshold_red=0.5),
+        PreprocessConfig(),
+        segmentation_mode="internal",
+        threshold_source="render",
+    )
+
+    assert report.crossing_rows
+    crossing = report.crossing_rows[0]
+    assert crossing.status in {"over_under", "ambiguous"}
+    assert int(np.max(report.debug_volumes["vessel_crossing_markers"])) >= 1
+    if crossing.status == "over_under":
+        assert crossing.over_vessel_id > 0
+
+
+def test_microglia_analysis_bundle_exports_debug_artifacts(tmp_path) -> None:
+    green = np.zeros((3, 32, 32), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[1, 12, 4:24] = 1.0
+    red[1, 12, 28:31] = 1.0
+    ds = _dataset(green, red)
+    report = analyze_microglia_vessel(
+        ds,
+        RenderConfig(threshold_green=0.5, threshold_red=0.5),
+        PreprocessConfig(),
+        segmentation_mode="internal",
+        threshold_source="render",
+    )
+
+    outputs = export_microglia_analysis_bundle(
+        report,
+        tmp_path / "microglia_analysis.csv",
+        green_volume=green,
+        red_volume=red,
+    )
+
+    assert outputs["cells"].exists()
+    assert outputs["branches"].exists()
+    assert outputs["tips"].exists()
+    assert outputs["vessel_crossings"].exists()
+    assert outputs["debug_label_volumes"].exists()
+    assert outputs["debug_measurements"].exists()
+    assert outputs["overlay_xy"].exists()
+    loaded = np.load(outputs["debug_label_volumes"])
+    assert "microglia_component_labels" in loaded.files

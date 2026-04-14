@@ -3,7 +3,11 @@ from __future__ import annotations
 import numpy as np
 
 from nvap.analysis import microglia_components
-from nvap.analysis.microglia_components import compute_component_labels, isolate_component
+from nvap.analysis.microglia_components import (
+    compute_component_labels,
+    filter_components_by_preferred_voxel_floor,
+    isolate_component,
+)
 
 
 def test_mask_bounds_avoids_full_nonzero_coordinate_allocation(monkeypatch) -> None:
@@ -391,3 +395,66 @@ def test_faint_bridge_branch_gets_single_soma_owner() -> None:
     assert right_id > 0
     assert left_id != right_id
     assert len(bridge_ids) == 1
+
+
+def test_preferred_voxel_floor_drops_small_components_when_large_one_exists() -> None:
+    labels = np.zeros((1, 4, 5), dtype=np.int32)
+    labels[0, 0, 0:2] = 1
+    labels[0, 1:4, 1:5] = 2
+    order = np.asarray([2, 1], dtype=np.int32)
+    sizes = np.asarray([0, 4_000, 18_000], dtype=np.int64)
+
+    filtered_labels, filtered_order, filtered_sizes = filter_components_by_preferred_voxel_floor(
+        labels,
+        order,
+        sizes,
+    )
+
+    assert filtered_order.tolist() == [1]
+    assert int(filtered_sizes[1]) == 18_000
+    assert int(np.max(filtered_labels)) == 1
+    assert int(filtered_labels[0, 0, 0]) == 0
+    assert int(filtered_labels[0, 2, 2]) == 1
+
+
+def test_preferred_voxel_floor_preserves_small_components_when_no_large_one_exists() -> None:
+    labels = np.zeros((1, 3, 4), dtype=np.int32)
+    labels[0, 0, 0:2] = 1
+    labels[0, 1:3, 2:4] = 2
+    order = np.asarray([2, 1], dtype=np.int32)
+    sizes = np.asarray([0, 4_200, 9_000], dtype=np.int64)
+
+    filtered_labels, filtered_order, filtered_sizes = filter_components_by_preferred_voxel_floor(
+        labels,
+        order,
+        sizes,
+    )
+
+    assert np.array_equal(filtered_labels, labels)
+    assert np.array_equal(filtered_order, order)
+    assert np.array_equal(filtered_sizes, sizes)
+
+
+def test_preferred_voxel_floor_demotes_likely_merged_giant_components() -> None:
+    labels = np.zeros((1, 1, 10), dtype=np.int32)
+    for component_id in range(1, 11):
+        labels[0, 0, component_id - 1] = component_id
+    order = np.asarray([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=np.int32)
+    sizes = np.asarray(
+        [0, 240_000, 190_000, 31_000, 30_500, 29_800, 29_100, 28_700, 28_000, 27_600, 27_000],
+        dtype=np.int64,
+    )
+
+    filtered_labels, filtered_order, filtered_sizes = filter_components_by_preferred_voxel_floor(
+        labels,
+        order,
+        sizes,
+    )
+
+    assert filtered_order.tolist() == list(range(1, 11))
+    assert int(filtered_sizes[1]) == 31_000
+    assert int(filtered_sizes[2]) == 30_500
+    assert int(filtered_sizes[9]) == 240_000
+    assert int(filtered_sizes[10]) == 190_000
+    assert int(filtered_labels[0, 0, 0]) == 9
+    assert int(filtered_labels[0, 0, 2]) == 1

@@ -10,6 +10,7 @@ from skimage.segmentation import watershed as _watershed
 logger = logging.getLogger(__name__)
 _CC_STRUCTURE = ndi.generate_binary_structure(3, 2).astype(np.uint8, copy=False)
 _MAX_PEAK_CENTER_CANDIDATES = 16384
+PREFERRED_VISIBLE_MICROGLIA_MIN_VOXELS = 15_000
 
 
 def _empty_labels(shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -636,3 +637,69 @@ def isolate_component(
     local_mask = lbl[bounds] == component
     out[bounds][local_mask] = arr[bounds][local_mask]
     return out
+
+
+def filter_components_by_preferred_voxel_floor(
+    labels: np.ndarray,
+    order: np.ndarray,
+    sizes: np.ndarray,
+    *,
+    preferred_min_voxels: int = PREFERRED_VISIBLE_MICROGLIA_MIN_VOXELS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Drop small components when clearly visible larger components already exist."""
+    lbl = np.asarray(labels, dtype=np.int32)
+    ordered = np.asarray(order, dtype=np.int32)
+    comp_sizes = np.asarray(sizes, dtype=np.int64)
+    preferred_floor = max(1, int(preferred_min_voxels))
+
+    if ordered.size <= 0 or comp_sizes.size <= 1:
+        return lbl, ordered, comp_sizes
+
+    keep_mask = np.array(
+        [
+            int(component_id) < int(comp_sizes.shape[0])
+            and int(comp_sizes[int(component_id)]) >= preferred_floor
+            for component_id in ordered
+        ],
+        dtype=bool,
+    )
+    if not np.any(keep_mask):
+        return lbl, ordered, comp_sizes
+
+    keep_ids = ordered[keep_mask]
+    if keep_ids.size >= 8:
+        keep_sizes = np.asarray(comp_sizes[keep_ids], dtype=np.float64)
+        median_size = float(np.median(keep_sizes))
+        q25, q75 = np.percentile(keep_sizes, [25.0, 75.0])
+        iqr = float(max(1.0, q75 - q25))
+        giant_floor = float(
+            max(
+                preferred_floor * 3.0,
+                median_size * 2.75,
+                q75 + (2.5 * iqr),
+            )
+        )
+        giant_mask = keep_sizes > giant_floor
+        if np.any(giant_mask) and np.any(~giant_mask):
+            normal_ids = keep_ids[~giant_mask]
+            giant_ids = keep_ids[giant_mask]
+            normal_ids = normal_ids[np.argsort(comp_sizes[normal_ids])[::-1]]
+            giant_ids = giant_ids[np.argsort(comp_sizes[giant_ids])[::-1]]
+            keep_ids = np.concatenate([normal_ids, giant_ids]).astype(np.int32, copy=False)
+            logger.info(
+                "Microglia ranking: moved %d unusually large component(s) after "
+                "typical cells (median=%d giant_floor=%d).",
+                int(np.count_nonzero(giant_mask)),
+                int(round(median_size)),
+                int(round(giant_floor)),
+            )
+
+    lut = np.zeros(int(comp_sizes.shape[0]), dtype=np.int32)
+    filtered_sizes = np.zeros(int(keep_ids.size) + 1, dtype=np.int64)
+    for new_id, old_id in enumerate(keep_ids, start=1):
+        lut[int(old_id)] = int(new_id)
+        filtered_sizes[new_id] = int(comp_sizes[int(old_id)])
+
+    filtered_labels = lut[lbl]
+    filtered_order = np.arange(1, int(keep_ids.size) + 1, dtype=np.int32)
+    return filtered_labels, filtered_order, filtered_sizes

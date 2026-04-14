@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QScrollArea,
     QSplitter,
 )
 
@@ -25,7 +26,7 @@ from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
 from nvap.analysis.microglia_vessel_report import (
     MicrogliaCellReport,
     analyze_microglia_vessel,
-    microglia_cell_report_to_csv_rows,
+    export_microglia_analysis_bundle,
 )
 from nvap.cache.processed_cache import (
     build_dataset_signature,
@@ -54,7 +55,11 @@ from nvap.pipeline import (
     fill_and_sync_dataset,
     prepare_dataset_for_mesh,
 )
-from nvap.analysis.microglia_components import compute_component_labels, isolate_component
+from nvap.analysis.microglia_components import (
+    compute_component_labels,
+    filter_components_by_preferred_voxel_floor,
+    isolate_component,
+)
 from nvap.preprocess.enhancement import preprocess_dataset
 from nvap.plugins.registry import discover_plugins
 from nvap.render.vtk_scene import VTKScene
@@ -143,8 +148,13 @@ class MainWindow(QMainWindow):
 
         self.scene = VTKScene(self)
         self.controls = ControlPanel(self)
+        self.controls_scroll = QScrollArea(self)
+        self.controls_scroll.setObjectName("controlPanelScrollArea")
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setWidget(self.controls)
         splitter = QSplitter(self)
-        splitter.addWidget(self.controls)
+        splitter.addWidget(self.controls_scroll)
         splitter.addWidget(self.scene.widget())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -185,6 +195,7 @@ class MainWindow(QMainWindow):
         self._green_component_branch_sensitivity: float | None = None
         self._green_component_shape: tuple[int, int, int] | None = None
         self._green_component_sparse: dict[int, tuple[tuple[slice, slice, slice], np.ndarray]] = {}
+        self._green_component_coloring_active = False
         self._microglia_isolate_active = bool(self.controls.microglia_view_state()[0])
         self._microglia_label_cache_max_bytes = 256 * 1024 * 1024
 
@@ -205,6 +216,9 @@ class MainWindow(QMainWindow):
         self.controls.microglia_view_changed.connect(self._on_microglia_view_changed)
         self.controls.run_microglia_analysis_requested.connect(
             self._on_run_microglia_analysis_requested
+        )
+        self.controls.microglia_analysis_overlay_changed.connect(
+            self._refresh_microglia_analysis_overlays
         )
         self.controls.export_microglia_analysis_requested.connect(
             self._on_export_microglia_analysis_requested
@@ -308,8 +322,22 @@ class MainWindow(QMainWindow):
         self._green_component_branch_sensitivity = None
         self._green_component_shape = None
         self._green_component_sparse = {}
+        self._green_component_coloring_active = False
+        self.scene.set_channel_component_coloring("green", False)
+        self.scene.clear_debug_overlays()
         self.controls.set_microglia_component_summary(0, 0, 0)
         self.controls.microglia_info.setText("Enable 'View one microglia' to detect components.")
+
+    def _refresh_microglia_analysis_overlays(self) -> None:
+        if self.latest_microglia_report is None:
+            self.scene.clear_debug_overlays()
+            return
+        measurements = self.latest_microglia_report.debug_measurements
+        self.scene.set_debug_overlays(
+            points=measurements.get("overlay_points", []) if isinstance(measurements, dict) else [],
+            lines=measurements.get("overlay_lines", []) if isinstance(measurements, dict) else [],
+            visibility=self.controls.current_microglia_debug_overlay_state(),
+        )
 
     def _compute_microglia_components(
         self,
@@ -343,7 +371,7 @@ class MainWindow(QMainWindow):
         min_voxels = max(32, min_voxels)
         if green.size >= 120 * 1024 * 1024:
             min_voxels = max(min_voxels, 256)
-        return compute_component_labels(
+        labels, order, sizes = compute_component_labels(
             green,
             threshold=threshold,
             min_voxels=min_voxels,
@@ -352,6 +380,7 @@ class MainWindow(QMainWindow):
             branch_sensitivity=branch_sense,
             spacing=spacing,
         )
+        return filter_components_by_preferred_voxel_floor(labels, order, sizes)
 
     def _cache_microglia_components(
         self,
@@ -519,12 +548,30 @@ class MainWindow(QMainWindow):
             raise RuntimeError("No visual dataset loaded.")
         base = np.asarray(self.visual_dataset.green.data, dtype=np.float32)
         enabled, selected_index = self.controls.microglia_view_state()
-        if not enabled or selected_index <= 0:
+        self._green_component_coloring_active = False
+        if not enabled:
             return base
 
         self._refresh_microglia_components_if_needed()
         if self._green_component_sizes is None:
             return base
+        count = int(len(self._green_component_order))
+        if selected_index <= 0:
+            self.controls.set_microglia_component_summary(
+                count=count,
+                selected_index=0,
+                selected_voxels=0,
+            )
+            if self._green_component_labels is None:
+                logger.info(
+                    "Microglia all-color view skipped: dense label cache unavailable "
+                    "for shape=%s count=%d. Showing raw green volume instead.",
+                    self._green_component_shape,
+                    count,
+                )
+                return base
+            self._green_component_coloring_active = True
+            return self._green_component_labels
         if selected_index > int(len(self._green_component_order)):
             return base
         component_id = int(self._green_component_order[selected_index - 1])
@@ -551,9 +598,15 @@ class MainWindow(QMainWindow):
         if self.visual_dataset is None:
             return
         self._set_busy_message("Uploading green channel to VTK...")
+        green_volume = self._current_green_volume_for_view()
+        self.scene.set_channel_component_coloring(
+            "green",
+            self._green_component_coloring_active,
+            label_count=int(len(self._green_component_order)),
+        )
         self.scene.set_channel_data(
             channel="green",
-            volume=self._current_green_volume_for_view(),
+            volume=green_volume,
             spacing=self._display_spacing(self.visual_dataset.green.spacing),
         )
         if green_only:
@@ -1489,6 +1542,7 @@ class MainWindow(QMainWindow):
                 raise TypeError("Invalid microglia analysis result payload.")
             self.latest_microglia_report = result
             self.controls.set_microglia_analysis_report(result)
+            self._refresh_microglia_analysis_overlays()
             self.statusBar().showMessage(
                 f"Microglia analysis complete: {result.cell_count} cell(s) detected.",
                 5000,
@@ -1519,9 +1573,19 @@ class MainWindow(QMainWindow):
         try:
             with self._busy("Export Microglia Analysis", "Writing CSV..."):
                 self._publish_busy_progress(percent=20.0, message="Collecting analysis rows...")
-                rows = microglia_cell_report_to_csv_rows(self.latest_microglia_report)
+                green_volume = None
+                red_volume = None
+                if self.processed_dataset is not None:
+                    green_volume = self.processed_dataset.green.data
+                    red_volume = self.processed_dataset.red.data
                 self._publish_busy_progress(percent=70.0, message="Writing CSV file...")
-                out = export_metrics_csv(rows, file_path)
+                outputs = export_microglia_analysis_bundle(
+                    self.latest_microglia_report,
+                    file_path,
+                    green_volume=green_volume,
+                    red_volume=red_volume,
+                )
+                out = outputs.get("cells", Path(file_path))
                 self._publish_busy_progress(percent=100.0, message="Analysis export complete.")
             self.statusBar().showMessage(f"Microglia analysis exported to {out}", 5000)
             self._log_info(f"Microglia analysis exported: {out}")

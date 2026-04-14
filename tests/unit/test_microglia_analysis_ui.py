@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QScrollArea, QSplitter
 
 from nvap.analysis.microglia_vessel_report import MicrogliaCellReport, MicrogliaCellReportRow
+from nvap.ui.main_window import MainWindow
 from nvap.ui.control_panel import ControlPanel
 
 
@@ -84,3 +86,26 @@ def test_microglia_analysis_table_clear_resets_export_state(qtbot) -> None:
     panel.clear_microglia_analysis_table()
     assert panel.microglia_analysis_table.rowCount() == 0
     assert not panel.export_microglia_analysis_btn.isEnabled()
+
+
+def test_microglia_analysis_debug_overlay_toggles_emit_state(qtbot) -> None:
+    panel = ControlPanel()
+    qtbot.addWidget(panel)
+    assert panel.current_microglia_debug_overlay_state()["soma"]
+    with qtbot.waitSignal(panel.microglia_analysis_overlay_changed):
+        panel.debug_overlay_soma.setChecked(False)
+    assert not panel.current_microglia_debug_overlay_state()["soma"]
+
+
+def test_main_window_wraps_control_panel_in_scroll_area(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    splitter = window.centralWidget()
+    assert isinstance(splitter, QSplitter)
+    assert splitter.count() == 2
+
+    scroll_area = splitter.widget(0)
+    assert isinstance(scroll_area, QScrollArea)
+    assert scroll_area.widget() is window.controls
+    assert scroll_area.widgetResizable()

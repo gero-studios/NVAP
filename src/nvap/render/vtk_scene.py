@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -8,7 +9,8 @@ import numpy as np
 from PySide6.QtCore import Qt
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.util.numpy_support import numpy_to_vtk
-from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPiecewiseFunction
+from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkImageData, vtkPiecewiseFunction, vtkPolyData, vtkPolyLine
+from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkFiltersCore import vtkMarchingCubes
 from vtkmodules.vtkImagingCore import vtkImageResample
 from vtkmodules.vtkIOImage import vtkPNGWriter
@@ -141,6 +143,8 @@ class VTKScene:
         self._actors: dict[str, _ChannelActors] = {}
         self._spacing: dict[str, VoxelSpacing] = {}
         self._current = RenderConfig()
+        self._component_coloring: dict[str, int] = {}
+        self._debug_overlay_actors: list[vtkActor] = []
 
         self._interactor.Initialize()
         self._interactor.Enable()
@@ -161,6 +165,157 @@ class VTKScene:
         self.render()
         self.activate_interaction()
         logger.debug("VTK camera reset.")
+
+    def clear_debug_overlays(self) -> None:
+        for actor in self._debug_overlay_actors:
+            self._renderer.RemoveActor(actor)
+        self._debug_overlay_actors.clear()
+        self.render()
+
+    def set_debug_overlays(
+        self,
+        points: list[dict[str, object]] | None = None,
+        lines: list[dict[str, object]] | None = None,
+        *,
+        visibility: dict[str, bool] | None = None,
+    ) -> None:
+        self.clear_debug_overlays()
+        visibility = visibility or {}
+        grouped_points: dict[str, list[tuple[float, float, float]]] = {}
+        for item in points or []:
+            kind = str(item.get("kind", "point"))
+            if not self._debug_kind_visible(kind, visibility):
+                continue
+            xyz = item.get("xyz_um")
+            if not isinstance(xyz, list | tuple) or len(xyz) != 3:
+                continue
+            grouped_points.setdefault(kind, []).append((float(xyz[0]), float(xyz[1]), float(xyz[2])))
+        for kind, coords in grouped_points.items():
+            actor = self._make_point_actor(coords, self._debug_color(kind), point_size=self._debug_point_size(kind))
+            self._renderer.AddActor(actor)
+            self._debug_overlay_actors.append(actor)
+
+        grouped_lines: dict[str, list[list[tuple[float, float, float]]]] = {}
+        for item in lines or []:
+            kind = str(item.get("kind", "line"))
+            if not self._debug_kind_visible(kind, visibility):
+                continue
+            raw_points = item.get("points_xyz_um")
+            if not isinstance(raw_points, list | tuple):
+                continue
+            coords = []
+            for raw in raw_points:
+                if isinstance(raw, list | tuple) and len(raw) == 3:
+                    coords.append((float(raw[0]), float(raw[1]), float(raw[2])))
+            if len(coords) >= 2:
+                grouped_lines.setdefault(kind, []).append(coords)
+        for kind, paths in grouped_lines.items():
+            actor = self._make_line_actor(paths, self._debug_color(kind))
+            self._renderer.AddActor(actor)
+            self._debug_overlay_actors.append(actor)
+        self.render()
+
+    @staticmethod
+    def _debug_kind_visible(kind: str, visibility: dict[str, bool]) -> bool:
+        mapping = {
+            "soma_center": "soma",
+            "branch_path": "branches",
+            "tip": "tips",
+            "cell_to_vessel": "connectors",
+            "tip_to_vessel": "connectors",
+            "nearest_vessel_point": "vessels",
+            "diameter_sample": "diameter",
+            "vessel_crossing": "crossings",
+        }
+        key = mapping.get(kind, kind)
+        return bool(visibility.get(key, True))
+
+    @staticmethod
+    def _debug_color(kind: str) -> tuple[float, float, float]:
+        colors = {
+            "soma_center": (1.0, 0.92, 0.0),
+            "branch_path": (0.0, 0.72, 1.0),
+            "tip": (1.0, 0.0, 0.9),
+            "cell_to_vessel": (1.0, 1.0, 1.0),
+            "tip_to_vessel": (0.7, 0.7, 1.0),
+            "nearest_vessel_point": (1.0, 0.25, 0.15),
+            "diameter_sample": (1.0, 0.55, 0.0),
+            "vessel_crossing": (1.0, 1.0, 1.0),
+        }
+        return colors.get(kind, (1.0, 1.0, 1.0))
+
+    @staticmethod
+    def _debug_point_size(kind: str) -> float:
+        if kind == "vessel_crossing":
+            return 11.0
+        if kind in {"soma_center", "tip"}:
+            return 8.0
+        return 6.0
+
+    @staticmethod
+    def _make_point_actor(
+        coords: list[tuple[float, float, float]],
+        color: tuple[float, float, float],
+        *,
+        point_size: float,
+    ) -> vtkActor:
+        points = vtkPoints()
+        vertices = vtkCellArray()
+        for x, y, z in coords:
+            point_id = points.InsertNextPoint(float(x), float(y), float(z))
+            vertices.InsertNextCell(1)
+            vertices.InsertCellPoint(point_id)
+        poly = vtkPolyData()
+        poly.SetPoints(points)
+        poly.SetVerts(vertices)
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetPointSize(float(point_size))
+        actor.GetProperty().SetRenderPointsAsSpheres(True)
+        return actor
+
+    @staticmethod
+    def _make_line_actor(
+        paths: list[list[tuple[float, float, float]]],
+        color: tuple[float, float, float],
+    ) -> vtkActor:
+        points = vtkPoints()
+        cells = vtkCellArray()
+        for path in paths:
+            polyline = vtkPolyLine()
+            polyline.GetPointIds().SetNumberOfIds(len(path))
+            for idx, (x, y, z) in enumerate(path):
+                point_id = points.InsertNextPoint(float(x), float(y), float(z))
+                polyline.GetPointIds().SetId(idx, point_id)
+            cells.InsertNextCell(polyline)
+        poly = vtkPolyData()
+        poly.SetPoints(points)
+        poly.SetLines(cells)
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetLineWidth(2.0)
+        return actor
+
+    def set_channel_component_coloring(
+        self,
+        channel: str,
+        enabled: bool,
+        *,
+        label_count: int = 0,
+    ) -> None:
+        channel = channel.lower()
+        if enabled:
+            self._component_coloring[channel] = max(0, int(label_count))
+        else:
+            self._component_coloring.pop(channel, None)
+        if channel in self._actors:
+            self.apply_render_config(self._current)
 
     def set_channel_data(self, channel: str, volume: np.ndarray, spacing: VoxelSpacing) -> None:
         channel = channel.lower()
@@ -192,7 +347,11 @@ class VTKScene:
                 # Fast path: keep actors/mappers and only replace scalar data.
                 self._update_vtk_image(actor.image, volume, spacing)
                 if actor.resample is not None:
-                    self._configure_resample(actor.resample, render_spacing)
+                    self._configure_resample(
+                        actor.resample,
+                        render_spacing,
+                        nearest=channel in self._component_coloring,
+                    )
                 unit_distance = float(max(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um) * 1.5)
                 actor.volume_property.SetScalarOpacityUnitDistance(max(0.08, unit_distance))
                 # Re-sync sample distance to current spacing.
@@ -213,11 +372,18 @@ class VTKScene:
             self._renderer.RemoveActor(old.iso_actor)
 
         image = self._numpy_to_vtk_image(volume, spacing)
-        mapper_input, resample = self._build_render_input(image, render_spacing)
+        mapper_input, resample = self._build_render_input(
+            image,
+            render_spacing,
+            nearest=channel in self._component_coloring,
+        )
         mapper = self._build_volume_mapper(mapper_input, render_spacing)
         prop = vtkVolumeProperty()
         prop.ShadeOn()
-        prop.SetInterpolationTypeToLinear()
+        if channel in self._component_coloring:
+            prop.SetInterpolationTypeToNearest()
+        else:
+            prop.SetInterpolationTypeToLinear()
         prop.IndependentComponentsOn()
         # Enhanced lighting for depth perception
         prop.SetAmbient(0.15)
@@ -275,6 +441,8 @@ class VTKScene:
         self,
         image: vtkImageData,
         render_spacing: VoxelSpacing,
+        *,
+        nearest: bool = False,
     ):
         input_spacing = image.GetSpacing()
         source_spacing = VoxelSpacing(
@@ -287,11 +455,20 @@ class VTKScene:
 
         resample = vtkImageResample()
         resample.SetInputData(image)
-        self._configure_resample(resample, render_spacing)
+        self._configure_resample(resample, render_spacing, nearest=nearest)
         return resample.GetOutputPort(), resample
 
-    def _configure_resample(self, resample: vtkImageResample, render_spacing: VoxelSpacing) -> None:
-        resample.SetInterpolationModeToCubic()
+    def _configure_resample(
+        self,
+        resample: vtkImageResample,
+        render_spacing: VoxelSpacing,
+        *,
+        nearest: bool = False,
+    ) -> None:
+        if nearest:
+            resample.SetInterpolationModeToNearestNeighbor()
+        else:
+            resample.SetInterpolationModeToCubic()
         resample.SetAxisOutputSpacing(0, float(render_spacing.x_um))
         resample.SetAxisOutputSpacing(1, float(render_spacing.y_um))
         resample.SetAxisOutputSpacing(2, float(render_spacing.z_um))
@@ -321,9 +498,13 @@ class VTKScene:
     def _numpy_to_vtk_scalars(self, volume: np.ndarray):
         # vtkImageData point ids advance x fastest, then y, then z. A C-order
         # flatten of a (z, y, x) numpy volume preserves that exact order.
-        flat = np.ascontiguousarray(volume.ravel(order="C"), dtype=np.float32)
+        arr = np.asarray(volume)
+        if np.issubdtype(arr.dtype, np.integer):
+            flat = np.ascontiguousarray(arr.ravel(order="C"))
+        else:
+            flat = np.ascontiguousarray(arr.ravel(order="C"), dtype=np.float32)
         vtk_array = numpy_to_vtk(flat, deep=False)
-        vtk_array.SetName("intensity")
+        vtk_array.SetName("label" if np.issubdtype(arr.dtype, np.integer) else "intensity")
         return vtk_array
 
     def _update_vtk_image(self, image: vtkImageData, volume: np.ndarray, spacing: VoxelSpacing) -> None:
@@ -404,6 +585,31 @@ class VTKScene:
         opacity = float(np.clip(opacity, 0.0, 1.0))
         iso = float(np.clip(iso, 0.0, 1.0))
 
+        label_count = int(self._component_coloring.get(channel, 0))
+        if label_count > 0:
+            color_tf = self._component_color_transfer_function(label_count)
+            scalar_opacity = actor.volume_property.GetScalarOpacity()
+            if scalar_opacity is None:
+                scalar_opacity = vtkPiecewiseFunction()
+            scalar_opacity.RemoveAllPoints()
+            scalar_opacity.AddPoint(0.0, 0.0)
+            scalar_opacity.AddPoint(0.5, 0.0)
+            scalar_opacity.AddPoint(1.0, opacity * 0.74)
+            scalar_opacity.AddPoint(float(label_count) + 0.5, opacity * 0.88)
+
+            gradient_opacity = vtkPiecewiseFunction()
+            gradient_opacity.AddPoint(0.0, 1.0)
+            gradient_opacity.AddPoint(float(label_count) + 0.5, 1.0)
+
+            actor.volume_property.SetInterpolationTypeToNearest()
+            actor.volume_property.SetColor(color_tf)
+            actor.volume_property.SetScalarOpacity(scalar_opacity)
+            actor.volume_property.SetGradientOpacity(0, gradient_opacity)
+            actor.volume_actor.SetVisibility(1 if visible else 0)
+            actor.marching.SetValue(0, 0.5)
+            actor.iso_actor.SetVisibility(0)
+            return
+
         color_tf = vtkColorTransferFunction()
         color_tf.AddRGBPoint(0.0, 0.0, 0.0, 0.0)
         color_tf.AddRGBPoint(max(0.0, threshold - knee), 0.0, 0.0, 0.0)
@@ -426,12 +632,27 @@ class VTKScene:
         gradient_opacity.AddPoint(min(1.0, threshold + 0.06), 0.55)
         gradient_opacity.AddPoint(1.0, 1.0)
 
+        actor.volume_property.SetInterpolationTypeToLinear()
         actor.volume_property.SetColor(color_tf)
         actor.volume_property.SetScalarOpacity(scalar_opacity)
         actor.volume_property.SetGradientOpacity(0, gradient_opacity)
         actor.volume_actor.SetVisibility(1 if visible else 0)
         actor.marching.SetValue(0, iso)
         actor.iso_actor.SetVisibility(1 if (visible and show_iso) else 0)
+
+    @staticmethod
+    def _component_color_transfer_function(label_count: int) -> vtkColorTransferFunction:
+        color_tf = vtkColorTransferFunction()
+        color_tf.AddRGBPoint(0.0, 0.0, 0.0, 0.0)
+        for label_id in range(1, int(label_count) + 1):
+            hue = (0.11 + (0.61803398875 * float(label_id))) % 1.0
+            saturation = 0.74 if label_id % 3 else 0.58
+            value = 0.98 if label_id % 2 else 0.86
+            red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+            x = float(label_id)
+            color_tf.AddRGBPoint(x - 0.49, red, green, blue)
+            color_tf.AddRGBPoint(x + 0.49, red, green, blue)
+        return color_tf
 
     def capture_snapshot(self, output_path: str | Path) -> Path:
         path = Path(output_path).resolve()
@@ -453,6 +674,7 @@ class VTKScene:
 
     def cleanup(self) -> None:
         """Release VTK resources to avoid GPU/memory leaks on window close."""
+        self.clear_debug_overlays()
         for actor in self._actors.values():
             self._renderer.RemoveVolume(actor.volume_actor)
             self._renderer.RemoveActor(actor.iso_actor)

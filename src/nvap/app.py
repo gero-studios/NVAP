@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import logging
 from pathlib import Path
 
 from nvap.analysis.microglia_vessel_report import (
-    MICROGLIA_CELL_REPORT_COLUMNS,
     analyze_microglia_vessel,
-    microglia_cell_report_to_csv_rows,
+    export_microglia_analysis_bundle,
 )
 from nvap.analysis.metrics import compute_metrics
 from nvap.analysis.green_benchmark import run_green_denoise_benchmark
@@ -169,18 +167,16 @@ def run_microglia_analysis(
         threshold_source=threshold_source,
     )
 
-    rows = microglia_cell_report_to_csv_rows(report)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=list(rows[0].keys()) if rows else list(MICROGLIA_CELL_REPORT_COLUMNS),
-        )
-        writer.writeheader()
-        if rows:
-            writer.writerows(rows)
-
-    print(f"NVAP microglia analysis complete - output={out} rows={len(rows)}")
+    outputs = export_microglia_analysis_bundle(
+        report,
+        out,
+        green_volume=dataset.green.data,
+        red_volume=dataset.red.data,
+    )
+    print(
+        "NVAP microglia analysis complete - "
+        f"output={outputs.get('cells', out)} rows={len(report.rows)} debug={outputs.get('debug_measurements')}"
+    )
     return 0
 
 

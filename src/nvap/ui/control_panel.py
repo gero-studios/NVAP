@@ -32,6 +32,7 @@ class ControlPanel(QWidget):
     microglia_view_changed = Signal()
     run_microglia_analysis_requested = Signal()
     export_microglia_analysis_requested = Signal()
+    microglia_analysis_overlay_changed = Signal()
     export_metrics_requested = Signal()
     export_snapshot_requested = Signal()
     export_mesh_requested = Signal()
@@ -54,10 +55,17 @@ class ControlPanel(QWidget):
         self._pending_render_update = False
         self._pending_microglia_update = False
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(9)
 
-        load_btn = QPushButton("Load Dataset")
+        title = QLabel("NVAP Workbench")
+        title.setObjectName("panelTitle")
+        root.addWidget(title)
+        subtitle = QLabel("Volumetric microglia and vascular analysis")
+        subtitle.setObjectName("panelSubtitle")
+        root.addWidget(subtitle)
+
+        load_btn = QPushButton("Open Dataset")
         load_btn.setObjectName("primaryAction")
         load_btn.setToolTip("Load a dataset from disk (Ctrl+L)")
         load_btn.clicked.connect(self.load_requested.emit)
@@ -352,6 +360,29 @@ class ControlPanel(QWidget):
         action_row.addWidget(self.export_microglia_analysis_btn)
         layout.addLayout(action_row)
 
+        debug_group = QGroupBox("Visual Debuggers")
+        debug_layout = QVBoxLayout(debug_group)
+        self.debug_overlay_soma = QCheckBox("Soma cores")
+        self.debug_overlay_branches = QCheckBox("Branch skeletons")
+        self.debug_overlay_tips = QCheckBox("Branch tips")
+        self.debug_overlay_connectors = QCheckBox("Nearest-vessel connectors")
+        self.debug_overlay_vessels = QCheckBox("Vessel points")
+        self.debug_overlay_diameter = QCheckBox("Diameter samples")
+        self.debug_overlay_crossings = QCheckBox("Vessel crossings")
+        for checkbox in (
+            self.debug_overlay_soma,
+            self.debug_overlay_branches,
+            self.debug_overlay_tips,
+            self.debug_overlay_connectors,
+            self.debug_overlay_vessels,
+            self.debug_overlay_diameter,
+            self.debug_overlay_crossings,
+        ):
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(lambda _checked: self.microglia_analysis_overlay_changed.emit())
+            debug_layout.addWidget(checkbox)
+        layout.addWidget(debug_group)
+
         self.microglia_analysis_table = QTableWidget(0, len(MICROGLIA_CELL_REPORT_COLUMNS))
         self.microglia_analysis_table.setHorizontalHeaderLabels(MICROGLIA_CELL_REPORT_COLUMNS)
         self.microglia_analysis_table.setAlternatingRowColors(True)
@@ -575,35 +606,29 @@ class ControlPanel(QWidget):
         self.microglia_analysis_table.setRowCount(0)
         self.microglia_analysis_table.setRowCount(len(report.rows))
         for row_idx, row in enumerate(report.rows):
-            values = {
-                "cell_index": row.cell_index,
-                "component_id": row.component_id,
-                "segmentation_engine_used": row.segmentation_engine_used,
-                "voxel_count": row.voxel_count,
-                "volume_um3": row.volume_um3,
-                "branch_endpoint_count": row.branch_endpoint_count,
-                "branch_junction_count": row.branch_junction_count,
-                "distance_to_vasculature_um": row.distance_to_vasculature_um,
-                "microglia_closest_x_um": row.microglia_closest_x_um,
-                "microglia_closest_y_um": row.microglia_closest_y_um,
-                "microglia_closest_z_um": row.microglia_closest_z_um,
-                "vessel_closest_x_um": row.vessel_closest_x_um,
-                "vessel_closest_y_um": row.vessel_closest_y_um,
-                "vessel_closest_z_um": row.vessel_closest_z_um,
-                "threshold_green_used": row.threshold_green_used,
-                "threshold_red_used": row.threshold_red_used,
-            }
+            values = row.__dict__
             for col_idx, key in enumerate(MICROGLIA_CELL_REPORT_COLUMNS):
                 self.microglia_analysis_table.setItem(
                     row_idx,
                     col_idx,
-                    QTableWidgetItem(str(values[key])),
+                    QTableWidgetItem(str(values.get(key, ""))),
                 )
         self.export_microglia_analysis_btn.setEnabled(len(report.rows) > 0)
 
     def clear_microglia_analysis_table(self) -> None:
         self.microglia_analysis_table.setRowCount(0)
         self.export_microglia_analysis_btn.setEnabled(False)
+
+    def current_microglia_debug_overlay_state(self) -> dict[str, bool]:
+        return {
+            "soma": self.debug_overlay_soma.isChecked(),
+            "branches": self.debug_overlay_branches.isChecked(),
+            "tips": self.debug_overlay_tips.isChecked(),
+            "connectors": self.debug_overlay_connectors.isChecked(),
+            "vessels": self.debug_overlay_vessels.isChecked(),
+            "diameter": self.debug_overlay_diameter.isChecked(),
+            "crossings": self.debug_overlay_crossings.isChecked(),
+        }
 
     def append_debug_text(self, text: str) -> None:
         self.debug_text.append(text)
