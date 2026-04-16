@@ -9,7 +9,10 @@ from skimage.segmentation import watershed as _watershed
 
 logger = logging.getLogger(__name__)
 _CC_STRUCTURE = ndi.generate_binary_structure(3, 2).astype(np.uint8, copy=False)
+_CUBIC_STRUCTURE = np.ones((3, 3, 3), dtype=np.uint8)
 _MAX_PEAK_CENTER_CANDIDATES = 16384
+_MAX_DISTANCE_EDT_VOXELS = 24_000_000
+_MAX_DISTANCE_COMPONENT_LABEL_VOXELS = 96_000_000
 PREFERRED_VISIBLE_MICROGLIA_MIN_VOXELS = 15_000
 
 
@@ -45,7 +48,8 @@ def _select_seed_centers(
     arr: np.ndarray,
     centers: np.ndarray,
     *,
-    min_sep: int,
+    min_sep_um: float,
+    spacing_zyx: np.ndarray,
     max_centers: int,
 ) -> np.ndarray:
     pts = np.asarray(centers, dtype=np.int32)
@@ -55,29 +59,222 @@ def _select_seed_centers(
     pts = np.unique(pts, axis=0)
     values = arr[pts[:, 0], pts[:, 1], pts[:, 2]]
     order = np.argsort(values)[::-1]
+    spacing = np.maximum(np.asarray(spacing_zyx, dtype=np.float32).reshape(1, 3), 1.0e-6)
+    pts_um = pts.astype(np.float32, copy=False) * spacing
 
     selected: list[tuple[int, int, int]] = []
-    min_sep2 = int(max(0, min_sep) ** 2)
+    selected_um: list[np.ndarray] = []
+    min_sep2 = float(max(0.0, min_sep_um) ** 2)
     for idx in order:
         z, y, x = (int(v) for v in pts[int(idx)])
         keep = True
-        if min_sep2 > 0:
-            for sz, sy, sx in selected:
-                dz = sz - z
-                dy = sy - y
-                dx = sx - x
-                if (dz * dz + dy * dy + dx * dx) < min_sep2:
-                    keep = False
-                    break
+        if min_sep2 > 0.0 and selected_um:
+            candidate_um = pts_um[int(idx)]
+            stacked = np.asarray(selected_um, dtype=np.float32)
+            delta = stacked - candidate_um
+            if np.any(np.einsum("ij,ij->i", delta, delta) < min_sep2):
+                keep = False
         if not keep:
             continue
         selected.append((z, y, x))
+        selected_um.append(pts_um[int(idx)])
         if len(selected) >= int(max(1, max_centers)):
             break
 
     if not selected:
         return np.empty((0, 3), dtype=np.int32)
     return np.asarray(selected, dtype=np.int32)
+
+
+def _distance_peak_centers_from_soma_mask(
+    soma_mask: np.ndarray,
+    spacing_zyx: np.ndarray,
+    *,
+    max_candidates: int = _MAX_PEAK_CENTER_CANDIDATES,
+) -> np.ndarray:
+    mask = np.asarray(soma_mask, dtype=bool)
+    bounds = _mask_bounds(mask)
+    if bounds is None:
+        return np.empty((0, 3), dtype=np.int32)
+
+    local_mask = mask[bounds]
+    if not np.any(local_mask):
+        return np.empty((0, 3), dtype=np.int32)
+
+    spacing = np.maximum(np.asarray(spacing_zyx, dtype=np.float32), 1.0e-6)
+
+    def _component_distance_peak_centers(
+        component_mask: np.ndarray,
+        *,
+        global_offset_zyx: np.ndarray,
+        peak_cap: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        comp_mask = np.asarray(component_mask, dtype=bool)
+        if not np.any(comp_mask):
+            return (
+                np.empty((0, 3), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+
+        comp_shape = np.asarray(comp_mask.shape, dtype=np.int64)
+        comp_voxels = int(np.prod(comp_shape))
+        step = int(max(1, np.ceil((comp_voxels / float(_MAX_DISTANCE_EDT_VOXELS)) ** (1.0 / 3.0))))
+        step_zyx = np.asarray([step, step, step], dtype=np.int32)
+        if step > 1:
+            eval_mask = np.asarray(comp_mask[::step, ::step, ::step], dtype=bool)
+            logger.info(
+                "Microglia seed EDT: downsampled component bbox %s by step=%d for memory safety.",
+                tuple(int(v) for v in comp_shape.tolist()),
+                int(step),
+            )
+        else:
+            eval_mask = comp_mask
+
+        if not np.any(eval_mask):
+            return (
+                np.empty((0, 3), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+
+        eval_spacing = spacing * step_zyx.astype(np.float32)
+        try:
+            dist = ndi.distance_transform_edt(
+                eval_mask,
+                sampling=(float(eval_spacing[0]), float(eval_spacing[1]), float(eval_spacing[2])),
+            )
+        except MemoryError:
+            logger.warning(
+                "Microglia seed EDT: skipping component bbox %s due memory pressure.",
+                tuple(int(v) for v in comp_shape.tolist()),
+            )
+            return (
+                np.empty((0, 3), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+
+        local_dist = np.asarray(dist[eval_mask], dtype=np.float32)
+        if local_dist.size <= 0:
+            return (
+                np.empty((0, 3), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+
+        floor = float(max(np.quantile(local_dist, 0.60), 0.75 * float(np.min(eval_spacing))))
+        peak_mask = eval_mask & (dist >= floor)
+        if not np.any(peak_mask):
+            return (
+                np.empty((0, 3), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+
+        peak_radius_um = 1.2
+        max_size = tuple(
+            int(
+                max(
+                    3,
+                    (2 * int(np.ceil(peak_radius_um / max(1.0e-6, float(eval_spacing[i]))))) + 1,
+                )
+            )
+            for i in range(3)
+        )
+        peak_max = ndi.maximum_filter(dist, size=max_size, mode="nearest")
+        np.subtract(peak_max, 1.0e-6, out=peak_max)
+        np.greater_equal(dist, peak_max, out=peak_mask, where=peak_mask)
+
+        eval_centers = _peak_centers_from_mask(dist, peak_mask, max_candidates=int(max(1, peak_cap)))
+        if eval_centers.size == 0:
+            return (
+                np.empty((0, 3), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+        eval_centers = np.asarray(eval_centers, dtype=np.int32)
+        eval_scores = np.asarray(dist[tuple(eval_centers.T)], dtype=np.float32)
+
+        if step > 1:
+            local_centers = eval_centers * step_zyx
+            np.minimum(local_centers, comp_shape.astype(np.int32) - 1, out=local_centers)
+        else:
+            local_centers = eval_centers
+
+        global_centers = local_centers + np.asarray(global_offset_zyx, dtype=np.int32)
+        return np.asarray(global_centers, dtype=np.int32), eval_scores
+
+    max_candidates = int(max(1, max_candidates))
+    local_offsets = np.asarray(
+        [
+            int(bounds[0].start or 0),
+            int(bounds[1].start or 0),
+            int(bounds[2].start or 0),
+        ],
+        dtype=np.int32,
+    )
+    candidate_centers: list[np.ndarray] = []
+    candidate_scores: list[np.ndarray] = []
+
+    if int(local_mask.size) > int(_MAX_DISTANCE_COMPONENT_LABEL_VOXELS):
+        logger.info(
+            "Microglia seed EDT: bypassing full connected-component labeling for large mask shape=%s.",
+            tuple(int(v) for v in local_mask.shape),
+        )
+        centers, scores = _component_distance_peak_centers(
+            local_mask,
+            global_offset_zyx=local_offsets,
+            peak_cap=max_candidates,
+        )
+        if centers.size > 0:
+            candidate_centers.append(centers)
+            candidate_scores.append(scores)
+    else:
+        component_labels, n_components = ndi.label(local_mask, structure=_CC_STRUCTURE)
+        if n_components <= 0:
+            return np.empty((0, 3), dtype=np.int32)
+
+        component_objects = ndi.find_objects(component_labels)
+        per_component_cap = int(max(32, max_candidates // max(1, n_components)))
+        for component_id, comp_slice in enumerate(component_objects, start=1):
+            if comp_slice is None:
+                continue
+            comp_mask = np.asarray(component_labels[comp_slice] == int(component_id), dtype=bool)
+            if not np.any(comp_mask):
+                continue
+            component_offset = np.asarray(
+                [
+                    int(comp_slice[0].start or 0),
+                    int(comp_slice[1].start or 0),
+                    int(comp_slice[2].start or 0),
+                ],
+                dtype=np.int32,
+            )
+            centers, scores = _component_distance_peak_centers(
+                comp_mask,
+                global_offset_zyx=component_offset + local_offsets,
+                peak_cap=per_component_cap,
+            )
+            if centers.size > 0:
+                candidate_centers.append(centers)
+                candidate_scores.append(scores)
+
+    if not candidate_centers:
+        return np.empty((0, 3), dtype=np.int32)
+
+    centers = np.vstack(candidate_centers)
+    scores = np.concatenate(candidate_scores)
+    if centers.shape[0] > max_candidates:
+        keep_idx = np.argpartition(scores, -max_candidates)[-max_candidates:]
+        centers = centers[keep_idx]
+        scores = scores[keep_idx]
+
+    unique_centers, inverse = np.unique(centers, axis=0, return_inverse=True)
+    if unique_centers.shape[0] != centers.shape[0]:
+        unique_scores = np.full((unique_centers.shape[0],), -np.inf, dtype=np.float32)
+        np.maximum.at(unique_scores, inverse, scores)
+        centers = unique_centers
+        scores = unique_scores
+        if centers.shape[0] > max_candidates:
+            keep_idx = np.argpartition(scores, -max_candidates)[-max_candidates:]
+            centers = centers[keep_idx]
+
+    return np.asarray(centers, dtype=np.int32)
 
 
 def _peak_centers_from_mask(
@@ -136,6 +333,145 @@ def _max_positions_for_labels(
     return positions
 
 
+def _line_min_intensity_between_points(
+    values: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> float:
+    left_pt = np.asarray(left, dtype=np.int32)
+    right_pt = np.asarray(right, dtype=np.int32)
+    steps = int(np.max(np.abs(right_pt - left_pt))) + 1
+    if steps <= 1:
+        return float(values[int(left_pt[0]), int(left_pt[1]), int(left_pt[2])])
+    z = np.rint(np.linspace(float(left_pt[0]), float(right_pt[0]), num=steps)).astype(np.int32)
+    y = np.rint(np.linspace(float(left_pt[1]), float(right_pt[1]), num=steps)).astype(np.int32)
+    x = np.rint(np.linspace(float(left_pt[2]), float(right_pt[2]), num=steps)).astype(np.int32)
+    return float(np.min(values[z, y, x]))
+
+
+def _is_multi_soma_island(
+    local_values: np.ndarray,
+    centers: np.ndarray,
+    *,
+    spacing_zyx: np.ndarray,
+    branch_sensitivity: float,
+) -> bool:
+    pts = np.asarray(centers, dtype=np.int32)
+    if pts.ndim != 2 or pts.shape[0] < 2:
+        return False
+
+    vals = np.asarray(local_values[tuple(pts.T)], dtype=np.float32)
+    order = np.argsort(vals)[::-1]
+    keep = order[: min(int(order.size), 6)]
+    pts = pts[keep]
+    vals = vals[keep]
+
+    spacing = np.maximum(np.asarray(spacing_zyx, dtype=np.float32).reshape(1, 3), 1.0e-6)
+    pts_um = pts.astype(np.float32, copy=False) * spacing
+
+    min_sep_um = float(np.clip(1.8 / max(0.5, branch_sensitivity), 1.1, 2.6))
+    # Require a fairly deep valley between candidate peaks before treating an
+    # island as multi-soma; this avoids splitting one soma with patchy lobes.
+    dip_ratio_limit = float(np.clip(0.42 + (0.04 * (branch_sensitivity - 1.0)), 0.38, 0.50))
+    for i in range(pts.shape[0]):
+        for j in range(i + 1, pts.shape[0]):
+            if float(np.linalg.norm(pts_um[i] - pts_um[j])) < min_sep_um:
+                continue
+            base = float(min(vals[i], vals[j]))
+            if base <= 1.0e-6:
+                continue
+            line_min = _line_min_intensity_between_points(local_values, pts[i], pts[j])
+            dip_ratio = line_min / base
+            if dip_ratio <= dip_ratio_limit:
+                return True
+    return False
+
+
+def _single_island_multi_marker_positions(
+    working: np.ndarray,
+    island_mask: np.ndarray,
+    *,
+    high_t: float,
+    branch_sensitivity: float,
+    spacing_zyx: np.ndarray,
+) -> list[tuple[int, int, int]]:
+    mask = np.asarray(island_mask, dtype=bool)
+    bounds = _mask_bounds(mask)
+    if bounds is None:
+        return []
+
+    local_mask = np.asarray(mask[bounds], dtype=bool)
+    if not np.any(local_mask):
+        return []
+    local_values = np.asarray(working[bounds], dtype=np.float32)
+    spacing = np.maximum(np.asarray(spacing_zyx, dtype=np.float32), 1.0e-6)
+
+    candidate_arrays: list[np.ndarray] = []
+
+    peak_floor = float(max(high_t * 0.96, np.quantile(local_values[local_mask], 0.90)))
+    peak_mask = local_mask & (local_values >= peak_floor)
+    if np.any(peak_mask):
+        peak_radius_um = float(np.clip(1.5 / max(0.5, branch_sensitivity), 0.9, 2.4))
+        peak_size = tuple(
+            int(max(3, (2 * int(np.ceil(peak_radius_um / float(spacing[i])))) + 1))
+            for i in range(3)
+        )
+        peak_max = ndi.maximum_filter(local_values, size=peak_size, mode="nearest")
+        np.subtract(peak_max, 1.0e-6, out=peak_max)
+        np.greater_equal(local_values, peak_max, out=peak_mask, where=peak_mask)
+        if np.any(peak_mask):
+            peak_labels, n_peak = ndi.label(peak_mask, structure=_CC_STRUCTURE)
+            if n_peak > 0:
+                peak_ids = list(range(1, n_peak + 1))
+                peak_positions = _max_positions_for_labels(local_values, peak_labels, peak_ids)
+                if peak_positions:
+                    candidate_arrays.append(np.asarray(peak_positions, dtype=np.int32))
+
+    distance_centers = _distance_peak_centers_from_soma_mask(
+        local_mask,
+        spacing,
+        max_candidates=64,
+    )
+    if distance_centers.size > 0:
+        candidate_arrays.append(np.asarray(distance_centers, dtype=np.int32))
+
+    if not candidate_arrays:
+        return []
+
+    candidates = np.vstack(candidate_arrays)
+    candidates = np.unique(np.asarray(candidates, dtype=np.int32), axis=0)
+    if candidates.shape[0] < 2:
+        return []
+
+    selected = _select_seed_centers(
+        local_values,
+        candidates,
+        min_sep_um=float(np.clip(1.8 / max(0.5, branch_sensitivity), 1.1, 2.8)),
+        spacing_zyx=spacing,
+        max_centers=4,
+    )
+    if selected.shape[0] < 2:
+        return []
+    if not _is_multi_soma_island(
+        local_values,
+        selected,
+        spacing_zyx=spacing,
+        branch_sensitivity=branch_sensitivity,
+    ):
+        return []
+
+    offset = np.asarray(
+        [
+            int(bounds[0].start or 0),
+            int(bounds[1].start or 0),
+            int(bounds[2].start or 0),
+        ],
+        dtype=np.int32,
+    )
+    global_selected = np.asarray(selected, dtype=np.int32) + offset
+    return [tuple(int(v) for v in pos) for pos in global_selected.tolist()]
+
+
 def _merge_close_soma_marker_positions(
     positions: list[tuple[int, int, int]],
     working: np.ndarray,
@@ -143,17 +479,23 @@ def _merge_close_soma_marker_positions(
     low_floor: float,
     high_t: float,
     branch_sensitivity: float,
+    spacing_zyx: np.ndarray,
 ) -> list[tuple[int, int, int]]:
     if len(positions) <= 1:
         return positions
 
     pts = np.asarray(positions, dtype=np.int32)
-    body_t = float(max(low_floor, high_t * 0.45))
+    pts_um = pts.astype(np.float32, copy=False) * np.maximum(
+        np.asarray(spacing_zyx, dtype=np.float32).reshape(1, 3),
+        1.0e-6,
+    )
+    body_scale = float(np.clip(0.60 + (0.03 * (branch_sensitivity - 1.0)), 0.54, 0.70))
+    body_t = float(max(low_floor, high_t * body_scale))
     body_mask = np.asarray(working >= body_t, dtype=bool)
     body_labels, _ = ndi.label(body_mask, structure=_CC_STRUCTURE)
     body_ids = body_labels[pts[:, 0], pts[:, 1], pts[:, 2]]
 
-    merge_radius = float(np.clip(7.0 / max(0.5, branch_sensitivity), 4.5, 9.0))
+    merge_radius_um = float(np.clip(2.2 / max(0.5, branch_sensitivity), 1.1, 3.0))
     parent = list(range(len(positions)))
 
     def find(idx: int) -> int:
@@ -174,8 +516,8 @@ def _merge_close_soma_marker_positions(
         for j in range(i + 1, len(positions)):
             if int(body_ids[i]) != int(body_ids[j]):
                 continue
-            dist = float(np.linalg.norm(pts[i].astype(np.float32) - pts[j].astype(np.float32)))
-            if dist <= merge_radius:
+            dist_um = float(np.linalg.norm(pts_um[i] - pts_um[j]))
+            if dist_um <= merge_radius_um:
                 union(i, j)
 
     groups: dict[int, list[int]] = {}
@@ -214,7 +556,7 @@ def _assign_low_confidence_branches_to_one_owner(
     if not np.any(branch_mask):
         return labels
 
-    branch_labels, n_branch = ndi.label(branch_mask, structure=_CC_STRUCTURE)
+    branch_labels, n_branch = ndi.label(branch_mask, structure=_CUBIC_STRUCTURE)
     if n_branch <= 0:
         return labels
 
@@ -234,6 +576,51 @@ def _assign_low_confidence_branches_to_one_owner(
         current_ids = current_ids[current_ids > 0]
         if current_ids.size <= 1:
             continue
+
+        owner_candidates = np.unique(
+            local_labels[
+                ndi.binary_dilation(local_branch, structure=_CUBIC_STRUCTURE) & (~local_branch)
+            ]
+        )
+        owner_candidates = owner_candidates[owner_candidates > 0]
+        if owner_candidates.size == 1:
+            local_labels[local_branch] = int(owner_candidates[0])
+            out[comp_slice] = local_labels
+            reassigned += 1
+            continue
+
+        if owner_candidates.size >= 2:
+            owner_frontier_markers = np.zeros(local_branch.shape, dtype=np.int32)
+            owner_map: dict[int, int] = {}
+            marker_id = 0
+            for owner_id in owner_candidates.tolist():
+                owner_touch = local_branch & ndi.binary_dilation(
+                    local_labels == int(owner_id),
+                    structure=_CUBIC_STRUCTURE,
+                )
+                if not np.any(owner_touch):
+                    continue
+                marker_id += 1
+                owner_map[marker_id] = int(owner_id)
+                owner_frontier_markers[owner_touch] = marker_id
+
+            if marker_id >= 2:
+                local_values = np.asarray(working[comp_slice], dtype=np.float32)
+                branch_owner_markers = np.asarray(
+                    _watershed(
+                        -local_values,
+                        markers=owner_frontier_markers,
+                        mask=local_branch,
+                        connectivity=_CUBIC_STRUCTURE,
+                    ),
+                    dtype=np.int32,
+                )
+                if np.any(branch_owner_markers > 0):
+                    for marker_idx, owner_id in owner_map.items():
+                        local_labels[branch_owner_markers == int(marker_idx)] = int(owner_id)
+                    out[comp_slice] = local_labels
+                    reassigned += 1
+                    continue
 
         # Score branch ownership by integrated intensity already assigned to
         # each label; this favors the soma with the strongest 3D connection.
@@ -256,6 +643,131 @@ def _assign_low_confidence_branches_to_one_owner(
             reassigned,
         )
     return out
+
+
+def _segment_soma_markers_from_reduced_threshold(
+    seed: np.ndarray,
+    working: np.ndarray,
+    finite: np.ndarray,
+    *,
+    low_floor: float,
+    high_t: float,
+    branch_sensitivity: float,
+    min_keep: int,
+    spacing_zyx: np.ndarray,
+) -> np.ndarray:
+    sensitivity = float(np.clip(branch_sensitivity, 0.4, 2.0))
+    reduce_scale = float(np.clip(0.58 - (0.08 * (sensitivity - 1.0)), 0.46, 0.72))
+    soma_t = float(np.clip(max(low_floor, high_t * reduce_scale), 0.0, max(high_t, low_floor)))
+    soma_candidate = np.asarray(finite & (working >= soma_t), dtype=bool)
+    if not np.any(soma_candidate):
+        return np.zeros(seed.shape, dtype=np.int32)
+
+    try:
+        dist = ndi.distance_transform_edt(
+            soma_candidate,
+            sampling=(float(spacing_zyx[0]), float(spacing_zyx[1]), float(spacing_zyx[2])),
+        )
+    except MemoryError:
+        dist = np.zeros_like(working, dtype=np.float32)
+
+    soma_core_mask = soma_candidate
+    dist_on_candidate = np.asarray(dist[soma_candidate], dtype=np.float32)
+    if dist_on_candidate.size > 0 and np.any(dist_on_candidate > 0.0):
+        core_quantile = float(np.clip(0.48 + (0.05 * (sensitivity - 1.0)), 0.40, 0.60))
+        core_floor = float(np.quantile(dist_on_candidate, core_quantile))
+        soma_core_mask = soma_candidate & (dist >= max(0.0, core_floor))
+        if not np.any(soma_core_mask):
+            soma_core_mask = soma_candidate
+
+    marker_positions: list[tuple[int, int, int]] = []
+    seed_inside = np.asarray(seed, dtype=bool) & soma_candidate
+
+    core_labels, n_core = ndi.label(soma_core_mask, structure=_CUBIC_STRUCTURE)
+    if n_core > 0:
+        core_sizes = np.bincount(core_labels.ravel(), minlength=n_core + 1)
+        min_core_voxels = max(2, int(min_keep // 3))
+        valid_ids = [
+            i
+            for i in range(1, n_core + 1)
+            if int(core_sizes[i]) >= min_core_voxels
+        ]
+        if valid_ids:
+            marker_positions.extend(_max_positions_for_labels(working, core_labels, valid_ids))
+            if len(valid_ids) == 1:
+                island_mask = np.asarray(core_labels == int(valid_ids[0]), dtype=bool)
+                split_positions = _single_island_multi_marker_positions(
+                    working,
+                    island_mask,
+                    high_t=high_t,
+                    branch_sensitivity=sensitivity,
+                    spacing_zyx=spacing_zyx,
+                )
+                if len(split_positions) >= 2:
+                    marker_positions = split_positions
+
+    if not marker_positions and np.any(seed_inside):
+        seed_labels, n_seed = ndi.label(seed_inside, structure=_CUBIC_STRUCTURE)
+        if n_seed > 0:
+            marker_positions = _max_positions_for_labels(working, seed_labels, list(range(1, n_seed + 1)))
+
+    if marker_positions:
+        marker_positions = _merge_close_soma_marker_positions(
+            marker_positions,
+            working,
+            low_floor=low_floor,
+            high_t=high_t,
+            branch_sensitivity=sensitivity,
+            spacing_zyx=spacing_zyx,
+        )
+
+    if not marker_positions and np.any(seed_inside):
+        marker_labels, _ = ndi.label(seed_inside, structure=_CUBIC_STRUCTURE)
+    elif marker_positions:
+        marker_mask = np.zeros(seed.shape, dtype=bool)
+        for zc, yc, xc in marker_positions:
+            marker_mask[int(zc), int(yc), int(xc)] = True
+        marker_labels, _ = ndi.label(marker_mask, structure=_CUBIC_STRUCTURE)
+    else:
+        marker_labels = np.zeros(seed.shape, dtype=np.int32)
+
+    if not np.any(marker_labels):
+        return np.zeros(seed.shape, dtype=np.int32)
+
+    soma_elevation = -np.asarray(working, dtype=np.float32)
+    if np.any(dist > 0.0):
+        max_dist = float(np.max(dist))
+        if max_dist > 1.0e-6:
+            soma_elevation = soma_elevation - (0.16 * (dist / max_dist).astype(np.float32, copy=False))
+
+    soma_labels = np.asarray(
+        _watershed(
+            soma_elevation,
+            markers=marker_labels,
+            mask=soma_candidate,
+            connectivity=_CUBIC_STRUCTURE,
+        ),
+        dtype=np.int32,
+    )
+    if not np.any(soma_labels):
+        return np.asarray(marker_labels, dtype=np.int32)
+
+    soma_sizes = np.bincount(soma_labels.ravel()).astype(np.int64)
+    keep_ids = np.asarray(
+        [
+            i
+            for i in range(1, soma_sizes.size)
+            if int(soma_sizes[i]) >= max(2, int(min_keep // 3))
+        ],
+        dtype=np.int32,
+    )
+    if keep_ids.size <= 0:
+        return np.asarray(marker_labels, dtype=np.int32)
+
+    lut = np.zeros(int(soma_sizes.size), dtype=np.int32)
+    for new_id, old_id in enumerate(keep_ids.tolist(), start=1):
+        lut[int(old_id)] = int(new_id)
+    return np.asarray(lut[soma_labels], dtype=np.int32)
 
 
 def _detect_soma_blobs(
@@ -291,12 +803,13 @@ def _detect_soma_blobs(
     if detect_positive.size <= 0:
         return np.zeros(arr.shape, dtype=bool)
 
-    peak_quantile = float(np.clip(0.88 - (0.05 * (sensitivity_scale - 1.0)), 0.76, 0.92))
+    peak_quantile = float(np.clip(0.85 - (0.07 * (sensitivity_scale - 1.0)), 0.70, 0.90))
     peak_floor = float(max(threshold, np.quantile(detect_positive, peak_quantile)))
+    peak_radius_um = float(np.clip(1.6 / sensitivity_scale, 0.9, 2.4))
     max_size = (
-        3,
-        int(max(3, round(7.0 / sensitivity_scale))),
-        int(max(3, round(7.0 / sensitivity_scale))),
+        int(max(3, (2 * int(np.ceil(peak_radius_um / float(spacing_zyx[0])))) + 1)),
+        int(max(3, (2 * int(np.ceil(peak_radius_um / float(spacing_zyx[1])))) + 1)),
+        int(max(3, (2 * int(np.ceil(peak_radius_um / float(spacing_zyx[2])))) + 1)),
     )
     peak_mask = finite & (detect >= peak_floor)
     if np.any(peak_mask):
@@ -310,6 +823,21 @@ def _detect_soma_blobs(
         peak_mask,
         max_candidates=max(_MAX_PEAK_CENTER_CANDIDATES, max_centers * 8),
     )
+
+    soma_body_floor = float(max(threshold, peak_floor * 0.70))
+    soma_body_mask = finite & (detect >= soma_body_floor)
+    distance_centers = _distance_peak_centers_from_soma_mask(
+        soma_body_mask,
+        spacing_zyx,
+        max_candidates=max(_MAX_PEAK_CENTER_CANDIDATES, max_centers * 6),
+    )
+    if distance_centers.size > 0:
+        if local_centers.size > 0:
+            local_centers = np.vstack([local_centers, distance_centers])
+        else:
+            local_centers = distance_centers
+        local_centers = np.unique(np.asarray(local_centers, dtype=np.int32), axis=0)
+
     logger.info(
         "Microglia seed detection: volume_shape=%s threshold=%.5f peak_floor=%.5f "
         "peak_candidates=%d max_centers=%d spacing=%s",
@@ -320,11 +848,12 @@ def _detect_soma_blobs(
         max_centers,
         spacing,
     )
-    min_sep = int(max(2, round(3.0 / sensitivity_scale)))
+    min_sep_um = float(np.clip(1.8 / sensitivity_scale, 0.9, 2.6))
     selected = _select_seed_centers(
         detect,
         local_centers,
-        min_sep=min_sep,
+        min_sep_um=min_sep_um,
+        spacing_zyx=spacing_zyx,
         max_centers=max_centers,
     )
 
@@ -361,7 +890,8 @@ def _detect_soma_blobs(
         fallback_centers = _select_seed_centers(
             detect,
             fallback_candidates,
-            min_sep=min_sep,
+            min_sep_um=min_sep_um,
+            spacing_zyx=spacing_zyx,
             max_centers=max_centers,
         )
         logger.info(
@@ -390,41 +920,26 @@ def _seed_labels_from_soma_candidates(
     high_t: float,
     branch_sensitivity: float,
     min_keep: int,
+    spacing_zyx: np.ndarray,
 ) -> np.ndarray:
-    merge_scale = float(np.clip(0.72 - (0.08 * (branch_sensitivity - 1.0)), 0.56, 0.80))
-    merge_t = float(np.clip(max(low_floor, high_t * merge_scale), 0.0, max(high_t, low_floor)))
-    soma_mask = finite & (working >= merge_t)
-    marker_mask = np.asarray(seed, dtype=bool).copy()
-    if np.any(soma_mask):
-        # Keep one marker per disconnected high-confidence soma island. Faint
-        # bridges are assigned later by watershed instead of being allowed to
-        # merge distinct somas during marker construction.
-        soma_labels, n_soma = ndi.label(soma_mask, structure=_CC_STRUCTURE)
-        if n_soma > 0:
-            min_island_voxels = max(2, int(min_keep // 2))
-            island_sizes = np.bincount(soma_labels.ravel(), minlength=n_soma + 1)
-            valid_ids = [
-                i for i in range(1, n_soma + 1)
-                if island_sizes[i] >= min_island_voxels
-            ]
-            if valid_ids:
-                positions = _max_positions_for_labels(working, soma_labels, valid_ids)
-                positions = _merge_close_soma_marker_positions(
-                    positions,
-                    working,
-                    low_floor=low_floor,
-                    high_t=high_t,
-                    branch_sensitivity=branch_sensitivity,
-                )
-                logger.info(
-                    "Microglia seed merge: using %d high-confidence soma island marker(s).",
-                    len(positions),
-                )
-                marker_mask &= ~soma_mask
-                for pos in positions:
-                    marker_mask[int(pos[0]), int(pos[1]), int(pos[2])] = True
+    soma_seed_labels = _segment_soma_markers_from_reduced_threshold(
+        seed,
+        working,
+        finite,
+        low_floor=low_floor,
+        high_t=high_t,
+        branch_sensitivity=branch_sensitivity,
+        min_keep=min_keep,
+        spacing_zyx=spacing_zyx,
+    )
+    if np.any(soma_seed_labels):
+        logger.info(
+            "Microglia soma segmentation: segmented %d soma marker region(s) with reduced threshold.",
+            int(np.max(soma_seed_labels)),
+        )
+        return np.asarray(soma_seed_labels, dtype=np.int32)
 
-    seed_labels, _ = ndi.label(marker_mask, structure=_CC_STRUCTURE)
+    seed_labels, _ = ndi.label(np.asarray(seed, dtype=bool), structure=_CUBIC_STRUCTURE)
     return np.asarray(seed_labels, dtype=np.int32)
 
 
@@ -462,13 +977,17 @@ def compute_component_labels(
     high_quantile = float(np.clip(0.84 - (0.06 * (branch_sense - 1.0)), 0.70, 0.92))
     high_q = float(np.quantile(positive, high_quantile))
     high_t = float(np.clip(max(t, high_q), 0.0, 0.999))
+    spacing_zyx = np.maximum(
+        np.asarray(spacing if spacing is not None else (1.0, 1.0, 1.0), dtype=np.float32),
+        1.0e-6,
+    )
 
     # Detect soma seed centres — one compact region per microglia.
     seed = _detect_soma_blobs(
         working,
         threshold=t,
         branch_sensitivity=branch_sense,
-        spacing=spacing,
+        spacing=(float(spacing_zyx[0]), float(spacing_zyx[1]), float(spacing_zyx[2])),
     )
     if not np.any(seed):
         seed = finite & (working >= high_t)
@@ -517,6 +1036,7 @@ def compute_component_labels(
         high_t=high_t,
         branch_sensitivity=branch_sense,
         min_keep=min_keep,
+        spacing_zyx=spacing_zyx,
     )
     if not np.any(seed_labels):
         return _empty_labels(arr.shape)
@@ -526,7 +1046,7 @@ def compute_component_labels(
     candidate = finite_roi & (working_roi >= low_t)
     if np.any(candidate):
         support = ndi.convolve(
-            candidate.astype(np.uint8), _CC_STRUCTURE, mode="constant", cval=0
+            candidate.astype(np.uint8), _CUBIC_STRUCTURE, mode="constant", cval=0
         )
         # Seeds are always included regardless of neighbour support.
         candidate = (candidate & (support >= support_min)) | (seed_labels > 0)
@@ -537,7 +1057,12 @@ def compute_component_labels(
     # Inverting working_roi makes bright somas low-elevation (fill first), so
     # cells are naturally split at intensity saddle-points — no multi-pass needed.
     raw_labels = np.asarray(
-        _watershed(-working_roi, markers=seed_labels, mask=candidate, connectivity=2),
+        _watershed(
+            -working_roi,
+            markers=seed_labels,
+            mask=candidate,
+            connectivity=_CUBIC_STRUCTURE,
+        ),
         dtype=np.int32,
     )
     raw_labels = _assign_low_confidence_branches_to_one_owner(
@@ -562,7 +1087,9 @@ def compute_component_labels(
     ).astype(np.int64)
 
     component_ids = np.arange(1, n_labels, dtype=np.int32)
-    min_core_voxels = max(1, int(min_keep // 16))
+    # Marker seeds are now compact and may be single-voxel; requiring more
+    # than one core voxel can incorrectly drop valid soma components.
+    min_core_voxels = 1
     min_visible_voxels = max(2, min_core_voxels)
     min_visible_ratio = float(np.clip(0.06 - (0.02 * (branch_sense - 1.0)), 0.03, 0.08))
     max_component_ratio = float(np.clip(0.08 + (0.02 * (branch_sense - 1.0)), 0.06, 0.14))

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Literal
+import time
+from typing import Callable, Literal, Mapping
 
 import imageio.v3 as iio
 import numpy as np
@@ -116,6 +119,21 @@ _CC_STRUCTURE = np.ones((3, 3, 3), dtype=np.uint8)
 _DEGREE_KERNEL = np.ones((3, 3, 3), dtype=np.uint8)
 _AUTO_FIJI_FALLBACK_MAX_VOXELS = 96 * 1024 * 1024
 _TIP_NEAR_VESSEL_RADIUS_UM = 10.0
+_BRANCH_OVERLAY_MAX_POINTS = 192
+
+
+@dataclass
+class _ComponentAnalysisResult:
+    cell_index: int
+    component_id: int
+    component_slice: tuple[slice, slice, slice]
+    row: MicrogliaCellReportRow
+    branch_rows: list[MicrogliaBranchReportRow]
+    tip_payloads: list[dict[str, object]]
+    soma_local: np.ndarray
+    branch_labels_local: np.ndarray
+    overlay_points: list[dict[str, object]]
+    overlay_lines: list[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -483,6 +501,23 @@ def _neighbor_offsets() -> list[tuple[int, int, int]]:
 _NEIGHBOR_OFFSETS = _neighbor_offsets()
 
 
+def _downsample_overlay_path(
+    path: list[tuple[int, int, int]],
+    max_points: int,
+) -> list[tuple[int, int, int]]:
+    if len(path) <= int(max_points):
+        return path
+    target = max(2, int(max_points))
+    sample_idx = np.linspace(0, len(path) - 1, num=target, dtype=np.int64)
+    sample_idx = np.unique(sample_idx)
+    sampled = [path[int(i)] for i in sample_idx.tolist()]
+    if sampled[0] != path[0]:
+        sampled.insert(0, path[0])
+    if sampled[-1] != path[-1]:
+        sampled.append(path[-1])
+    return sampled
+
+
 def _skeleton_neighbors(
     point: tuple[int, int, int],
     skeleton: np.ndarray,
@@ -843,6 +878,324 @@ def _internal_result_looks_merged(
     return False
 
 
+def _resolve_analysis_workers(
+    preprocess_config: PreprocessConfig,
+    *,
+    total_jobs: int,
+    max_workers: int = 8,
+) -> int:
+    if int(total_jobs) <= 1:
+        return 1
+    requested = int(preprocess_config.cpu_worker_threads)
+    if requested > 0:
+        return max(1, min(requested, int(total_jobs), int(max_workers)))
+    cpus = os.cpu_count() or 1
+    return max(1, min(int(cpus), int(total_jobs), int(max_workers)))
+
+
+def _compute_vessel_labels_and_radius(
+    red_mask: np.ndarray,
+    spacing: VoxelSpacing,
+) -> tuple[np.ndarray, np.ndarray]:
+    labels, _ = ndi.label(red_mask, structure=_CC_STRUCTURE)
+    radius = ndi.distance_transform_edt(
+        red_mask,
+        sampling=(float(spacing.z_um), float(spacing.y_um), float(spacing.x_um)),
+    )
+    return np.asarray(labels, dtype=np.int32), np.asarray(radius, dtype=np.float32)
+
+
+def _analyze_single_microglia_component(
+    *,
+    cell_index: int,
+    component_id: int,
+    component_slice: tuple[slice, slice, slice],
+    labels: np.ndarray,
+    sizes: np.ndarray,
+    green: np.ndarray,
+    red_mask: np.ndarray,
+    threshold_green: float,
+    threshold_red: float,
+    spacing: VoxelSpacing,
+    shared_z_values: list[int],
+    engine: SegmentationEngine,
+    vessel_labels: np.ndarray,
+    vessel_radius_um: np.ndarray,
+    vessel_surface_dist_um: np.ndarray | None,
+    vessel_surface_indices: np.ndarray | None,
+    overlay_state: Mapping[str, bool],
+    max_branch_overlay_points: int,
+) -> _ComponentAnalysisResult | None:
+    comp_id = int(component_id)
+    comp_slice = component_slice
+    component_local = np.asarray(labels[comp_slice] == comp_id, dtype=bool)
+    if not np.any(component_local):
+        return None
+
+    green_local = np.asarray(green[comp_slice], dtype=np.float32)
+    skeleton_local = _skeletonize_mask(component_local)
+    degree_local = _skeleton_degree_map(skeleton_local)
+    branch_defs, branch_labels_local, _tip_labels_local, _junction_mask = _trace_skeleton_branches(
+        skeleton_local,
+        spacing,
+    )
+    endpoint_count = int(np.count_nonzero(skeleton_local & (degree_local == 1)))
+    junction_count = int(np.count_nonzero(skeleton_local & (degree_local >= 3)))
+
+    soma_local = _soma_core_mask(
+        component_local,
+        green_local,
+        skeleton_local,
+        threshold_green,
+    )
+    soma_voxel_count = int(np.count_nonzero(soma_local))
+    soma_center_idx = _mask_centroid_voxel(soma_local, comp_slice)
+    soma_xyz = _voxel_to_xyz_um(soma_center_idx, spacing, z_values=shared_z_values)
+    soma_dist_um, soma_vessel_idx, _soma_vessel_id, _soma_vessel_diam = _nearest_vessel_info(
+        soma_center_idx,
+        vessel_surface_dist_um,
+        vessel_surface_indices,
+        vessel_labels,
+        vessel_radius_um,
+    )
+    soma_equiv_diameter, soma_bbox_x, soma_bbox_y, soma_bbox_z, soma_roundness, soma_rectangularity = _soma_shape_metrics(
+        soma_local,
+        spacing,
+    )
+
+    overlay_points: list[dict[str, object]] = []
+    overlay_lines: list[dict[str, object]] = []
+    if overlay_state["soma"]:
+        overlay_points.append(
+            {
+                "kind": "soma_center",
+                "cell_index": int(cell_index),
+                "component_id": comp_id,
+                "xyz_um": [float(v) for v in soma_xyz],
+            }
+        )
+
+    component_surface_local = _surface_mask(component_local)
+    component_coords = _coords_from_local_mask(component_local, comp_slice)
+    component_surface_coords = _coords_from_local_mask(component_surface_local, comp_slice)
+    distance_um, micro_idx, vessel_idx = _closest_surface_pair_from_coords(
+        component_coords=component_coords,
+        component_surface_coords=component_surface_coords,
+        red_mask=red_mask,
+        vessel_surface_dist_um=vessel_surface_dist_um,
+        vessel_surface_indices=vessel_surface_indices,
+    )
+    micro_xyz = _voxel_to_xyz_um(micro_idx, spacing, z_values=shared_z_values)
+    if vessel_idx is None:
+        vessel_xyz = (float("nan"), float("nan"), float("nan"))
+        nearest_vessel_id = 0
+        nearest_vessel_diameter_um = float("nan")
+    else:
+        vessel_xyz = _voxel_to_xyz_um(vessel_idx, spacing, z_values=shared_z_values)
+        nearest_vessel_id = int(vessel_labels[vessel_idx])
+        nearest_vessel_diameter_um = _local_vessel_diameter_um(
+            vessel_idx,
+            nearest_vessel_id,
+            vessel_labels,
+            vessel_radius_um,
+        )
+        if overlay_state["vessels"]:
+            overlay_points.append(
+                {
+                    "kind": "nearest_vessel_point",
+                    "cell_index": int(cell_index),
+                    "component_id": comp_id,
+                    "vessel_id": nearest_vessel_id,
+                    "xyz_um": [float(v) for v in vessel_xyz],
+                }
+            )
+        if overlay_state["connectors"]:
+            overlay_lines.append(
+                {
+                    "kind": "cell_to_vessel",
+                    "cell_index": int(cell_index),
+                    "component_id": comp_id,
+                    "points_xyz_um": [[float(v) for v in micro_xyz], [float(v) for v in vessel_xyz]],
+                }
+            )
+
+    tip_payloads: list[dict[str, object]] = []
+    branch_rows: list[MicrogliaBranchReportRow] = []
+    tip_near_multiple_vessel_count = 0
+    for branch in branch_defs:
+        branch_id = int(branch["branch_id"])
+        path_local = [tuple(int(v) for v in p) for p in branch["path"]]  # type: ignore[index]
+        path_global = [
+            (
+                int(p[0]) + int(comp_slice[0].start or 0),
+                int(p[1]) + int(comp_slice[1].start or 0),
+                int(p[2]) + int(comp_slice[2].start or 0),
+            )
+            for p in path_local
+        ]
+        if not path_global:
+            continue
+
+        if vessel_surface_dist_um is not None and vessel_surface_indices is not None:
+            path_arr = np.asarray(path_global, dtype=np.int64)
+            z_path = path_arr[:, 0]
+            y_path = path_arr[:, 1]
+            x_path = path_arr[:, 2]
+            branch_dist = np.asarray(vessel_surface_dist_um[z_path, y_path, x_path], dtype=np.float32)
+            finite_mask = np.isfinite(branch_dist)
+            if np.any(finite_mask):
+                finite_idx = np.flatnonzero(finite_mask)
+                best_local = int(finite_idx[int(np.argmin(branch_dist[finite_mask]))])
+                best_point = (
+                    int(z_path[best_local]),
+                    int(y_path[best_local]),
+                    int(x_path[best_local]),
+                )
+                best_branch_distance = float(branch_dist[best_local])
+                best_branch_vessel_idx = (
+                    int(vessel_surface_indices[0][best_point]),
+                    int(vessel_surface_indices[1][best_point]),
+                    int(vessel_surface_indices[2][best_point]),
+                )
+                branch_vessel_id = int(vessel_labels[best_branch_vessel_idx])
+                branch_vessel_diam = _local_vessel_diameter_um(
+                    best_branch_vessel_idx,
+                    branch_vessel_id,
+                    vessel_labels,
+                    vessel_radius_um,
+                )
+            else:
+                best_branch_distance, branch_vessel_id, branch_vessel_diam = float("nan"), 0, float("nan")
+        else:
+            best_branch_distance, branch_vessel_id, branch_vessel_diam = float("nan"), 0, float("nan")
+
+        start_global = path_global[0]
+        end_global = path_global[-1]
+        start_xyz = _voxel_to_xyz_um(start_global, spacing, z_values=shared_z_values)
+        end_xyz = _voxel_to_xyz_um(end_global, spacing, z_values=shared_z_values)
+        branch_rows.append(
+            MicrogliaBranchReportRow(
+                cell_index=int(cell_index),
+                component_id=comp_id,
+                branch_id=branch_id,
+                start_x_um=float(start_xyz[0]),
+                start_y_um=float(start_xyz[1]),
+                start_z_um=float(start_xyz[2]),
+                end_x_um=float(end_xyz[0]),
+                end_y_um=float(end_xyz[1]),
+                end_z_um=float(end_xyz[2]),
+                path_length_um=float(branch["path_length_um"]),
+                chord_length_um=float(branch["chord_length_um"]),
+                tortuosity=float(branch["tortuosity"]),
+                nearest_vessel_id=int(branch_vessel_id),
+                nearest_vessel_distance_um=float(best_branch_distance),
+                nearest_vessel_diameter_um=float(branch_vessel_diam),
+            )
+        )
+
+        if overlay_state["branches"]:
+            overlay_path = _downsample_overlay_path(path_global, max_branch_overlay_points)
+            overlay_lines.append(
+                {
+                    "kind": "branch_path",
+                    "cell_index": int(cell_index),
+                    "component_id": comp_id,
+                    "branch_id": branch_id,
+                    "points_xyz_um": [
+                        [float(v) for v in _voxel_to_xyz_um(point, spacing, z_values=shared_z_values)]
+                        for point in overlay_path
+                    ],
+                }
+            )
+
+        for tip_global in (start_global, end_global):
+            local_tip = (
+                int(tip_global[0]) - int(comp_slice[0].start or 0),
+                int(tip_global[1]) - int(comp_slice[1].start or 0),
+                int(tip_global[2]) - int(comp_slice[2].start or 0),
+            )
+            if not bool(skeleton_local[local_tip]) or int(degree_local[local_tip]) != 1:
+                continue
+            near_ids = _nearby_vessel_ids(tip_global, vessel_labels, spacing)
+            tip_near_multiple_vessel_count = max(tip_near_multiple_vessel_count, int(len(near_ids)))
+            tip_dist, tip_vessel_idx, tip_vessel_id, tip_vessel_diameter = _nearest_vessel_info(
+                tip_global,
+                vessel_surface_dist_um,
+                vessel_surface_indices,
+                vessel_labels,
+                vessel_radius_um,
+            )
+            tip_xyz = _voxel_to_xyz_um(tip_global, spacing, z_values=shared_z_values)
+            tip_payloads.append(
+                {
+                    "cell_index": int(cell_index),
+                    "component_id": comp_id,
+                    "branch_id": branch_id,
+                    "tip_global": tuple(int(v) for v in tip_global),
+                    "tip_xyz": tuple(float(v) for v in tip_xyz),
+                    "tip_dist": float(tip_dist),
+                    "tip_vessel_idx": (
+                        tuple(int(v) for v in tip_vessel_idx)
+                        if tip_vessel_idx is not None
+                        else None
+                    ),
+                    "tip_vessel_id": int(tip_vessel_id),
+                    "tip_vessel_diameter": float(tip_vessel_diameter),
+                    "near_ids": [int(v) for v in near_ids],
+                }
+            )
+
+    voxel_count = int(sizes[comp_id]) if comp_id < int(sizes.shape[0]) else int(np.count_nonzero(component_local))
+    voxel_volume_um3 = float(spacing.voxel_volume_um3)
+    row = MicrogliaCellReportRow(
+        cell_index=int(cell_index),
+        component_id=comp_id,
+        segmentation_engine_used=engine,
+        voxel_count=voxel_count,
+        volume_um3=float(voxel_count * voxel_volume_um3),
+        soma_voxel_count=soma_voxel_count,
+        soma_volume_um3=float(soma_voxel_count * voxel_volume_um3),
+        soma_center_x_um=float(soma_xyz[0]),
+        soma_center_y_um=float(soma_xyz[1]),
+        soma_center_z_um=float(soma_xyz[2]),
+        soma_distance_to_vasculature_um=float(soma_dist_um),
+        soma_equivalent_diameter_um=float(soma_equiv_diameter),
+        soma_bbox_x_um=float(soma_bbox_x),
+        soma_bbox_y_um=float(soma_bbox_y),
+        soma_bbox_z_um=float(soma_bbox_z),
+        soma_roundness=float(soma_roundness),
+        soma_rectangularity=float(soma_rectangularity),
+        branch_count=int(len(branch_defs)),
+        branch_endpoint_count=int(endpoint_count),
+        branch_junction_count=int(junction_count),
+        distance_to_vasculature_um=float(distance_um),
+        nearest_vessel_id=int(nearest_vessel_id),
+        nearest_vessel_diameter_um=float(nearest_vessel_diameter_um),
+        tip_near_multiple_vessel_count=int(tip_near_multiple_vessel_count),
+        microglia_closest_x_um=float(micro_xyz[0]),
+        microglia_closest_y_um=float(micro_xyz[1]),
+        microglia_closest_z_um=float(micro_xyz[2]),
+        vessel_closest_x_um=float(vessel_xyz[0]),
+        vessel_closest_y_um=float(vessel_xyz[1]),
+        vessel_closest_z_um=float(vessel_xyz[2]),
+        threshold_green_used=float(threshold_green),
+        threshold_red_used=float(threshold_red),
+    )
+
+    return _ComponentAnalysisResult(
+        cell_index=int(cell_index),
+        component_id=comp_id,
+        component_slice=comp_slice,
+        row=row,
+        branch_rows=branch_rows,
+        tip_payloads=tip_payloads,
+        soma_local=np.asarray(soma_local, dtype=bool),
+        branch_labels_local=np.asarray(branch_labels_local, dtype=np.int32),
+        overlay_points=overlay_points,
+        overlay_lines=overlay_lines,
+    )
+
+
 def resolve_microglia_analysis_render(
     dataset: DatasetVolume,
     render: RenderConfig,
@@ -869,10 +1222,44 @@ def analyze_microglia_vessel(
     segmentation_mode: SegmentationMode = "auto",
     branch_sensitivity: float = 1.0,
     threshold_source: AnalysisThresholdSource = "adaptive",
+    progress_callback: Callable[[float, str], None] | None = None,
+    overlay_options: Mapping[str, bool] | None = None,
+    max_branch_overlay_points: int = _BRANCH_OVERLAY_MAX_POINTS,
 ) -> MicrogliaCellReport:
+    total_start = time.perf_counter()
+
+    def _publish_progress(progress: float, message: str, *, log: bool = False) -> None:
+        frac = float(np.clip(progress, 0.0, 1.0))
+        if progress_callback is not None:
+            try:
+                progress_callback(frac, message)
+            except Exception:
+                # Progress updates are best-effort and must never fail analysis.
+                pass
+        if log:
+            logger.info("Microglia analysis: %s", message)
+
     mode = str(segmentation_mode).strip().lower()
     if mode not in {"auto", "internal", "fiji"}:
         raise ValueError("segmentation_mode must be one of: auto, internal, fiji.")
+
+    overlay_state = {
+        "soma": True,
+        "branches": True,
+        "tips": True,
+        "connectors": True,
+        "vessels": True,
+        "diameter": True,
+        "crossings": True,
+    }
+    if overlay_options is not None:
+        for key in overlay_state:
+            if key in overlay_options:
+                overlay_state[key] = bool(overlay_options[key])
+
+    max_branch_overlay_points = max(8, int(max_branch_overlay_points))
+
+    _publish_progress(0.02, "Resolving thresholds and shared volume...", log=True)
 
     resolved_render = resolve_microglia_analysis_render(
         dataset,
@@ -888,6 +1275,8 @@ def analyze_microglia_vessel(
     order: np.ndarray
     sizes: np.ndarray
     engine: SegmentationEngine
+
+    _publish_progress(0.12, f"Segmenting microglia (mode={mode})...", log=True)
 
     if mode == "fiji":
         labels, order, sizes = _run_fiji_segmentation(
@@ -918,6 +1307,7 @@ def analyze_microglia_vessel(
                 )
             else:
                 try:
+                    _publish_progress(0.20, "Retrying segmentation with Fiji fallback...", log=True)
                     labels, order, sizes = _run_fiji_segmentation(
                         green, threshold_green, preprocess_config,
                         spacing=spacing, branch_sensitivity=branch_sensitivity,
@@ -927,19 +1317,39 @@ def analyze_microglia_vessel(
                 except Exception as exc:
                     logger.warning("Microglia report fallback to fiji failed: %s", exc)
 
+    _publish_progress(
+        0.28,
+        f"Segmentation complete: engine={engine}, components={int(len(order))}.",
+        log=True,
+    )
+
+    vessel_start = time.perf_counter()
+    _publish_progress(0.34, "Computing vessel distance maps and skeletons...", log=True)
     red_mask = red >= threshold_red
-    vessel_labels, _n_vessels = ndi.label(red_mask, structure=_CC_STRUCTURE)
-    vessel_radius_um = ndi.distance_transform_edt(
-        red_mask,
-        sampling=(float(spacing.z_um), float(spacing.y_um), float(spacing.x_um)),
-    ).astype(np.float32, copy=False)
-    vessel_skeleton = _skeletonize_mask(red_mask)
-    vessel_surface_dist_um, vessel_surface_indices = _compute_vessel_surface_distance_maps(red_mask, spacing)
+    vessel_workers = _resolve_analysis_workers(preprocess_config, total_jobs=3, max_workers=3)
+    if vessel_workers > 1:
+        logger.info("Microglia analysis vessel preprocessing: parallel workers=%d", vessel_workers)
+        with ThreadPoolExecutor(max_workers=vessel_workers, thread_name_prefix="nvap-vessel") as pool:
+            labels_future = pool.submit(_compute_vessel_labels_and_radius, red_mask, spacing)
+            skeleton_future = pool.submit(_skeletonize_mask, red_mask)
+            surface_future = pool.submit(_compute_vessel_surface_distance_maps, red_mask, spacing)
+            vessel_labels, vessel_radius_um = labels_future.result()
+            vessel_skeleton = np.asarray(skeleton_future.result(), dtype=bool)
+            vessel_surface_dist_um, vessel_surface_indices = surface_future.result()
+    else:
+        vessel_labels, vessel_radius_um = _compute_vessel_labels_and_radius(red_mask, spacing)
+        vessel_skeleton = _skeletonize_mask(red_mask)
+        vessel_surface_dist_um, vessel_surface_indices = _compute_vessel_surface_distance_maps(red_mask, spacing)
     crossing_rows, vessel_crossing_markers = _detect_vessel_crossings(
         vessel_skeleton,
         np.asarray(vessel_labels, dtype=np.int32),
         spacing,
         shared_z_values,
+    )
+    _publish_progress(
+        0.44,
+        f"Vessel preprocessing complete in {time.perf_counter() - vessel_start:.2f}s.",
+        log=True,
     )
 
     rows: list[MicrogliaCellReportRow] = []
@@ -950,8 +1360,8 @@ def analyze_microglia_vessel(
     tip_marker_labels = np.zeros(labels.shape, dtype=np.int32)
     overlay_points: list[dict[str, object]] = []
     overlay_lines: list[dict[str, object]] = []
-    voxel_volume_um3 = float(spacing.voxel_volume_um3)
     component_objects = ndi.find_objects(np.asarray(labels))
+    component_jobs: list[tuple[int, int, tuple[slice, slice, slice]]] = []
     for cell_index, component_id in enumerate(order.tolist(), start=1):
         comp_id = int(component_id)
         obj_idx = comp_id - 1
@@ -960,273 +1370,160 @@ def analyze_microglia_vessel(
         comp_slice = component_objects[obj_idx]
         if comp_slice is None:
             continue
-        component_local = np.asarray(labels[comp_slice] == comp_id, dtype=bool)
-        if not np.any(component_local):
-            continue
+        component_jobs.append((int(cell_index), comp_id, comp_slice))
 
-        green_local = np.asarray(green[comp_slice], dtype=np.float32)
-        skeleton_local = _skeletonize_mask(component_local)
-        degree_local = _skeleton_degree_map(skeleton_local)
-        branch_defs, branch_labels_local, tip_labels_local, _junction_mask = _trace_skeleton_branches(
-            skeleton_local,
-            spacing,
-        )
-        endpoint_count = int(np.count_nonzero(skeleton_local & (degree_local == 1)))
-        junction_count = int(np.count_nonzero(skeleton_local & (degree_local >= 3)))
+    total_cells = int(len(component_jobs))
+    if total_cells <= 0:
+        _publish_progress(0.90, "No microglia components found above threshold.", log=True)
+    progress_stride = max(1, total_cells // 10) if total_cells > 0 else 1
+    component_results: list[_ComponentAnalysisResult] = []
+    cell_workers = _resolve_analysis_workers(preprocess_config, total_jobs=total_cells, max_workers=8)
 
-        soma_local = _soma_core_mask(
-            component_local,
-            green_local,
-            skeleton_local,
-            threshold_green,
-        )
-        soma_core_labels[comp_slice][soma_local] = int(cell_index)
-        soma_voxel_count = int(np.count_nonzero(soma_local))
-        soma_center_idx = _mask_centroid_voxel(soma_local, comp_slice)
-        soma_xyz = _voxel_to_xyz_um(soma_center_idx, spacing, z_values=shared_z_values)
-        soma_dist_um, soma_vessel_idx, _soma_vessel_id, _soma_vessel_diam = _nearest_vessel_info(
-            soma_center_idx,
-            vessel_surface_dist_um,
-            vessel_surface_indices,
-            vessel_labels,
-            vessel_radius_um,
-        )
-        soma_equiv_diameter, soma_bbox_x, soma_bbox_y, soma_bbox_z, soma_roundness, soma_rectangularity = _soma_shape_metrics(
-            soma_local,
-            spacing,
-        )
-        overlay_points.append(
-            {
-                "kind": "soma_center",
-                "cell_index": int(cell_index),
-                "component_id": comp_id,
-                "xyz_um": [float(v) for v in soma_xyz],
+    if total_cells > 0 and cell_workers > 1:
+        logger.info("Microglia analysis cell processing: parallel workers=%d", cell_workers)
+        with ThreadPoolExecutor(max_workers=cell_workers, thread_name_prefix="nvap-cell") as pool:
+            futures = {
+                pool.submit(
+                    _analyze_single_microglia_component,
+                    cell_index=cell_index,
+                    component_id=component_id,
+                    component_slice=component_slice,
+                    labels=labels,
+                    sizes=sizes,
+                    green=green,
+                    red_mask=red_mask,
+                    threshold_green=threshold_green,
+                    threshold_red=threshold_red,
+                    spacing=spacing,
+                    shared_z_values=shared_z_values,
+                    engine=engine,
+                    vessel_labels=vessel_labels,
+                    vessel_radius_um=vessel_radius_um,
+                    vessel_surface_dist_um=vessel_surface_dist_um,
+                    vessel_surface_indices=vessel_surface_indices,
+                    overlay_state=overlay_state,
+                    max_branch_overlay_points=max_branch_overlay_points,
+                ): int(cell_index)
+                for cell_index, component_id, component_slice in component_jobs
             }
-        )
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                result = future.result()
+                if result is not None:
+                    component_results.append(result)
+                if completed == 1 or completed == total_cells or (completed % progress_stride == 0):
+                    frac = 0.46 + (0.44 * (float(completed - 1) / max(1.0, float(total_cells))))
+                    _publish_progress(frac, f"Analyzing microglia cell {completed}/{total_cells}...", log=True)
+    else:
+        for completed, (cell_index, component_id, component_slice) in enumerate(component_jobs, start=1):
+            if completed == 1 or completed == total_cells or (completed % progress_stride == 0):
+                frac = 0.46 + (0.44 * (float(completed - 1) / max(1.0, float(total_cells))))
+                _publish_progress(frac, f"Analyzing microglia cell {completed}/{total_cells}...", log=True)
+            result = _analyze_single_microglia_component(
+                cell_index=cell_index,
+                component_id=component_id,
+                component_slice=component_slice,
+                labels=labels,
+                sizes=sizes,
+                green=green,
+                red_mask=red_mask,
+                threshold_green=threshold_green,
+                threshold_red=threshold_red,
+                spacing=spacing,
+                shared_z_values=shared_z_values,
+                engine=engine,
+                vessel_labels=vessel_labels,
+                vessel_radius_um=vessel_radius_um,
+                vessel_surface_dist_um=vessel_surface_dist_um,
+                vessel_surface_indices=vessel_surface_indices,
+                overlay_state=overlay_state,
+                max_branch_overlay_points=max_branch_overlay_points,
+            )
+            if result is not None:
+                component_results.append(result)
 
-        component_surface_local = _surface_mask(component_local)
-        component_coords = _coords_from_local_mask(component_local, comp_slice)
-        component_surface_coords = _coords_from_local_mask(component_surface_local, comp_slice)
-        distance_um, micro_idx, vessel_idx = _closest_surface_pair_from_coords(
-            component_coords=component_coords,
-            component_surface_coords=component_surface_coords,
-            red_mask=red_mask,
-            vessel_surface_dist_um=vessel_surface_dist_um,
-            vessel_surface_indices=vessel_surface_indices,
-        )
-        micro_xyz = _voxel_to_xyz_um(micro_idx, spacing, z_values=shared_z_values)
-        if vessel_idx is None:
-            vessel_xyz = (float("nan"), float("nan"), float("nan"))
-            nearest_vessel_id = 0
-            nearest_vessel_diameter_um = float("nan")
-        else:
-            vessel_xyz = _voxel_to_xyz_um(vessel_idx, spacing, z_values=shared_z_values)
-            nearest_vessel_id = int(vessel_labels[vessel_idx])
-            nearest_vessel_diameter_um = _local_vessel_diameter_um(
-                vessel_idx,
-                nearest_vessel_id,
-                vessel_labels,
-                vessel_radius_um,
-            )
-            overlay_points.append(
-                {
-                    "kind": "nearest_vessel_point",
-                    "cell_index": int(cell_index),
-                    "component_id": comp_id,
-                    "vessel_id": nearest_vessel_id,
-                    "xyz_um": [float(v) for v in vessel_xyz],
-                }
-            )
-            overlay_lines.append(
-                {
-                    "kind": "cell_to_vessel",
-                    "cell_index": int(cell_index),
-                    "component_id": comp_id,
-                    "points_xyz_um": [[float(v) for v in micro_xyz], [float(v) for v in vessel_xyz]],
-                }
-            )
+    component_results.sort(key=lambda item: int(item.cell_index))
+    for result in component_results:
+        rows.append(result.row)
+        soma_core_labels[result.component_slice][result.soma_local] = int(result.cell_index)
+        overlay_points.extend(result.overlay_points)
+        overlay_lines.extend(result.overlay_lines)
 
-        tip_near_multiple_vessel_count = 0
-        for branch in branch_defs:
-            branch_id = int(branch["branch_id"])
-            path_local = [tuple(int(v) for v in p) for p in branch["path"]]  # type: ignore[index]
-            path_global = [
-                (
-                    int(p[0]) + int(comp_slice[0].start or 0),
-                    int(p[1]) + int(comp_slice[1].start or 0),
-                    int(p[2]) + int(comp_slice[2].start or 0),
-                )
-                for p in path_local
-            ]
-            if not path_global:
-                continue
-            branch_skeleton_labels[comp_slice][branch_labels_local == branch_id] = len(branch_rows) + 1
-            branch_distances: list[tuple[float, tuple[int, int, int] | None, int, float, tuple[int, int, int]]] = []
-            for point in path_global:
-                d_um, near_idx, vessel_id, diameter_um = _nearest_vessel_info(
-                    point,
-                    vessel_surface_dist_um,
-                    vessel_surface_indices,
-                    vessel_labels,
-                    vessel_radius_um,
-                )
-                if np.isfinite(d_um):
-                    branch_distances.append((d_um, near_idx, vessel_id, diameter_um, point))
-            if branch_distances:
-                best_branch_distance, _best_branch_vessel_idx, branch_vessel_id, branch_vessel_diam, _branch_point = min(
-                    branch_distances,
-                    key=lambda item: item[0],
-                )
-            else:
-                best_branch_distance, branch_vessel_id, branch_vessel_diam = float("nan"), 0, float("nan")
-            start_global = path_global[0]
-            end_global = path_global[-1]
-            start_xyz = _voxel_to_xyz_um(start_global, spacing, z_values=shared_z_values)
-            end_xyz = _voxel_to_xyz_um(end_global, spacing, z_values=shared_z_values)
-            branch_rows.append(
-                MicrogliaBranchReportRow(
-                    cell_index=int(cell_index),
-                    component_id=comp_id,
-                    branch_id=branch_id,
-                    start_x_um=float(start_xyz[0]),
-                    start_y_um=float(start_xyz[1]),
-                    start_z_um=float(start_xyz[2]),
-                    end_x_um=float(end_xyz[0]),
-                    end_y_um=float(end_xyz[1]),
-                    end_z_um=float(end_xyz[2]),
-                    path_length_um=float(branch["path_length_um"]),
-                    chord_length_um=float(branch["chord_length_um"]),
-                    tortuosity=float(branch["tortuosity"]),
-                    nearest_vessel_id=int(branch_vessel_id),
-                    nearest_vessel_distance_um=float(best_branch_distance),
-                    nearest_vessel_diameter_um=float(branch_vessel_diam),
-                )
-            )
-            overlay_lines.append(
-                {
-                    "kind": "branch_path",
-                    "cell_index": int(cell_index),
-                    "component_id": comp_id,
-                    "branch_id": branch_id,
-                    "points_xyz_um": [
-                        [float(v) for v in _voxel_to_xyz_um(point, spacing, z_values=shared_z_values)]
-                        for point in path_global
-                    ],
-                }
-            )
+        local_branch_labels = np.asarray(result.branch_labels_local, dtype=np.int32)
+        for branch_row in result.branch_rows:
+            branch_rows.append(branch_row)
+            branch_global_id = int(len(branch_rows))
+            branch_skeleton_labels[result.component_slice][local_branch_labels == int(branch_row.branch_id)] = branch_global_id
 
-            for tip_global in (start_global, end_global):
-                local_tip = (
-                    int(tip_global[0]) - int(comp_slice[0].start or 0),
-                    int(tip_global[1]) - int(comp_slice[1].start or 0),
-                    int(tip_global[2]) - int(comp_slice[2].start or 0),
+        for payload in result.tip_payloads:
+            tip_id = int(len(tip_rows) + 1)
+            tip_global = tuple(int(v) for v in payload["tip_global"])
+            tip_xyz = tuple(float(v) for v in payload["tip_xyz"])
+            near_ids = [int(v) for v in payload["near_ids"]]
+            tip_marker_labels[tip_global] = tip_id
+            tip_rows.append(
+                MicrogliaTipReportRow(
+                    cell_index=int(payload["cell_index"]),
+                    component_id=int(payload["component_id"]),
+                    branch_id=int(payload["branch_id"]),
+                    tip_id=tip_id,
+                    tip_x_um=float(tip_xyz[0]),
+                    tip_y_um=float(tip_xyz[1]),
+                    tip_z_um=float(tip_xyz[2]),
+                    nearest_vessel_id=int(payload["tip_vessel_id"]),
+                    nearest_vessel_distance_um=float(payload["tip_dist"]),
+                    nearest_vessel_diameter_um=float(payload["tip_vessel_diameter"]),
+                    nearby_vessel_count=int(len(near_ids)),
+                    nearby_vessel_ids=";".join(str(v) for v in near_ids),
                 )
-                if not bool(skeleton_local[local_tip]) or int(degree_local[local_tip]) != 1:
-                    continue
-                near_ids = _nearby_vessel_ids(tip_global, vessel_labels, spacing)
-                tip_near_multiple_vessel_count = max(tip_near_multiple_vessel_count, int(len(near_ids)))
-                tip_dist, tip_vessel_idx, tip_vessel_id, tip_vessel_diameter = _nearest_vessel_info(
-                    tip_global,
-                    vessel_surface_dist_um,
-                    vessel_surface_indices,
-                    vessel_labels,
-                    vessel_radius_um,
-                )
-                tip_xyz = _voxel_to_xyz_um(tip_global, spacing, z_values=shared_z_values)
-                tip_id = len(tip_rows) + 1
-                tip_marker_labels[tip_global] = tip_id
-                tip_rows.append(
-                    MicrogliaTipReportRow(
-                        cell_index=int(cell_index),
-                        component_id=comp_id,
-                        branch_id=branch_id,
-                        tip_id=tip_id,
-                        tip_x_um=float(tip_xyz[0]),
-                        tip_y_um=float(tip_xyz[1]),
-                        tip_z_um=float(tip_xyz[2]),
-                        nearest_vessel_id=int(tip_vessel_id),
-                        nearest_vessel_distance_um=float(tip_dist),
-                        nearest_vessel_diameter_um=float(tip_vessel_diameter),
-                        nearby_vessel_count=int(len(near_ids)),
-                        nearby_vessel_ids=";".join(str(v) for v in near_ids),
-                    )
-                )
+            )
+            if overlay_state["tips"]:
                 overlay_points.append(
                     {
                         "kind": "tip",
-                        "cell_index": int(cell_index),
-                        "component_id": comp_id,
-                        "branch_id": branch_id,
+                        "cell_index": int(payload["cell_index"]),
+                        "component_id": int(payload["component_id"]),
+                        "branch_id": int(payload["branch_id"]),
                         "tip_id": tip_id,
                         "nearby_vessel_count": int(len(near_ids)),
                         "xyz_um": [float(v) for v in tip_xyz],
                     }
                 )
-                if tip_vessel_idx is not None:
-                    tip_vessel_xyz = _voxel_to_xyz_um(tip_vessel_idx, spacing, z_values=shared_z_values)
-                    overlay_lines.append(
-                        {
-                            "kind": "tip_to_vessel",
-                            "cell_index": int(cell_index),
-                            "component_id": comp_id,
-                            "branch_id": branch_id,
-                            "tip_id": tip_id,
-                            "points_xyz_um": [[float(v) for v in tip_xyz], [float(v) for v in tip_vessel_xyz]],
-                        }
-                    )
+            tip_vessel_idx = payload["tip_vessel_idx"]
+            if overlay_state["connectors"] and tip_vessel_idx is not None:
+                tip_vessel_xyz = _voxel_to_xyz_um(
+                    tuple(int(v) for v in tip_vessel_idx),
+                    spacing,
+                    z_values=shared_z_values,
+                )
+                overlay_lines.append(
+                    {
+                        "kind": "tip_to_vessel",
+                        "cell_index": int(payload["cell_index"]),
+                        "component_id": int(payload["component_id"]),
+                        "branch_id": int(payload["branch_id"]),
+                        "tip_id": tip_id,
+                        "points_xyz_um": [[float(v) for v in tip_xyz], [float(v) for v in tip_vessel_xyz]],
+                    }
+                )
 
-        voxel_count = int(sizes[comp_id]) if comp_id < int(sizes.shape[0]) else int(np.count_nonzero(component_local))
-        rows.append(
-            MicrogliaCellReportRow(
-                cell_index=int(cell_index),
-                component_id=comp_id,
-                segmentation_engine_used=engine,
-                voxel_count=voxel_count,
-                volume_um3=float(voxel_count * voxel_volume_um3),
-                soma_voxel_count=soma_voxel_count,
-                soma_volume_um3=float(soma_voxel_count * voxel_volume_um3),
-                soma_center_x_um=float(soma_xyz[0]),
-                soma_center_y_um=float(soma_xyz[1]),
-                soma_center_z_um=float(soma_xyz[2]),
-                soma_distance_to_vasculature_um=float(soma_dist_um),
-                soma_equivalent_diameter_um=float(soma_equiv_diameter),
-                soma_bbox_x_um=float(soma_bbox_x),
-                soma_bbox_y_um=float(soma_bbox_y),
-                soma_bbox_z_um=float(soma_bbox_z),
-                soma_roundness=float(soma_roundness),
-                soma_rectangularity=float(soma_rectangularity),
-                branch_count=int(len(branch_defs)),
-                branch_endpoint_count=int(endpoint_count),
-                branch_junction_count=int(junction_count),
-                distance_to_vasculature_um=float(distance_um),
-                nearest_vessel_id=int(nearest_vessel_id),
-                nearest_vessel_diameter_um=float(nearest_vessel_diameter_um),
-                tip_near_multiple_vessel_count=int(tip_near_multiple_vessel_count),
-                microglia_closest_x_um=float(micro_xyz[0]),
-                microglia_closest_y_um=float(micro_xyz[1]),
-                microglia_closest_z_um=float(micro_xyz[2]),
-                vessel_closest_x_um=float(vessel_xyz[0]),
-                vessel_closest_y_um=float(vessel_xyz[1]),
-                vessel_closest_z_um=float(vessel_xyz[2]),
-                threshold_green_used=threshold_green,
-                threshold_red_used=threshold_red,
+    if overlay_state["crossings"]:
+        for crossing in crossing_rows:
+            overlay_points.append(
+                {
+                    "kind": "vessel_crossing",
+                    "crossing_id": int(crossing.crossing_id),
+                    "vessel_id_a": int(crossing.vessel_id_a),
+                    "vessel_id_b": int(crossing.vessel_id_b),
+                    "over_vessel_id": int(crossing.over_vessel_id),
+                    "status": crossing.status,
+                    "confidence": float(crossing.confidence),
+                    "xyz_um": [float(crossing.x_um), float(crossing.y_um), float(crossing.z_um)],
+                }
             )
-        )
 
-    for crossing in crossing_rows:
-        overlay_points.append(
-            {
-                "kind": "vessel_crossing",
-                "crossing_id": int(crossing.crossing_id),
-                "vessel_id_a": int(crossing.vessel_id_a),
-                "vessel_id_b": int(crossing.vessel_id_b),
-                "over_vessel_id": int(crossing.over_vessel_id),
-                "status": crossing.status,
-                "confidence": float(crossing.confidence),
-                "xyz_um": [float(crossing.x_um), float(crossing.y_um), float(crossing.z_um)],
-            }
-        )
-
+    _publish_progress(0.96, "Packaging analysis outputs...", log=True)
     debug_volumes = {
         "microglia_component_labels": np.asarray(labels, dtype=np.int32),
         "soma_core_labels": np.asarray(soma_core_labels, dtype=np.int32),
@@ -1238,6 +1535,10 @@ def analyze_microglia_vessel(
     debug_measurements: dict[str, object] = {
         "threshold_green_used": float(threshold_green),
         "threshold_red_used": float(threshold_red),
+        "parallel_workers": {
+            "vessel_preprocessing": int(vessel_workers),
+            "cell_analysis": int(cell_workers),
+        },
         "spacing_um": {
             "x": float(spacing.x_um),
             "y": float(spacing.y_um),
@@ -1251,6 +1552,17 @@ def analyze_microglia_vessel(
         "overlay_points": overlay_points,
         "overlay_lines": overlay_lines,
     }
+
+    elapsed = time.perf_counter() - total_start
+    _publish_progress(
+        1.0,
+        (
+            "Analysis complete "
+            f"dt={elapsed:.2f}s cells={len(rows)} branches={len(branch_rows)} "
+            f"tips={len(tip_rows)} crossings={len(crossing_rows)}"
+        ),
+        log=True,
+    )
 
     return MicrogliaCellReport(
         rows=rows,

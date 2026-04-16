@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 _RENDER_CUBIC_MAX_AXIS_UPSAMPLE = 2.0
 _RENDER_CUBIC_MAX_TOTAL_UPSAMPLE = 3.0
+_RENDER_CUBIC_MAX_OUTPUT_VOXELS = 240_000_000
+_RENDER_SAMPLE_RATIO_DEFAULT = 0.18
+_RENDER_SAMPLE_RATIO_ANISO = 0.16
+_RENDER_SAMPLE_RATIO_LABELS = 0.14
 
 
 def _volume_debug_summary(volume: np.ndarray) -> str:
@@ -71,7 +75,7 @@ def _cubic_render_spacing(
     if not np.all(np.isfinite(spacing_xyz)):
         logger.warning("VTK cubic spacing fallback: non-finite spacing=%s", spacing)
         return spacing
-    finest = float(np.min(spacing_xyz))
+    finest = float(np.min(spacing_xyz[:2]))
     if finest <= 0.0:
         logger.warning("VTK cubic spacing fallback: non-positive spacing=%s", spacing)
         return spacing
@@ -88,9 +92,22 @@ def _cubic_render_spacing(
 
     active = zoom > 1.0 + 1.0e-3
     if np.any(active):
+        input_voxels = float(np.prod(np.asarray(shape, dtype=np.float64)))
+        max_zoom_product = float(_RENDER_CUBIC_MAX_TOTAL_UPSAMPLE)
+        if input_voxels > 0.0:
+            max_zoom_product = min(
+                max_zoom_product,
+                float(_RENDER_CUBIC_MAX_OUTPUT_VOXELS) / input_voxels,
+            )
+        if max_zoom_product <= 1.0 + 1.0e-6:
+            logger.info(
+                "VTK cubic spacing disabled for large volume: shape=%s spacing=%s", shape, spacing
+            )
+            return spacing
+
         log_sum = float(np.sum(np.log(zoom[active])))
         if log_sum > 0.0:
-            max_log = float(np.log(_RENDER_CUBIC_MAX_TOTAL_UPSAMPLE))
+            max_log = float(np.log(max_zoom_product))
             if log_sum > max_log:
                 scale = max_log / log_sum
                 zoom[active] = np.power(zoom[active], scale)
@@ -111,6 +128,27 @@ def _same_spacing(left: VoxelSpacing, right: VoxelSpacing) -> bool:
         and np.isclose(left.y_um, right.y_um)
         and np.isclose(left.z_um, right.z_um)
     )
+
+
+def _recommended_sample_distance(
+    spacing: VoxelSpacing,
+    *,
+    label_mode: bool = False,
+) -> float:
+    spacing_xyz = np.asarray(
+        [float(spacing.x_um), float(spacing.y_um), float(spacing.z_um)],
+        dtype=np.float32,
+    )
+    min_sp = float(np.min(spacing_xyz))
+    max_sp = float(np.max(spacing_xyz))
+    if min_sp <= 0.0:
+        return 0.02
+    anisotropy = max_sp / max(min_sp, 1.0e-6)
+    if label_mode:
+        ratio = _RENDER_SAMPLE_RATIO_LABELS
+    else:
+        ratio = _RENDER_SAMPLE_RATIO_ANISO if anisotropy >= 1.30 else _RENDER_SAMPLE_RATIO_DEFAULT
+    return float(max(0.01, ratio * min_sp))
 
 
 @dataclass
@@ -355,8 +393,12 @@ class VTKScene:
                 unit_distance = float(max(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um) * 1.5)
                 actor.volume_property.SetScalarOpacityUnitDistance(max(0.08, unit_distance))
                 # Re-sync sample distance to current spacing.
-                min_sp = min(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um)
-                actor.volume_mapper.SetSampleDistance(max(0.25 * min_sp, 0.02))
+                actor.volume_mapper.SetSampleDistance(
+                    _recommended_sample_distance(
+                        render_spacing,
+                        label_mode=channel in self._component_coloring,
+                    )
+                )
                 self._spacing[channel] = render_spacing
                 self.apply_render_config(self._current)
                 logger.info(
@@ -377,7 +419,11 @@ class VTKScene:
             render_spacing,
             nearest=channel in self._component_coloring,
         )
-        mapper = self._build_volume_mapper(mapper_input, render_spacing)
+        mapper = self._build_volume_mapper(
+            mapper_input,
+            render_spacing,
+            nearest=channel in self._component_coloring,
+        )
         prop = vtkVolumeProperty()
         prop.ShadeOn()
         if channel in self._component_coloring:
@@ -468,7 +514,9 @@ class VTKScene:
         if nearest:
             resample.SetInterpolationModeToNearestNeighbor()
         else:
-            resample.SetInterpolationModeToCubic()
+            # Linear interpolation retains detail better than cubic for these
+            # sparse channel volumes while avoiding excessive side-view blur.
+            resample.SetInterpolationModeToLinear()
         resample.SetAxisOutputSpacing(0, float(render_spacing.x_um))
         resample.SetAxisOutputSpacing(1, float(render_spacing.y_um))
         resample.SetAxisOutputSpacing(2, float(render_spacing.z_um))
@@ -519,17 +567,29 @@ class VTKScene:
             _volume_debug_summary(volume),
         )
 
-    def _build_volume_mapper(self, image_input, render_spacing: VoxelSpacing):
+    def _build_volume_mapper(
+        self,
+        image_input,
+        render_spacing: VoxelSpacing,
+        *,
+        nearest: bool = False,
+    ):
         mapper = vtkSmartVolumeMapper()
         self._set_pipeline_input(mapper, image_input)
         mapper.SetBlendModeToComposite()
         # Prevent quality degradation during camera rotation / angled views.
         mapper.SetAutoAdjustSampleDistances(False)
         mapper.SetInteractiveAdjustSampleDistances(False)
-        # Compute a tight sample distance from the voxel spacing so rays
-        # take enough samples even at oblique angles.
-        min_sp = min(render_spacing.x_um, render_spacing.y_um, render_spacing.z_um)
-        mapper.SetSampleDistance(max(0.25 * min_sp, 0.02))
+        if hasattr(mapper, "SetMinimumImageSampleDistance"):
+            mapper.SetMinimumImageSampleDistance(1.0)
+        if hasattr(mapper, "SetMaximumImageSampleDistance"):
+            mapper.SetMaximumImageSampleDistance(1.0)
+        if hasattr(mapper, "SetImageSampleDistance"):
+            mapper.SetImageSampleDistance(1.0)
+        # Tighter ray steps improve oblique/side-view crispness.
+        mapper.SetSampleDistance(
+            _recommended_sample_distance(render_spacing, label_mode=nearest)
+        )
         logger.debug(
             "VTK volume mapper configured: sample_distance=%.5f render_spacing=(%.4f, %.4f, %.4f)",
             mapper.GetSampleDistance(),

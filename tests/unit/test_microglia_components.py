@@ -82,6 +82,73 @@ def test_detect_soma_blobs_avoids_scipy_maximum_position(monkeypatch) -> None:
     assert int(np.count_nonzero(seed)) >= 1
 
 
+def test_distance_peak_centers_uses_component_local_edt(monkeypatch) -> None:
+    mask = np.zeros((12, 120, 120), dtype=bool)
+    mask[1:3, 5:9, 5:9] = True
+    mask[9:11, 110:114, 112:116] = True
+
+    calls: list[tuple[int, int, int]] = []
+    real_edt = microglia_components.ndi.distance_transform_edt
+
+    def _track_edt(input_mask, *args, **kwargs):
+        arr = np.asarray(input_mask)
+        calls.append(tuple(int(v) for v in arr.shape))
+        return real_edt(input_mask, *args, **kwargs)
+
+    monkeypatch.setattr(microglia_components.ndi, "distance_transform_edt", _track_edt)
+    centers = microglia_components._distance_peak_centers_from_soma_mask(
+        mask,
+        np.asarray((1.0, 1.0, 1.0), dtype=np.float32),
+        max_candidates=64,
+    )
+
+    assert centers.shape[0] >= 2
+    assert len(calls) >= 2
+    assert all(int(np.prod(shape)) < int(mask.size) for shape in calls)
+
+
+def test_distance_peak_centers_downsamples_large_component(monkeypatch) -> None:
+    mask = np.ones((12, 64, 64), dtype=bool)
+    calls: list[tuple[int, int, int]] = []
+    real_edt = microglia_components.ndi.distance_transform_edt
+
+    monkeypatch.setattr(microglia_components, "_MAX_DISTANCE_EDT_VOXELS", 512)
+
+    def _track_edt(input_mask, *args, **kwargs):
+        arr = np.asarray(input_mask)
+        calls.append(tuple(int(v) for v in arr.shape))
+        return real_edt(input_mask, *args, **kwargs)
+
+    monkeypatch.setattr(microglia_components.ndi, "distance_transform_edt", _track_edt)
+    centers = microglia_components._distance_peak_centers_from_soma_mask(
+        mask,
+        np.asarray((1.0, 1.0, 1.0), dtype=np.float32),
+        max_candidates=128,
+    )
+
+    assert centers.shape[0] >= 1
+    assert len(calls) >= 1
+    assert max(int(np.prod(shape)) for shape in calls) <= 512
+
+
+def test_distance_peak_centers_bypasses_labeling_for_oversized_masks(monkeypatch) -> None:
+    mask = np.ones((12, 64, 64), dtype=bool)
+    monkeypatch.setattr(microglia_components, "_MAX_DISTANCE_COMPONENT_LABEL_VOXELS", 256)
+
+    def _fail_label(*_args, **_kwargs):
+        raise AssertionError("oversized-mask path should bypass ndi.label")
+
+    monkeypatch.setattr(microglia_components.ndi, "label", _fail_label)
+
+    centers = microglia_components._distance_peak_centers_from_soma_mask(
+        mask,
+        np.asarray((1.0, 1.0, 1.0), dtype=np.float32),
+        max_candidates=64,
+    )
+
+    assert centers.shape[0] >= 1
+
+
 def test_compute_component_labels_orders_by_size_desc() -> None:
     arr = np.zeros((4, 16, 16), dtype=np.float32)
     arr[1:3, 8, 2:12] = 0.2  # large component
@@ -363,6 +430,70 @@ def test_nearby_somas_connected_by_dim_bridge_stay_separate() -> None:
     assert left_id > 0
     assert right_id > 0
     assert left_id != right_id
+
+
+def test_two_somas_in_one_high_confidence_island_can_split() -> None:
+    arr = np.zeros((6, 96, 96), dtype=np.float32)
+    z = 3
+
+    # Two soma regions are connected by a moderate-intensity bridge that sits
+    # above merge-floor levels, so they initially appear as one high-confidence
+    # island. Separation should still produce two components.
+    arr[z, 30:56, 20:46] = 0.24
+    arr[z, 30:56, 42:68] = np.maximum(arr[z, 30:56, 42:68], 0.24)
+    arr[z, 39:47, 28:36] = np.maximum(arr[z, 39:47, 28:36], 0.62)
+    arr[z, 39:47, 52:60] = np.maximum(arr[z, 39:47, 52:60], 0.61)
+    arr[z, 41:45, 42:46] = np.maximum(arr[z, 41:45, 42:46], 0.24)
+
+    # Branch-like extensions that should remain attached after splitting.
+    arr[z, 43, 12:22] = 0.16
+    arr[z, 43, 66:78] = 0.16
+
+    labels, order, _ = compute_component_labels(
+        arr,
+        threshold=0.12,
+        min_voxels=24,
+        max_components=16,
+        smooth_sigma=(0.0, 0.0, 0.0),
+        branch_sensitivity=1.2,
+    )
+
+    assert len(order) >= 2
+    left_id = int(labels[z, 43, 32])
+    right_id = int(labels[z, 43, 56])
+    assert left_id > 0
+    assert right_id > 0
+    assert left_id != right_id
+
+
+def test_somas_separate_along_z_axis_in_true_3d() -> None:
+    arr = np.zeros((12, 48, 48), dtype=np.float32)
+    y = 24
+    x = 24
+
+    # Two soma-like cores at the same XY but different Z.
+    arr[3, y - 1:y + 2, x - 1:x + 2] = 0.62
+    arr[8, y - 1:y + 2, x - 1:x + 2] = 0.64
+
+    # A faint vertical bridge should not collapse both somas into one label.
+    arr[4:8, y, x] = np.maximum(arr[4:8, y, x], 0.14)
+
+    labels, order, _ = compute_component_labels(
+        arr,
+        threshold=0.12,
+        min_voxels=8,
+        max_components=16,
+        smooth_sigma=(0.0, 0.0, 0.0),
+        branch_sensitivity=1.3,
+        spacing=(0.40, 0.331, 0.331),
+    )
+
+    assert len(order) >= 2
+    top_id = int(labels[3, y, x])
+    bottom_id = int(labels[8, y, x])
+    assert top_id > 0
+    assert bottom_id > 0
+    assert top_id != bottom_id
 
 
 def test_faint_bridge_branch_gets_single_soma_owner() -> None:

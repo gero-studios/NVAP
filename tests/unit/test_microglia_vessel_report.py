@@ -398,3 +398,72 @@ def test_microglia_analysis_bundle_exports_debug_artifacts(tmp_path) -> None:
     assert outputs["overlay_xy"].exists()
     loaded = np.load(outputs["debug_label_volumes"])
     assert "microglia_component_labels" in loaded.files
+
+
+def test_analysis_progress_callback_receives_stage_updates() -> None:
+    green = np.zeros((3, 24, 96), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[1, 12, 5:75] = 1.0
+    red[1, 12, 82:88] = 1.0
+    ds = _dataset(green, red)
+
+    events: list[tuple[float, str]] = []
+
+    report = analyze_microglia_vessel(
+        ds,
+        RenderConfig(threshold_green=0.5, threshold_red=0.5),
+        PreprocessConfig(),
+        segmentation_mode="internal",
+        threshold_source="render",
+        progress_callback=lambda frac, msg: events.append((float(frac), str(msg))),
+    )
+
+    assert report.cell_count == 1
+    assert events
+    assert events[-1][0] >= 0.99
+    assert any("Segmenting microglia" in msg for _, msg in events)
+    assert all(0.0 <= frac <= 1.0 for frac, _ in events)
+
+
+def test_overlay_options_can_disable_branch_paths() -> None:
+    green = np.zeros((3, 24, 96), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[1, 12, 5:75] = 1.0
+    red[1, 12, 82:88] = 1.0
+    ds = _dataset(green, red)
+
+    report = analyze_microglia_vessel(
+        ds,
+        RenderConfig(threshold_green=0.5, threshold_red=0.5),
+        PreprocessConfig(),
+        segmentation_mode="internal",
+        threshold_source="render",
+        overlay_options={"branches": False},
+    )
+
+    lines = report.debug_measurements.get("overlay_lines", [])
+    assert isinstance(lines, list)
+    assert all(str(item.get("kind", "")) != "branch_path" for item in lines)
+
+
+def test_branch_overlay_paths_are_downsampled_for_display() -> None:
+    green = np.zeros((3, 20, 320), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[1, 10, 20:290] = 1.0
+    red[1, 10, 300:315] = 1.0
+    ds = _dataset(green, red)
+
+    report = analyze_microglia_vessel(
+        ds,
+        RenderConfig(threshold_green=0.5, threshold_red=0.5),
+        PreprocessConfig(),
+        segmentation_mode="internal",
+        threshold_source="render",
+        max_branch_overlay_points=32,
+    )
+
+    lines = report.debug_measurements.get("overlay_lines", [])
+    assert isinstance(lines, list)
+    branch_lines = [item for item in lines if str(item.get("kind", "")) == "branch_path"]
+    assert branch_lines
+    assert all(len(item.get("points_xyz_um", [])) <= 32 for item in branch_lines)

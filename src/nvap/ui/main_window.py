@@ -183,6 +183,9 @@ class MainWindow(QMainWindow):
         self._busy_progress_lock = threading.Lock()
         self._eta_scale_load = 1.0
         self._eta_scale_psf = 1.0
+        self._eta_scale_microglia_separation = 1.0
+        self._eta_scale_microglia_analysis = 1.0
+        self._eta_scale_mesh_export = 1.0
         self._display_z_scale = float(max(0.05, self.current_render.display_z_scale))
         self._busy_timer = QTimer(self)
         self._busy_timer.setInterval(1000)
@@ -332,11 +335,26 @@ class MainWindow(QMainWindow):
         if self.latest_microglia_report is None:
             self.scene.clear_debug_overlays()
             return
+        overlay_state = self.controls.current_microglia_debug_overlay_state()
+        if not any(overlay_state.values()):
+            self.scene.clear_debug_overlays()
+            return
         measurements = self.latest_microglia_report.debug_measurements
+        points = measurements.get("overlay_points", []) if isinstance(measurements, dict) else []
+        lines = measurements.get("overlay_lines", []) if isinstance(measurements, dict) else []
+        t0 = time.perf_counter()
+        self._log_info(
+            "Applying microglia overlays: "
+            f"points={len(points) if isinstance(points, list) else 0} "
+            f"lines={len(lines) if isinstance(lines, list) else 0}"
+        )
         self.scene.set_debug_overlays(
-            points=measurements.get("overlay_points", []) if isinstance(measurements, dict) else [],
-            lines=measurements.get("overlay_lines", []) if isinstance(measurements, dict) else [],
-            visibility=self.controls.current_microglia_debug_overlay_state(),
+            points=points if isinstance(points, list) else [],
+            lines=lines if isinstance(lines, list) else [],
+            visibility=overlay_state,
+        )
+        self._log_info(
+            f"Microglia overlays applied in {time.perf_counter() - t0:.2f}s"
         )
 
     def _compute_microglia_components(
@@ -449,6 +467,10 @@ class MainWindow(QMainWindow):
         spacing = self.visual_dataset.green.spacing
         spacing_zyx = (float(spacing.z_um), float(spacing.y_um), float(spacing.x_um))
         base_min_voxels = max(64, int(self.preprocess_config.green_speckle_min_voxels) * 4)
+        eta_seconds = self._estimate_microglia_separation_eta_seconds(
+            green.shape,
+            branch_sensitivity,
+        )
 
         if (
             self._green_component_sizes is not None
@@ -509,6 +531,8 @@ class MainWindow(QMainWindow):
             on_success=_on_success,
             error_title="Microglia separation failed",
             success_status="Microglia view updated.",
+            eta_total_seconds=eta_seconds,
+            eta_kind="microglia-separation",
         )
 
     def _refresh_microglia_components_if_needed(self) -> None:
@@ -633,24 +657,8 @@ class MainWindow(QMainWindow):
 
         with self._busy_progress_lock:
             eta_total = self._busy_eta_total
-        # Early low-percent stages are too noisy for reliable pace extrapolation.
-        # Keep ETA stable until enough progress has accumulated.
-        if progress_percent >= 15.0 and elapsed >= 1.0:
-            pace_total = elapsed / max(1.0e-3, progress_percent / 100.0)
-            if eta_total is None:
-                # When no model ETA exists, wait for more progress before showing one.
-                if progress_percent >= 30.0:
-                    eta_total = pace_total
-            else:
-                model_eta = float(eta_total)
-                # Limit early-stage pace influence to prevent extreme ETA spikes.
-                if progress_percent < 35.0:
-                    pace_total = float(np.clip(pace_total, 0.5 * model_eta, 2.0 * model_eta))
-                # Increase trust in observed pace as progress advances.
-                alpha = float(np.clip((progress_percent - 15.0) / 70.0, 0.15, 0.65))
-                eta_total = ((1.0 - alpha) * model_eta) + (alpha * float(pace_total))
         if eta_total is not None:
-            remaining = max(0.0, eta_total - elapsed)
+            remaining = max(0.0, float(eta_total) - elapsed)
             lines.append(f"ETA: {self._format_seconds(remaining)}")
         return "\n".join(lines)
 
@@ -667,6 +675,186 @@ class MainWindow(QMainWindow):
                 self._busy_progress_message = message
             if eta_total_seconds is not None:
                 self._busy_progress_eta_total = float(max(0.0, eta_total_seconds))
+
+    def _eta_scale_for_kind(self, eta_kind: str | None) -> float:
+        kind = (eta_kind or "").strip().lower()
+        if kind == "load":
+            return float(self._eta_scale_load)
+        if kind == "psf":
+            return float(self._eta_scale_psf)
+        if kind == "microglia-separation":
+            return float(self._eta_scale_microglia_separation)
+        if kind == "microglia-analysis":
+            return float(self._eta_scale_microglia_analysis)
+        if kind == "mesh-export":
+            return float(self._eta_scale_mesh_export)
+        return 1.0
+
+    def _update_eta_scale_for_kind(self, eta_kind: str | None, ratio: float) -> None:
+        kind = (eta_kind or "").strip().lower()
+        if kind not in {
+            "load",
+            "psf",
+            "microglia-separation",
+            "microglia-analysis",
+            "mesh-export",
+        }:
+            return
+        if not np.isfinite(ratio) or ratio <= 0.0:
+            return
+        current = self._eta_scale_for_kind(kind)
+        updated = max(0.45, min(2.75, (0.85 * current) + (0.15 * float(ratio))))
+        if kind == "load":
+            self._eta_scale_load = updated
+        elif kind == "psf":
+            self._eta_scale_psf = updated
+        elif kind == "microglia-separation":
+            self._eta_scale_microglia_separation = updated
+        elif kind == "microglia-analysis":
+            self._eta_scale_microglia_analysis = updated
+        elif kind == "mesh-export":
+            self._eta_scale_mesh_export = updated
+        self._log_debug(
+            f"{kind} ETA calibration updated: ratio={ratio:.2f}, scale={updated:.2f}"
+        )
+
+    def _update_busy_eta_estimate(
+        self,
+        elapsed: float,
+        progress_percent: float,
+        eta_hint: float | None,
+    ) -> None:
+        model_total: float | None = None
+        if eta_hint is not None and np.isfinite(eta_hint) and eta_hint > 0.0:
+            model_total = float(max(eta_hint, elapsed + 0.5))
+
+        observed_total: float | None = None
+        if progress_percent >= 3.0 and elapsed >= 0.8:
+            observed_total = float(elapsed / max(1.0e-3, progress_percent / 100.0))
+
+        if model_total is None and observed_total is None:
+            return
+        if model_total is None:
+            candidate_total = observed_total
+        elif observed_total is None:
+            candidate_total = model_total
+        else:
+            trust_observed = float(np.clip((progress_percent - 5.0) / 70.0, 0.12, 0.85))
+            candidate_total = ((1.0 - trust_observed) * model_total) + (
+                trust_observed * observed_total
+            )
+
+        if candidate_total is None or not np.isfinite(candidate_total):
+            return
+
+        previous_total = self._busy_eta_total
+        if previous_total is None or not np.isfinite(previous_total):
+            smoothed_total = float(candidate_total)
+        else:
+            responsiveness = float(
+                np.clip(0.16 + (0.26 * (progress_percent / 100.0)), 0.16, 0.42)
+            )
+            smoothed_total = ((1.0 - responsiveness) * float(previous_total)) + (
+                responsiveness * float(candidate_total)
+            )
+            step_ratio = 0.30 if progress_percent < 25.0 else 0.18
+            lower = float(previous_total) * (1.0 - step_ratio)
+            upper = float(previous_total) * (1.0 + step_ratio)
+            smoothed_total = float(np.clip(smoothed_total, lower, upper))
+
+        self._busy_eta_total = max(float(elapsed) + 0.5, float(smoothed_total))
+
+    def _estimate_microglia_separation_eta_seconds(
+        self,
+        green_shape: tuple[int, int, int],
+        branch_sensitivity: float,
+    ) -> float | None:
+        try:
+            total_voxels = int(np.prod(green_shape))
+        except Exception:
+            return None
+        if total_voxels <= 0:
+            return None
+
+        branch_factor = float(np.clip(1.0 + (0.24 * (branch_sensitivity - 1.0)), 0.8, 1.35))
+        segment_seconds = total_voxels * 4.2e-8
+        filtering_seconds = total_voxels * 1.8e-8
+        scale = self._eta_scale_for_kind("microglia-separation")
+        total = max(3.0, (2.5 + ((segment_seconds + filtering_seconds) * branch_factor)) * scale)
+        self._log_info(
+            "Estimated microglia separation ETA="
+            f"{total:.1f}s (scale={scale:.2f}, voxels={total_voxels}, "
+            f"branch_sensitivity={branch_sensitivity:.2f})"
+        )
+        return total
+
+    def _estimate_microglia_analysis_eta_seconds(
+        self,
+        dataset: DatasetVolume,
+        overlay_state: dict[str, bool],
+    ) -> float | None:
+        green_voxels = int(dataset.green.data.size)
+        red_voxels = int(dataset.red.data.size)
+        total_voxels = green_voxels + red_voxels
+        if total_voxels <= 0:
+            return None
+
+        overlay_enabled = sum(1 for enabled in overlay_state.values() if enabled)
+        overlay_ratio = float(overlay_enabled / max(1, len(overlay_state)))
+        segmentation_seconds = green_voxels * 1.7e-7
+        vessel_seconds = red_voxels * 1.2e-7
+        pairing_seconds = total_voxels * 3.5e-8
+        overlay_seconds = green_voxels * (0.7e-8 + (1.1e-8 * overlay_ratio))
+        scale = self._eta_scale_for_kind("microglia-analysis")
+        total = max(
+            8.0,
+            (
+                5.0
+                + segmentation_seconds
+                + vessel_seconds
+                + pairing_seconds
+                + overlay_seconds
+            )
+            * scale,
+        )
+        self._log_info(
+            "Estimated microglia analysis ETA="
+            f"{total:.1f}s (scale={scale:.2f}, voxels={total_voxels}, "
+            f"overlay_enabled={overlay_enabled}/{len(overlay_state)})"
+        )
+        return total
+
+    def _estimate_mesh_export_eta_seconds(
+        self,
+        dataset: DatasetVolume,
+        mesh_cfg: MeshExportConfig,
+    ) -> float | None:
+        green_voxels = int(dataset.green.data.size)
+        red_voxels = int(dataset.red.data.size)
+        total_voxels = green_voxels + red_voxels
+        if total_voxels <= 0:
+            return None
+
+        smoothing_factor = 1.0 + (
+            float(np.clip(mesh_cfg.smooth_iterations, 0, 120)) / 40.0
+        ) * 0.35
+        decimate_factor = 1.0 + (float(np.clip(mesh_cfg.decimate_fraction, 0.0, 0.95)) * 0.45)
+        poisson_factor = 1.35 if mesh_cfg.use_poisson else 1.0
+        extract_seconds = total_voxels * 8.0e-8
+        post_seconds = total_voxels * 2.5e-8
+        scale = self._eta_scale_for_kind("mesh-export")
+        total = max(
+            8.0,
+            (6.0 + ((extract_seconds + post_seconds) * smoothing_factor * decimate_factor * poisson_factor))
+            * scale,
+        )
+        self._log_info(
+            "Estimated mesh export ETA="
+            f"{total:.1f}s (scale={scale:.2f}, voxels={total_voxels}, "
+            f"smooth_iter={mesh_cfg.smooth_iterations}, decimate={mesh_cfg.decimate_fraction:.2f}, "
+            f"poisson={mesh_cfg.use_poisson})"
+        )
+        return total
 
     def _estimate_load_eta_seconds(
         self,
@@ -724,11 +912,12 @@ class MainWindow(QMainWindow):
             + cache_restore_seconds
             + render_seconds
         )
-        total *= self._eta_scale_load
+        scale = self._eta_scale_for_kind("load")
+        total *= scale
         total = max(5.0, total)
         self._log_info(
             "Estimated load ETA="
-            f"{total:.1f}s (scale={self._eta_scale_load:.2f}, "
+            f"{total:.1f}s (scale={scale:.2f}, "
             f"slices={stats.green.slice_count}/{stats.red.slice_count}, "
             f"iterations={psf_cfg.iterations}, cache_hit={cache_hit})"
         )
@@ -741,16 +930,17 @@ class MainWindow(QMainWindow):
         preprocess_cfg: PreprocessConfig,
         dataset_signature: str | None = None,
     ) -> float | None:
+        scale = self._eta_scale_for_kind("psf")
         if _green_no_psf_mode(preprocess_cfg) or not psf_cfg.enabled or psf_cfg.iterations <= 0:
             total_voxels = int(dataset.green.data.size + dataset.red.data.size)
             preprocess_seconds = total_voxels * 1.8e-7
             threshold_seconds = total_voxels * 5.0e-8
             resample_seconds = total_voxels * 2.0e-8 if preprocess_cfg.resample_for_mesh else 0.0
-            total = (preprocess_seconds + threshold_seconds + resample_seconds + 8.0) * self._eta_scale_psf
+            total = (preprocess_seconds + threshold_seconds + resample_seconds + 8.0) * scale
             total = max(8.0, total)
             self._log_info(
                 "Estimated reprocess ETA="
-                f"{total:.1f}s (scale={self._eta_scale_psf:.2f}, mode={preprocess_cfg.green_denoise_strategy})"
+                f"{total:.1f}s (scale={scale:.2f}, mode={preprocess_cfg.green_denoise_strategy})"
             )
             return total
         cache_hit = False
@@ -770,11 +960,11 @@ class MainWindow(QMainWindow):
         psf_seconds = total_voxels * psf_cfg.iterations * 1.2e-7
         threshold_seconds = total_voxels * 5.0e-8
         resample_seconds = total_voxels * 2.0e-8 if preprocess_cfg.resample_for_mesh else 0.0
-        total = (preprocess_seconds + psf_seconds + threshold_seconds + resample_seconds + 6.0) * self._eta_scale_psf
+        total = (preprocess_seconds + psf_seconds + threshold_seconds + resample_seconds + 6.0) * scale
         total = max(6.0, total)
         self._log_info(
             "Estimated PSF ETA="
-            f"{total:.1f}s (scale={self._eta_scale_psf:.2f}, "
+            f"{total:.1f}s (scale={scale:.2f}, "
             f"iterations={psf_cfg.iterations}, cache_hit={cache_hit})"
         )
         return total
@@ -815,10 +1005,8 @@ class MainWindow(QMainWindow):
             eta_hint = self._busy_progress_eta_total
         if message:
             self._busy_base_message = message
-        if eta_hint is not None:
-            with self._busy_progress_lock:
-                self._busy_eta_total = eta_hint
         elapsed = time.perf_counter() - self._busy_start
+        self._update_busy_eta_estimate(elapsed, progress_percent, eta_hint)
         self._busy_dialog.setValue(int(round(progress_percent)))
         self._busy_dialog.setLabelText(self._compose_busy_label(elapsed, progress_percent))
 
@@ -848,12 +1036,15 @@ class MainWindow(QMainWindow):
             self._busy_dialog.setCancelButton(None)
         self._busy_title = title
         self._busy_base_message = message
-        self._busy_eta_total = eta_total_seconds
+        initial_eta = None
+        if eta_total_seconds is not None and np.isfinite(eta_total_seconds):
+            initial_eta = float(max(0.0, eta_total_seconds))
+        self._busy_eta_total = initial_eta
         self._busy_start = time.perf_counter()
         with self._busy_progress_lock:
             self._busy_progress_percent = 0.0
             self._busy_progress_message = message
-            self._busy_progress_eta_total = eta_total_seconds
+            self._busy_progress_eta_total = initial_eta
         self._busy_dialog.setWindowTitle(title)
         self._busy_dialog.setValue(0)
         self._busy_dialog.setLabelText(self._compose_busy_label(0.0, 0.0))
@@ -956,20 +1147,7 @@ class MainWindow(QMainWindow):
             elapsed = time.perf_counter() - self._busy_start
             if eta_total_seconds is not None and eta_total_seconds > 0:
                 ratio = elapsed / eta_total_seconds
-                if eta_kind == "load":
-                    scale = self._eta_scale_load
-                    scale = max(0.5, min(2.5, (0.8 * scale) + (0.2 * ratio)))
-                    self._eta_scale_load = scale
-                    self._log_debug(
-                        f"Load ETA calibration updated: ratio={ratio:.2f}, scale={self._eta_scale_load:.2f}"
-                    )
-                elif eta_kind == "psf":
-                    scale = self._eta_scale_psf
-                    scale = max(0.5, min(2.5, (0.8 * scale) + (0.2 * ratio)))
-                    self._eta_scale_psf = scale
-                    self._log_debug(
-                        f"PSF ETA calibration updated: ratio={ratio:.2f}, scale={self._eta_scale_psf:.2f}"
-                    )
+                self._update_eta_scale_for_kind(eta_kind, ratio)
             self.controls.setEnabled(True)
             self._publish_busy_progress(percent=100.0)
             self._hide_busy()
@@ -1523,9 +1701,33 @@ class MainWindow(QMainWindow):
         render = self.current_render
         segmentation_mode = "internal"
         threshold_source = self.controls.current_microglia_analysis_threshold_mode()
+        overlay_state = self.controls.current_microglia_debug_overlay_state()
+        eta_seconds = self._estimate_microglia_analysis_eta_seconds(dataset, overlay_state)
 
         def _run_analysis() -> MicrogliaCellReport:
-            self._publish_busy_progress(percent=15.0, message="Analyzing microglia vs vasculature...")
+            self._publish_busy_progress(percent=8.0, message="Preparing microglia analysis...")
+
+            progress_lock = threading.Lock()
+            progress_state = {"last_emit": 0.0, "last_time": 0.0}
+
+            def on_analysis_progress(progress: float, message: str) -> None:
+                frac = float(np.clip(progress, 0.0, 1.0))
+                now = time.perf_counter()
+                with progress_lock:
+                    delta = frac - float(progress_state["last_emit"])
+                    elapsed = now - float(progress_state["last_time"])
+                    should_emit = (
+                        frac >= 1.0
+                        or delta >= 0.01
+                        or elapsed >= 0.5
+                    )
+                    if not should_emit:
+                        return
+                    progress_state["last_emit"] = frac
+                    progress_state["last_time"] = now
+                percent = 12.0 + (84.0 * frac)
+                self._publish_busy_progress(percent=percent, message=message)
+
             report = analyze_microglia_vessel(
                 dataset,
                 render,
@@ -1533,16 +1735,20 @@ class MainWindow(QMainWindow):
                 segmentation_mode=segmentation_mode,
                 branch_sensitivity=float(self.controls.current_microglia_branch_sensitivity()),
                 threshold_source=threshold_source,
+                progress_callback=on_analysis_progress,
+                overlay_options=overlay_state,
             )
-            self._publish_busy_progress(percent=100.0, message="Microglia analysis complete.")
+            self._publish_busy_progress(percent=98.0, message="Finalizing analysis output...")
             return report
 
         def _on_success(result: object) -> None:
             if not isinstance(result, MicrogliaCellReport):
                 raise TypeError("Invalid microglia analysis result payload.")
+            self._publish_busy_progress(percent=99.0, message="Updating analysis table...")
             self.latest_microglia_report = result
             self.controls.set_microglia_analysis_report(result)
-            self._refresh_microglia_analysis_overlays()
+            # Defer VTK overlay upload until after the busy dialog closes.
+            QTimer.singleShot(0, self._refresh_microglia_analysis_overlays)
             self.statusBar().showMessage(
                 f"Microglia analysis complete: {result.cell_count} cell(s) detected.",
                 5000,
@@ -1555,6 +1761,8 @@ class MainWindow(QMainWindow):
             on_success=_on_success,
             error_title="Microglia analysis failed",
             success_status="Microglia analysis complete.",
+            eta_total_seconds=eta_seconds,
+            eta_kind="microglia-analysis",
         )
 
     def _on_export_microglia_analysis_requested(self) -> None:
@@ -1632,6 +1840,7 @@ class MainWindow(QMainWindow):
             return
         dataset = self.visual_dataset or self.processed_dataset
         mesh_cfg = self.controls.current_mesh_config()
+        eta_seconds = self._estimate_mesh_export_eta_seconds(dataset, mesh_cfg)
 
         def _do_export() -> dict[str, Path]:
             self._publish_busy_progress(percent=10.0, message="Extracting per-channel meshes...")
@@ -1652,6 +1861,8 @@ class MainWindow(QMainWindow):
             on_success=self._on_mesh_export_success,
             error_title="Mesh export failed",
             success_status="3D meshes exported successfully.",
+            eta_total_seconds=eta_seconds,
+            eta_kind="mesh-export",
         )
 
     def _on_mesh_export_success(self, result: object) -> None:
