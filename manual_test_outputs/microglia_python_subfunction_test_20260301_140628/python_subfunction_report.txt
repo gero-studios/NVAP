@@ -1,8 +1,0 @@
-input_shape=(6, 96, 96)
-output_shape=(6, 96, 96)
-output_min=0.000000
-output_max=0.000000
-output_mean=0.000000
-nonzero_voxels=0
-output_tif=C:\Users\giaco\Documents\NVAP\NVAP\manual_test_outputs\microglia_python_subfunction_test_20260301_140628\masked_from_python_subfunction.tif
-output_npz=C:\Users\giaco\Documents\NVAP\NVAP\manual_test_outputs\microglia_python_subfunction_test_20260301_140628\masked_from_python_subfunction.npz

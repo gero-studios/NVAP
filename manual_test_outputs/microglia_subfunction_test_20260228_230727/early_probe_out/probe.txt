@@ -1,6 +1,0 @@
-ARGS=inputDir=C:/Users/giaco/Documents/NVAP/NVAP/manual_test_outputs/microglia_subfunction_test_20260228_230727/input_slices;outputDir=C:/Users/giaco/Documents/NVAP/NVAP/manual_test_outputs/microglia_subfunction_test_20260228_230727/early_probe_out;pixelSizeUm=1.0;allowUiFallback=false;saveFrameSlices=false;exitOnComplete=true;applyMaskTarget=seg
-
-INPUT=C:/Users/giaco/Documents/NVAP/NVAP/manual_test_outputs/microglia_subfunction_test_20260228_230727/input_slices
-
-OUTPUT=C:/Users/giaco/Documents/NVAP/NVAP/manual_test_outputs/microglia_subfunction_test_20260228_230727/early_probe_out/
-
