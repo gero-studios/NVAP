@@ -149,6 +149,95 @@ def test_distance_peak_centers_bypasses_labeling_for_oversized_masks(monkeypatch
     assert centers.shape[0] >= 1
 
 
+def test_merge_close_soma_marker_positions_uses_fast_path_for_large_volume(monkeypatch) -> None:
+    working = np.zeros((2, 16, 16), dtype=np.float32)
+    positions: list[tuple[int, int, int]] = []
+    for y in range(2, 14, 2):
+        for x in range(2, 14, 2):
+            working[1, y, x] = 0.6 + (0.01 * (x + y))
+            positions.append((1, y, x))
+
+    monkeypatch.setattr(microglia_components, "_LARGE_VOLUME_VOXELS", 1)
+
+    def _fail_label(*_args, **_kwargs):
+        raise AssertionError("fast-path merge should avoid ndi.label on large volumes")
+
+    monkeypatch.setattr(microglia_components.ndi, "label", _fail_label)
+    merged = microglia_components._merge_close_soma_marker_positions(
+        positions,
+        working,
+        low_floor=0.1,
+        high_t=0.3,
+        branch_sensitivity=1.0,
+        spacing_zyx=np.asarray((1.0, 1.0, 1.0), dtype=np.float32),
+    )
+
+    assert 1 <= len(merged) <= len(positions)
+
+
+def test_segment_soma_markers_skips_edt_for_large_candidates(monkeypatch) -> None:
+    working = np.zeros((3, 12, 12), dtype=np.float32)
+    working[:, 2:10, 2:10] = 0.45
+    finite = np.isfinite(working)
+    seed = np.zeros_like(working, dtype=bool)
+    seed[1, 4, 4] = True
+    seed[1, 7, 7] = True
+
+    monkeypatch.setattr(microglia_components, "_MAX_SOMA_EDT_VOXELS", 8)
+    monkeypatch.setattr(microglia_components, "_MAX_SOMA_CORE_LABEL_VOXELS", 8)
+
+    def _fail_edt(*_args, **_kwargs):
+        raise AssertionError("large-candidate path should skip full-resolution EDT")
+
+    monkeypatch.setattr(microglia_components.ndi, "distance_transform_edt", _fail_edt)
+
+    labels = microglia_components._segment_soma_markers_from_reduced_threshold(
+        seed,
+        working,
+        finite,
+        low_floor=0.1,
+        high_t=0.35,
+        branch_sensitivity=1.0,
+        min_keep=2,
+        spacing_zyx=np.asarray((1.0, 1.0, 1.0), dtype=np.float32),
+        structure=microglia_components._CUBIC_STRUCTURE,
+    )
+
+    assert labels.shape == working.shape
+    assert int(np.max(labels)) >= 1
+
+
+def test_compute_component_labels_skips_branch_reassignment_for_oversized_label_volume(
+    monkeypatch,
+) -> None:
+    arr = np.zeros((4, 32, 32), dtype=np.float32)
+    arr[:, 8:24, 8:24] = 0.28
+    arr[2, 12:20, 12:20] = 0.55
+
+    monkeypatch.setattr(microglia_components, "_MAX_BRANCH_REASSIGN_VOXELS", 1)
+
+    def _fail_assign(*_args, **_kwargs):
+        raise AssertionError("oversized label volume should skip branch reassignment")
+
+    monkeypatch.setattr(
+        microglia_components,
+        "_assign_low_confidence_branches_to_one_owner",
+        _fail_assign,
+    )
+
+    labels, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.12,
+        min_voxels=8,
+        max_components=16,
+        smooth_sigma=(0.0, 0.0, 0.0),
+    )
+
+    assert labels.shape == arr.shape
+    assert len(order) >= 1
+    assert int(sizes[int(order[0])]) > 0
+
+
 def test_compute_component_labels_orders_by_size_desc() -> None:
     arr = np.zeros((4, 16, 16), dtype=np.float32)
     arr[1:3, 8, 2:12] = 0.2  # large component
@@ -464,6 +553,38 @@ def test_two_somas_in_one_high_confidence_island_can_split() -> None:
     assert left_id > 0
     assert right_id > 0
     assert left_id != right_id
+
+
+def test_dense_field_haze_does_not_swallow_soma_isolation() -> None:
+    arr = np.full((4, 32, 32), 0.08, dtype=np.float32)
+    z = 2
+
+    # Two soma-like regions sit in a weak whole-field haze. The haze should
+    # not become part of the isolated components or collapse both cells into
+    # one full-volume label.
+    arr[z, 9:23, 4:16] = 0.24
+    arr[z, 9:23, 18:30] = np.maximum(arr[z, 9:23, 18:30], 0.24)
+    arr[z, 13:17, 7:11] = np.maximum(arr[z, 13:17, 7:11], 0.52)
+    arr[z, 13:17, 21:25] = np.maximum(arr[z, 13:17, 21:25], 0.50)
+
+    labels, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.18,
+        min_voxels=20,
+        max_components=16,
+        smooth_sigma=(0.0, 0.0, 0.0),
+        branch_sensitivity=1.0,
+    )
+
+    assert len(order) >= 2
+    left_id = int(labels[z, 15, 9])
+    right_id = int(labels[z, 15, 23])
+    assert left_id > 0
+    assert right_id > 0
+    assert left_id != right_id
+    assert int(labels[0, 0, 0]) == 0
+    assert int(labels[z, 15, 17]) == 0
+    assert max(int(sizes[int(order[0])]), int(sizes[int(order[1])])) < 1200
 
 
 def test_somas_separate_along_z_axis_in_true_3d() -> None:

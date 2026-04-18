@@ -24,6 +24,7 @@ COMBINED_FILE_PATTERN = re.compile(
 CHANNEL_DIR = {"green": "Green", "red": "Red"}
 CHANNEL_ID = {"green": "c1", "red": "c2"}
 CHANNEL_RGB_INDEX = {"green": 1, "red": 0}
+CHANNEL_STACK_INDEX = {"green": 1, "red": 0}
 _COMBINED_RG_CACHE_MAX = 8
 _combined_rg_cache: dict[tuple[str, tuple[int, int, str, str]], list[tuple[int, Path]]] = {}
 _COMBINED_RG_PRESENT_CACHE_MAX = 16
@@ -278,6 +279,7 @@ def _list_channel_files(channel_source: Path, channel_name: str) -> list[tuple[i
 def _load_volume_from_stack_file(stack_path: Path, channel_name: str) -> tuple[list[int], np.ndarray]:
     image = iio.imread(stack_path)
     arr = np.asarray(image)
+    arr = np.squeeze(arr)
 
     if arr.ndim == 2:
         planes = arr[np.newaxis, ...]
@@ -287,9 +289,41 @@ def _load_volume_from_stack_file(stack_path: Path, channel_name: str) -> tuple[l
             planes = arr[np.newaxis, ...]
         else:
             planes = arr
-    elif arr.ndim == 4 and arr.shape[-1] in (3, 4):
-        # RGB/RGBA stack (z, y, x, c)
-        planes = arr
+    elif arr.ndim == 4:
+        if arr.shape[-1] in (3, 4):
+            # RGB/RGBA stack (z, y, x, c)
+            planes = arr
+        elif arr.shape[2] >= 4 and arr.shape[3] >= 4:
+            d0 = int(arr.shape[0])
+            d1 = int(arr.shape[1])
+            channel_axis: int | None = None
+
+            # Common microscopy 2-channel stacks: prefer the dimension with size 2.
+            if d0 == 2 and d1 != 2:
+                channel_axis = 0
+            elif d1 == 2 and d0 != 2:
+                channel_axis = 1
+            elif d0 in (2, 3, 4) and d1 not in (2, 3, 4):
+                channel_axis = 0
+            elif d1 in (2, 3, 4) and d0 not in (2, 3, 4):
+                channel_axis = 1
+            elif d0 in (2, 3, 4) and d1 in (2, 3, 4):
+                # Ambiguous small dims: choose the smaller axis as channels.
+                channel_axis = 0 if d0 <= d1 else 1
+
+            if channel_axis is None:
+                raise ValueError(f"Unsupported 4D stack layout: {arr.shape}")
+
+            if channel_axis == 0:
+                # Channel-leading stack (c, z, y, x)
+                c_idx = int(min(arr.shape[0] - 1, CHANNEL_STACK_INDEX[channel_name]))
+                planes = np.asarray(arr[c_idx, ...])
+            else:
+                # Channel-middle stack (z, c, y, x)
+                c_idx = int(min(arr.shape[1] - 1, CHANNEL_STACK_INDEX[channel_name]))
+                planes = np.asarray(arr[:, c_idx, ...])
+        else:
+            raise ValueError(f"Unsupported 4D stack layout: {arr.shape}")
     else:
         raise ValueError(f"Unsupported stack dimensions: {arr.shape}")
 

@@ -50,6 +50,24 @@ def _write_rgb_stack(path: Path, red_values: list[int], green_values: list[int])
     iio.imwrite(path, stack)
 
 
+def _write_hyperstack_zcyx(path: Path, red_values: list[int], green_values: list[int]) -> None:
+    depth = len(red_values)
+    arr = np.zeros((depth, 2, 8, 8), dtype=np.uint16)
+    for z, (r_val, g_val) in enumerate(zip(red_values, green_values)):
+        arr[z, 0, :, :] = int(r_val)
+        arr[z, 1, :, :] = int(g_val)
+    iio.imwrite(path, arr, plugin="tifffile", photometric="minisblack")
+
+
+def _write_hyperstack_czyx(path: Path, red_values: list[int], green_values: list[int]) -> None:
+    depth = len(red_values)
+    arr = np.zeros((2, depth, 8, 8), dtype=np.uint16)
+    for z, (r_val, g_val) in enumerate(zip(red_values, green_values)):
+        arr[0, z, :, :] = int(r_val)
+        arr[1, z, :, :] = int(g_val)
+    iio.imwrite(path, arr, plugin="tifffile", photometric="minisblack")
+
+
 def test_load_dataset_sorts_z_and_extracts_channels(tmp_path: Path) -> None:
     green_dir = tmp_path / "Segmented" / "Green"
     red_dir = tmp_path / "Segmented" / "Red"
@@ -142,6 +160,44 @@ def test_load_dataset_supports_single_combined_rgb_tiff_stack(tmp_path: Path) ->
     assert float(dataset.green.data[0, 0, 0]) == 0.0
     assert float(dataset.green.data[0, 7, 0]) > 0.0
     assert float(dataset.red.data[0, 7, 0]) == 0.0
+
+
+def test_load_dataset_supports_single_hyperstack_zcyx_tiff(tmp_path: Path) -> None:
+    stack_path = tmp_path / "hyper_zcyx.tif"
+    _write_hyperstack_zcyx(stack_path, red_values=[100, 220], green_values=[300, 500])
+
+    dataset = load_dataset(
+        tmp_path,
+        spacing=VoxelSpacing(),
+        channel_overrides={"green": stack_path, "red": stack_path},
+    )
+
+    assert dataset.green.data.shape == (2, 8, 8)
+    assert dataset.red.data.shape == (2, 8, 8)
+    assert dataset.green.z_indices == [1, 2]
+    assert dataset.red.z_indices == [1, 2]
+    assert float(dataset.green.data[0, 0, 0]) > float(dataset.red.data[0, 0, 0])
+    assert float(dataset.green.data[1, 0, 0]) > float(dataset.green.data[0, 0, 0])
+    assert float(dataset.red.data[1, 0, 0]) > float(dataset.red.data[0, 0, 0])
+
+
+def test_load_dataset_supports_single_hyperstack_czyx_tiff(tmp_path: Path) -> None:
+    stack_path = tmp_path / "hyper_czyx.tif"
+    _write_hyperstack_czyx(stack_path, red_values=[90, 180, 240], green_values=[200, 350, 600])
+
+    dataset = load_dataset(
+        tmp_path,
+        spacing=VoxelSpacing(),
+        channel_overrides={"green": stack_path, "red": stack_path},
+    )
+
+    assert dataset.green.data.shape == (3, 8, 8)
+    assert dataset.red.data.shape == (3, 8, 8)
+    assert dataset.green.z_indices == [1, 2, 3]
+    assert dataset.red.z_indices == [1, 2, 3]
+    assert float(dataset.green.data[0, 0, 0]) > float(dataset.red.data[0, 0, 0])
+    assert float(dataset.green.data[2, 0, 0]) > float(dataset.green.data[0, 0, 0])
+    assert float(dataset.red.data[2, 0, 0]) > float(dataset.red.data[0, 0, 0])
 
 
 def test_load_dataset_supports_file_sources_in_channel_overrides(tmp_path: Path) -> None:
