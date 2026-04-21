@@ -10,7 +10,7 @@ def _plane(value: float, shape: tuple[int, int] = (4, 4)) -> np.ndarray:
     return np.full(shape, value, dtype=np.float32)
 
 
-def test_fill_and_sync_extends_red_to_green_max_with_zero_padding() -> None:
+def test_fill_and_sync_zero_pads_to_global_range_but_preserves_true_overlap() -> None:
     spacing = VoxelSpacing()
 
     green = ChannelVolume(
@@ -31,7 +31,7 @@ def test_fill_and_sync_extends_red_to_green_max_with_zero_padding() -> None:
 
     assert synced.green.z_indices == [1, 2, 3, 4]
     assert synced.red.z_indices == [1, 2, 3, 4]
-    assert synced.shared_z_range == (1, 4)
+    assert synced.shared_z_range == (1, 2)
     assert np.allclose(synced.red.data[0], 0.7)
     assert np.allclose(synced.red.data[1], 0.9)
     assert np.allclose(synced.red.data[2], 0.0)

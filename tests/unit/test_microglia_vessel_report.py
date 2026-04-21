@@ -10,6 +10,7 @@ from nvap.analysis.microglia_vessel_report import (
 )
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig, RenderConfig, VoxelSpacing
 from nvap.export.exporters import export_metrics_csv
+from nvap.pipeline import fill_and_sync_dataset
 
 
 def _dataset(green: np.ndarray, red: np.ndarray, spacing: VoxelSpacing | None = None) -> DatasetVolume:
@@ -182,6 +183,32 @@ def test_mismatched_channel_depths_are_aligned_by_shared_z_range() -> None:
     row = report.rows[0]
     assert row.distance_to_vasculature_um >= 0.0
     assert row.microglia_closest_z_um == 2.0
+
+
+def test_analysis_after_sync_ignores_zero_padded_nonoverlap_slices() -> None:
+    spacing = VoxelSpacing(x_um=1.0, y_um=1.0, z_um=1.0)
+    green = np.zeros((4, 16, 96), dtype=np.float32)  # z values [1,2,3,4]
+    red = np.zeros((2, 16, 96), dtype=np.float32)    # z values [1,2]
+    green[1, 6, 8:72] = 1.0   # shared z=2
+    green[3, 10, 8:72] = 1.0  # non-overlap z=4
+    red[1, 6, 80:86] = 1.0    # shared z=2
+    ds = DatasetVolume(
+        green=ChannelVolume("green", green, [1, 2, 3, 4], spacing),
+        red=ChannelVolume("red", red, [1, 2], spacing),
+        shared_z_range=(1, 2),
+    )
+
+    synced = fill_and_sync_dataset(ds)
+    report = analyze_microglia_vessel(
+        synced,
+        RenderConfig(threshold_green=0.5, threshold_red=0.5),
+        PreprocessConfig(),
+        segmentation_mode="internal",
+    )
+
+    assert synced.shared_z_range == (1, 2)
+    assert report.cell_count == 1
+    assert report.rows[0].microglia_closest_z_um == 2.0
 
 
 def test_auto_mode_skips_fiji_fallback_for_large_volume(monkeypatch) -> None:

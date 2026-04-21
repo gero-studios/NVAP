@@ -169,6 +169,8 @@ class MainWindow(QMainWindow):
         self.current_psf = self.controls.current_psf_config()
         self.current_render = self.controls.current_render_config()
         self.latest_metrics: MetricsComputation | None = None
+        self._metrics_revision = 0
+        self._metrics_cache_key: tuple[int, float, float, float, float, float] | None = None
         self.latest_microglia_report: MicrogliaCellReport | None = None
         self.dataset_root: Path | None = None
         self._dataset_signature: str | None = None
@@ -316,6 +318,80 @@ class MainWindow(QMainWindow):
             y_um=spacing.y_um,
             z_um=float(spacing.z_um) * z_scale,
         )
+
+    @staticmethod
+    def _apply_render_trim(
+        volume: np.ndarray,
+        trim_first_slices: int,
+        trim_last_slices: int,
+    ) -> np.ndarray:
+        arr = np.asarray(volume)
+        if arr.ndim != 3 or arr.shape[0] <= 0:
+            return arr
+        trim_first = max(0, int(trim_first_slices))
+        trim_last = max(0, int(trim_last_slices))
+        if trim_first <= 0 and trim_last <= 0:
+            return arr
+        if trim_first + trim_last >= int(arr.shape[0]):
+            return np.zeros_like(arr)
+        out = np.array(arr, copy=True)
+        if trim_first > 0:
+            out[:trim_first] = 0
+        if trim_last > 0:
+            out[-trim_last:] = 0
+        return out
+
+    @staticmethod
+    def _render_trim_changed(previous: RenderConfig, current: RenderConfig) -> bool:
+        return bool(
+            int(previous.trim_first_slices) != int(current.trim_first_slices)
+            or int(previous.trim_last_slices) != int(current.trim_last_slices)
+        )
+
+    @staticmethod
+    def _render_config_affects_metrics(previous: RenderConfig, current: RenderConfig) -> bool:
+        return bool(
+            not np.isclose(float(previous.threshold_green), float(current.threshold_green), atol=1.0e-6)
+            or not np.isclose(float(previous.threshold_red), float(current.threshold_red), atol=1.0e-6)
+            or not np.isclose(float(previous.offset_x_um), float(current.offset_x_um), atol=1.0e-6)
+            or not np.isclose(float(previous.offset_y_um), float(current.offset_y_um), atol=1.0e-6)
+            or not np.isclose(float(previous.offset_z_um), float(current.offset_z_um), atol=1.0e-6)
+        )
+
+    def _mark_metrics_dirty(self) -> None:
+        self._metrics_revision += 1
+        self._metrics_cache_key = None
+        self.latest_metrics = None
+
+    def _metrics_cache_key_for_render(
+        self,
+        render: RenderConfig,
+    ) -> tuple[int, float, float, float, float, float]:
+        return (
+            int(self._metrics_revision),
+            float(render.threshold_green),
+            float(render.threshold_red),
+            float(render.offset_x_um),
+            float(render.offset_y_um),
+            float(render.offset_z_um),
+        )
+
+    def _set_metrics_text_from_result(self, metrics: MetricsComputation) -> None:
+        lines = []
+        for item in metrics.channel_results:
+            lines.append(
+                (
+                    f"{item.channel}: voxels={item.voxel_count}, "
+                    f"volume_um3={item.volume_um3:.3f}, "
+                    f"components={item.component_count}, "
+                    f"largest_component={item.largest_component_voxels}"
+                )
+            )
+        lines.append(
+            f"overlap: voxels={metrics.overlap_voxel_count}, "
+            f"volume_um3={metrics.overlap_volume_um3:.3f}"
+        )
+        self.controls.set_metrics_text("\n".join(lines))
 
     def _invalidate_microglia_components(self) -> None:
         self._green_component_labels = None
@@ -621,8 +697,14 @@ class MainWindow(QMainWindow):
     def _push_scene_channels(self, *, green_only: bool = False) -> None:
         if self.visual_dataset is None:
             return
+        trim_first = int(self.current_render.trim_first_slices)
+        trim_last = int(self.current_render.trim_last_slices)
         self._set_busy_message("Uploading green channel to VTK...")
-        green_volume = self._current_green_volume_for_view()
+        green_volume = self._apply_render_trim(
+            self._current_green_volume_for_view(),
+            trim_first,
+            trim_last,
+        )
         self.scene.set_channel_component_coloring(
             "green",
             self._green_component_coloring_active,
@@ -636,9 +718,14 @@ class MainWindow(QMainWindow):
         if green_only:
             return
         self._set_busy_message("Uploading red channel to VTK...")
+        red_volume = self._apply_render_trim(
+            self.visual_dataset.red.data,
+            trim_first,
+            trim_last,
+        )
         self.scene.set_channel_data(
             channel="red",
-            volume=self.visual_dataset.red.data,
+            volume=red_volume,
             spacing=self._display_spacing(self.visual_dataset.red.spacing),
         )
 
@@ -1304,44 +1391,35 @@ class MainWindow(QMainWindow):
     ) -> _LoadTaskResult:
         t0 = time.perf_counter()
         self._publish_busy_progress(percent=2.0, message="Reading channel stacks...")
-        self._log_info("Load step 1/6: reading channel stacks...")
+        self._log_info("Load step 1/5: reading channel stacks...")
         dataset = load_dataset(root, spacing=self.spacing, channel_overrides=channel_overrides)
-        self._log_info("Load step 1/6 complete.")
+        self._log_info("Load step 1/5 complete.")
         self._publish_busy_progress(percent=16.0, message="Synchronizing channels...")
 
-        self._log_info("Load step 2/6: filling missing slices...")
+        self._log_info("Load step 2/5: filling missing slices...")
         synced_dataset = fill_and_sync_dataset(dataset)
-        self._log_info("Load step 2/6 complete.")
-        self._publish_busy_progress(percent=26.0, message="Preprocessing (green pass-through + red cleanup)...")
+        self._log_info("Load step 2/5 complete.")
+        self._publish_busy_progress(percent=26.0, message="Resolving processed cache and pipeline...")
 
-        self._log_info("Load step 3/6: preprocessing (green pass-through + red cleanup)...")
+        self._log_info("Load step 3/5: resolving processed cache and pipeline...")
         self.preprocess_config = preprocess_cfg
-        if preprocess_cfg.enabled:
-            preprocessed_dataset = preprocess_dataset(synced_dataset, preprocess_cfg)
-            self._log_info("Load step 3/6 complete (preprocessing applied).")
-        else:
-            preprocessed_dataset = synced_dataset
-            self._log_info("Load step 3/6 skipped (preprocessing disabled).")
-        self._publish_busy_progress(percent=54.0, message="Applying cached/processed volume...")
-
-        self._log_info("Load step 4/6: applying cached/processed volume...")
         processed_dataset = self._get_processed_dataset_with_cache(
-            preprocessed_dataset,
+            synced_dataset,
             psf_cfg,
             preprocess_cfg,
             self._dataset_signature,
             cancel_event=None,
-            progress_bounds=(54.0, 74.0),
+            progress_bounds=(26.0, 74.0),
         )
-        self._log_info("Load step 4/6 complete.")
+        self._log_info("Load step 3/5 complete.")
         self._publish_busy_progress(percent=76.0, message="Preparing mesh dataset...")
 
-        self._log_info("Load step 5/6: preparing mesh dataset...")
+        self._log_info("Load step 4/5: preparing mesh dataset...")
         visual_dataset = prepare_dataset_for_mesh(processed_dataset, preprocess_cfg)
-        self._log_info("Load step 5/6 complete.")
+        self._log_info("Load step 4/5 complete.")
         self._publish_busy_progress(percent=86.0, message="Computing default thresholds...")
 
-        self._log_info("Load step 6/6: computing thresholds...")
+        self._log_info("Load step 5/5: computing thresholds...")
         threshold_green = default_green_threshold(processed_dataset.green.data)
         threshold_red = default_threshold(processed_dataset.red.data)
         self._publish_busy_progress(percent=92.0, message="Finalizing load...")
@@ -1352,7 +1430,7 @@ class MainWindow(QMainWindow):
         )
         return _LoadTaskResult(
             synced_dataset=synced_dataset,
-            raw_dataset=preprocessed_dataset,
+            raw_dataset=synced_dataset,
             processed_dataset=processed_dataset,
             visual_dataset=visual_dataset,
             threshold_green=threshold_green,
@@ -1367,6 +1445,7 @@ class MainWindow(QMainWindow):
         self.synced_dataset = result.synced_dataset
         self.raw_dataset = result.raw_dataset
         self.processed_dataset = result.processed_dataset
+        self._mark_metrics_dirty()
         self.visual_dataset = result.visual_dataset
         self.latest_microglia_report = None
         self.controls.clear_microglia_analysis_table()
@@ -1386,6 +1465,7 @@ class MainWindow(QMainWindow):
         self._publish_busy_progress(percent=90.0, message="Preparing render dataset...")
         self._microglia_isolate_active = bool(self.controls.microglia_view_state()[0])
         self.processed_dataset = result
+        self._mark_metrics_dirty()
         self.visual_dataset = prepare_dataset_for_mesh(self.processed_dataset, self.preprocess_config)
         self.latest_microglia_report = None
         self.controls.clear_microglia_analysis_table()
@@ -1401,7 +1481,7 @@ class MainWindow(QMainWindow):
 
     def _get_processed_dataset_with_cache(
         self,
-        raw_dataset: DatasetVolume,
+        synced_dataset: DatasetVolume,
         psf_cfg: PSFConfig,
         preprocess_cfg: PreprocessConfig,
         dataset_signature: str | None,
@@ -1431,7 +1511,21 @@ class MainWindow(QMainWindow):
                 self._log_info("Using cached processed dataset.")
                 return cached
             self._log_info(f"Cache pipeline: miss key={cache_key}")
-        publish_process_progress(0.08, "Running processing pipeline...")
+        working_dataset = synced_dataset
+        if preprocess_cfg.enabled:
+            publish_process_progress(0.08, "Running preprocessing...")
+            self._log_info(
+                "Cache pipeline: preprocessing start "
+                f"(strategy={preprocess_cfg.green_denoise_strategy})."
+            )
+            t_pre = time.perf_counter()
+            working_dataset = preprocess_dataset(synced_dataset, preprocess_cfg)
+            self._log_info(
+                f"Cache pipeline: preprocessing complete dt={time.perf_counter() - t_pre:.2f}s"
+            )
+        else:
+            self._log_info("Cache pipeline: preprocessing skipped (disabled).")
+        publish_process_progress(0.18, "Running processing pipeline...")
 
         self._log_info(
             "Cache pipeline: PSF start "
@@ -1456,23 +1550,23 @@ class MainWindow(QMainWindow):
                 if emit_log:
                     progress_seen[channel] = percent
             publish_process_progress(
-                0.12 + (0.74 * avg_frac),
+                0.22 + (0.68 * avg_frac),
                 message=f"Processing {channel}: {current}/{total}",
             )
             if emit_log:
                 self._log_info(f"Load progress: PSF {channel} {current}/{total} ({percent}%)")
 
         processed = apply_psf_to_dataset(
-            raw_dataset,
+            working_dataset,
             psf_cfg,
             preprocess_config=preprocess_cfg,
             cancel_event=cancel_event,
             progress_callback=on_psf_progress,
         )
-        publish_process_progress(0.90, "Finalizing processed dataset...")
+        publish_process_progress(0.92, "Finalizing processed dataset...")
         self._log_info(f"Cache pipeline: PSF complete dt={time.perf_counter() - t_psf:.2f}s")
         if cache_key is not None and (cancel_event is None or not cancel_event.is_set()):
-            publish_process_progress(0.95, "Saving processed dataset to cache...")
+            publish_process_progress(0.96, "Saving processed dataset to cache...")
             self._log_info("Cache pipeline: saving processed dataset to cache.")
             save_processed_dataset(cache_key, processed)
             self._log_info(f"Cache pipeline: cache save complete key={cache_key}")
@@ -1532,9 +1626,8 @@ class MainWindow(QMainWindow):
         no_psf_mode = _green_no_psf_mode(preprocess_cfg)
 
         def _reprocess_task():
-            preprocessed = preprocess_dataset(synced_dataset, preprocess_cfg) if preprocess_cfg.enabled else synced_dataset
             return self._get_processed_dataset_with_cache(
-                preprocessed,
+                synced_dataset,
                 psf_cfg,
                 preprocess_cfg,
                 dataset_signature,
@@ -1574,6 +1667,7 @@ class MainWindow(QMainWindow):
             psf_cfg,
             preprocess_config=self.preprocess_config,
         )
+        self._mark_metrics_dirty()
         self.visual_dataset = prepare_dataset_for_mesh(self.processed_dataset, self.preprocess_config)
         self._invalidate_microglia_components()
         self._log_debug(
@@ -1603,30 +1697,37 @@ class MainWindow(QMainWindow):
             new_z_scale,
             atol=1.0e-6,
         )
+        trim_changed = self._render_trim_changed(previous, config)
+        data_upload_changed = z_scale_changed or trim_changed
+        metrics_changed = self._render_config_affects_metrics(previous, config)
         self._display_z_scale = new_z_scale
         if self.processed_dataset is None:
             return
-        threshold_changed = not np.isclose(
+        green_threshold_changed = not np.isclose(
             float(previous.threshold_green),
             float(config.threshold_green),
             atol=1.0e-6,
         )
-        if threshold_changed:
+        if green_threshold_changed:
             self._invalidate_microglia_components()
         isolate_enabled, _ = self.controls.microglia_view_state()
-        if isolate_enabled and threshold_changed:
+        if isolate_enabled and green_threshold_changed:
             # Start background microglia refresh which will also push scene
             # channels when done — avoid synchronous watershed here.
+            if data_upload_changed:
+                self._push_scene_channels()
             self._start_microglia_refresh_task()
             self.scene.apply_render_config(config)
-            self._refresh_metrics()
+            if metrics_changed:
+                self._refresh_metrics()
             return
         if isolate_enabled:
             self._refresh_microglia_components_if_needed()
-        if z_scale_changed:
+        if data_upload_changed:
             self._push_scene_channels()
         self.scene.apply_render_config(config)
-        self._refresh_metrics()
+        if metrics_changed:
+            self._refresh_metrics()
 
     def _on_microglia_view_changed(self) -> None:
         if self.visual_dataset is None or self.processed_dataset is None:
@@ -1648,22 +1749,11 @@ class MainWindow(QMainWindow):
     def _refresh_metrics(self) -> None:
         if self.processed_dataset is None:
             return
-        self.latest_metrics = compute_metrics(self.processed_dataset, self.current_render)
-        lines = []
-        for item in self.latest_metrics.channel_results:
-            lines.append(
-                (
-                    f"{item.channel}: voxels={item.voxel_count}, "
-                    f"volume_um3={item.volume_um3:.3f}, "
-                    f"components={item.component_count}, "
-                    f"largest_component={item.largest_component_voxels}"
-                )
-            )
-        lines.append(
-            f"overlap: voxels={self.latest_metrics.overlap_voxel_count}, "
-            f"volume_um3={self.latest_metrics.overlap_volume_um3:.3f}"
-        )
-        self.controls.set_metrics_text("\n".join(lines))
+        cache_key = self._metrics_cache_key_for_render(self.current_render)
+        if self.latest_metrics is None or self._metrics_cache_key != cache_key:
+            self.latest_metrics = compute_metrics(self.processed_dataset, self.current_render)
+            self._metrics_cache_key = cache_key
+        self._set_metrics_text_from_result(self.latest_metrics)
         self._log_debug("Metrics updated.")
 
     def _on_export_metrics_requested(self) -> None:
@@ -1772,21 +1862,21 @@ class MainWindow(QMainWindow):
         start = str((self.dataset_root or Path.cwd()) / "microglia_analysis.csv")
         file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Export Microglia Analysis CSV",
+            "Export Microglia Analysis Bundle",
             start,
             "CSV files (*.csv)",
         )
         if not file_path:
             return
         try:
-            with self._busy("Export Microglia Analysis", "Writing CSV..."):
-                self._publish_busy_progress(percent=20.0, message="Collecting analysis rows...")
+            with self._busy("Export Microglia Analysis", "Writing analysis bundle..."):
+                self._publish_busy_progress(percent=20.0, message="Collecting analysis bundle...")
                 green_volume = None
                 red_volume = None
                 if self.processed_dataset is not None:
                     green_volume = self.processed_dataset.green.data
                     red_volume = self.processed_dataset.red.data
-                self._publish_busy_progress(percent=70.0, message="Writing CSV file...")
+                self._publish_busy_progress(percent=70.0, message="Writing bundle files...")
                 outputs = export_microglia_analysis_bundle(
                     self.latest_microglia_report,
                     file_path,
@@ -1795,8 +1885,16 @@ class MainWindow(QMainWindow):
                 )
                 out = outputs.get("cells", Path(file_path))
                 self._publish_busy_progress(percent=100.0, message="Analysis export complete.")
-            self.statusBar().showMessage(f"Microglia analysis exported to {out}", 5000)
-            self._log_info(f"Microglia analysis exported: {out}")
+            debug_measurements = outputs.get("debug_measurements")
+            debug_dir = debug_measurements.parent if isinstance(debug_measurements, Path) else None
+            if debug_dir is not None:
+                status = f"Analysis bundle exported: {out.name} + {debug_dir.name}"
+                log_message = f"Microglia analysis bundle exported: cells={out} debug_dir={debug_dir}"
+            else:
+                status = f"Microglia analysis exported to {out}"
+                log_message = f"Microglia analysis exported: {out}"
+            self.statusBar().showMessage(status, 5000)
+            self._log_info(log_message)
         except Exception as exc:
             self._log_info(f"Microglia analysis export failed: {exc}")
             self._show_error("Microglia analysis export failed", str(exc))

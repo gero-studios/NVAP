@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -108,17 +109,29 @@ class ControlPanel(QWidget):
         _mode_hint.setObjectName("modeHint")
         root.addWidget(_mode_hint)
 
+        self.tab_widget = QTabWidget()
+        root.addWidget(self.tab_widget)
+        
+        self.vis_tab = QWidget()
+        vis_layout = QVBoxLayout(self.vis_tab)
         self.render_group = self._build_render_group()
-        root.addWidget(self.render_group)
-
-        self.preprocess_group = self._build_preprocess_group()
-        root.addWidget(self.preprocess_group)
-
+        vis_layout.addWidget(self.render_group)
         self.microglia_group = self._build_microglia_group()
-        root.addWidget(self.microglia_group)
-
+        vis_layout.addWidget(self.microglia_group)
+        vis_layout.addStretch(1)
+        self.tab_widget.addTab(self.vis_tab, "Visualization")
+        
+        self.proc_tab = QWidget()
+        proc_layout = QVBoxLayout(self.proc_tab)
+        self.preprocess_group = self._build_preprocess_group()
+        proc_layout.addWidget(self.preprocess_group)
         self.microglia_analysis_group = self._build_microglia_analysis_group()
-        root.addWidget(self.microglia_analysis_group)
+        proc_layout.addWidget(self.microglia_analysis_group)
+        proc_layout.addStretch(1)
+        self.tab_widget.addTab(self.proc_tab, "Processing")
+
+        self.sys_tab = QWidget()
+        sys_layout = QVBoxLayout(self.sys_tab)
 
         export_group = QGroupBox("Export")
         export_layout = QHBoxLayout(export_group)
@@ -135,15 +148,7 @@ class ControlPanel(QWidget):
         export_layout.addWidget(csv_btn)
         export_layout.addWidget(png_btn)
         export_layout.addWidget(mesh_btn)
-        root.addWidget(export_group)
-
-        plugin_group = QGroupBox("Plugins")
-        plugin_layout = QVBoxLayout(plugin_group)
-        self.plugin_text = QTextEdit()
-        self.plugin_text.setReadOnly(True)
-        self.plugin_text.setMaximumHeight(80)
-        plugin_layout.addWidget(self.plugin_text)
-        root.addWidget(plugin_group)
+        sys_layout.addWidget(export_group)
 
         metrics_group = QGroupBox("Metrics")
         metrics_layout = QVBoxLayout(metrics_group)
@@ -151,7 +156,15 @@ class ControlPanel(QWidget):
         self.metrics_text.setReadOnly(True)
         self.metrics_text.setMaximumHeight(130)
         metrics_layout.addWidget(self.metrics_text)
-        root.addWidget(metrics_group)
+        sys_layout.addWidget(metrics_group)
+
+        plugin_group = QGroupBox("Plugins")
+        plugin_layout = QVBoxLayout(plugin_group)
+        self.plugin_text = QTextEdit()
+        self.plugin_text.setReadOnly(True)
+        self.plugin_text.setMaximumHeight(80)
+        plugin_layout.addWidget(self.plugin_text)
+        sys_layout.addWidget(plugin_group)
 
         self.debug_group = QGroupBox("Log")
         self.debug_group.setCheckable(True)
@@ -163,10 +176,12 @@ class ControlPanel(QWidget):
         debug_layout.addWidget(self.debug_text)
         self.debug_group.toggled.connect(lambda checked: self.debug_text.setVisible(checked))
         self.debug_text.setVisible(False)
-        root.addWidget(self.debug_group)
+        sys_layout.addWidget(self.debug_group)
+
+        sys_layout.addStretch(1)
+        self.tab_widget.addTab(self.sys_tab, "System & Export")
 
         self._set_advanced_visible(False)
-        root.addStretch(1)
         self._emit_render_config()
         self._emit_psf_config()
 
@@ -352,8 +367,11 @@ class ControlPanel(QWidget):
         self.run_microglia_analysis_btn.clicked.connect(self.run_microglia_analysis_requested.emit)
         action_row.addWidget(self.run_microglia_analysis_btn)
 
-        self.export_microglia_analysis_btn = QPushButton("Export Analysis CSV")
+        self.export_microglia_analysis_btn = QPushButton("Export Analysis Bundle")
         self.export_microglia_analysis_btn.setEnabled(False)
+        self.export_microglia_analysis_btn.setToolTip(
+            "Export cell, branch, tip, and vessel-crossing CSVs plus debug outputs."
+        )
         self.export_microglia_analysis_btn.clicked.connect(
             self.export_microglia_analysis_requested.emit
         )

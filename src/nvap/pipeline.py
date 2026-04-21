@@ -76,19 +76,20 @@ def fill_and_sync_dataset(dataset: DatasetVolume) -> DatasetVolume:
     logger.info("Filling missing slices and syncing channel z-ranges.")
     green = fill_channel_missing_slices(dataset.green)
     red = fill_channel_missing_slices(dataset.red)
-    shared = _shared_range(green, red)
+    overlap = _shared_range(green, red)
     global_start = min(min(green.z_indices), min(red.z_indices))
     global_end = max(max(green.z_indices), max(red.z_indices))
     green = _align_channel_to_range(green, z_start=global_start, z_end=global_end)
     red = _align_channel_to_range(red, z_start=global_start, z_end=global_end)
-    shared = (global_start, global_end)
+    aligned = (global_start, global_end)
     logger.info(
-        "Synced dataset: green_z=%d red_z=%d shared_range=%s",
+        "Synced dataset: green_z=%d red_z=%d aligned_range=%s overlap_range=%s",
         len(green.z_indices),
         len(red.z_indices),
-        shared,
+        aligned,
+        overlap,
     )
-    return DatasetVolume(green=green, red=red, shared_z_range=shared)
+    return DatasetVolume(green=green, red=red, shared_z_range=overlap)
 
 
 def apply_psf_to_dataset(

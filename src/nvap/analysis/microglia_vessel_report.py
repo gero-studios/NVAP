@@ -436,7 +436,7 @@ def _compute_vessel_surface_distance_maps(
         return_distances=True,
         return_indices=True,
     )
-    return np.asarray(distances, dtype=np.float32), np.asarray(indices, dtype=np.int64)
+    return np.asarray(distances, dtype=np.float32), np.asarray(indices, dtype=np.int32)
 
 
 def _skeletonize_mask(mask: np.ndarray) -> np.ndarray:
@@ -1327,15 +1327,18 @@ def analyze_microglia_vessel(
     _publish_progress(0.34, "Computing vessel distance maps and skeletons...", log=True)
     red_mask = red >= threshold_red
     vessel_workers = _resolve_analysis_workers(preprocess_config, total_jobs=3, max_workers=3)
+    actual_vessel_workers = 1
     if vessel_workers > 1:
-        logger.info("Microglia analysis vessel preprocessing: parallel workers=%d", vessel_workers)
-        with ThreadPoolExecutor(max_workers=vessel_workers, thread_name_prefix="nvap-vessel") as pool:
-            labels_future = pool.submit(_compute_vessel_labels_and_radius, red_mask, spacing)
+        actual_vessel_workers = 2
+        logger.info(
+            "Microglia analysis vessel preprocessing: parallel workers=%d (EDT passes serialized for memory safety)",
+            vessel_workers,
+        )
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="nvap-vessel") as pool:
             skeleton_future = pool.submit(_skeletonize_mask, red_mask)
-            surface_future = pool.submit(_compute_vessel_surface_distance_maps, red_mask, spacing)
-            vessel_labels, vessel_radius_um = labels_future.result()
+            vessel_labels, vessel_radius_um = _compute_vessel_labels_and_radius(red_mask, spacing)
+            vessel_surface_dist_um, vessel_surface_indices = _compute_vessel_surface_distance_maps(red_mask, spacing)
             vessel_skeleton = np.asarray(skeleton_future.result(), dtype=bool)
-            vessel_surface_dist_um, vessel_surface_indices = surface_future.result()
     else:
         vessel_labels, vessel_radius_um = _compute_vessel_labels_and_radius(red_mask, spacing)
         vessel_skeleton = _skeletonize_mask(red_mask)
@@ -1536,7 +1539,7 @@ def analyze_microglia_vessel(
         "threshold_green_used": float(threshold_green),
         "threshold_red_used": float(threshold_red),
         "parallel_workers": {
-            "vessel_preprocessing": int(vessel_workers),
+            "vessel_preprocessing": int(actual_vessel_workers),
             "cell_analysis": int(cell_workers),
         },
         "spacing_um": {

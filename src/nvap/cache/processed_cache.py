@@ -10,7 +10,7 @@ from nvap.config.types import ChannelVolume, DatasetVolume, PSFConfig, Preproces
 
 logger = logging.getLogger(__name__)
 
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 CACHE_DIRNAME = ".nvap_cache"
 _SUPPORTED_IMAGE_EXTENSIONS = {".png", ".tif", ".tiff"}
 
