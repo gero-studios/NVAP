@@ -31,6 +31,7 @@ class ControlPanel(QWidget):
     render_config_changed = Signal(object)
     psf_config_changed = Signal(object)
     microglia_view_changed = Signal()
+    enhance_microglia_requested = Signal()
     run_microglia_analysis_requested = Signal()
     export_microglia_analysis_requested = Signal()
     microglia_analysis_overlay_changed = Signal()
@@ -347,6 +348,23 @@ class ControlPanel(QWidget):
         self.microglia_branch_sensitivity.valueChanged.connect(self._on_microglia_setting_changed)
         form.addRow("Branch sensitivity", self.microglia_branch_sensitivity)
 
+        self.microglia_enhancement_method = QComboBox()
+        self.microglia_enhancement_method.addItem("Microglia-preserving combined", "microglia_preserve")
+        self.microglia_enhancement_method.addItem("ImageJ/Fiji rolling ball", "imagej_rolling_ball")
+        self.microglia_enhancement_method.addItem("BaSiC-style correction", "basic")
+        self.microglia_enhancement_method.addItem("CIDRE-style correction", "cidre")
+        self.microglia_enhancement_method.addItem("scikit-image white top-hat", "white_tophat")
+        self.microglia_enhancement_method.addItem("scikit-image CLAHE", "clahe")
+        form.addRow("Enhancement", self.microglia_enhancement_method)
+
+        self.enhance_microglia_btn = QPushButton("Enhance Microglia")
+        self.enhance_microglia_btn.setEnabled(False)
+        self.enhance_microglia_btn.setToolTip(
+            "Remove green-channel background after loading while preserving somas and branches."
+        )
+        self.enhance_microglia_btn.clicked.connect(self.enhance_microglia_requested.emit)
+        form.addRow(self.enhance_microglia_btn)
+
         self._set_microglia_navigation_enabled(False)
         return group
 
@@ -584,6 +602,12 @@ class ControlPanel(QWidget):
 
     def set_metrics_text(self, text: str) -> None:
         self.metrics_text.setPlainText(text)
+
+    def set_microglia_enhancement_enabled(self, enabled: bool) -> None:
+        self.enhance_microglia_btn.setEnabled(bool(enabled))
+
+    def current_microglia_enhancement_method(self) -> str:
+        return str(self.microglia_enhancement_method.currentData())
 
     def microglia_view_state(self) -> tuple[bool, int]:
         return self.microglia_isolate.isChecked(), int(self.microglia_index.value())

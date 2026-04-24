@@ -7,8 +7,10 @@ import time
 
 import numpy as np
 import scipy.ndimage as ndi
+from skimage import exposure
 from skimage.filters import frangi, meijering, sato, threshold_otsu
-from skimage.restoration import denoise_bilateral, denoise_nl_means, denoise_wavelet
+from skimage.morphology import disk, white_tophat
+from skimage.restoration import denoise_bilateral, denoise_nl_means, denoise_wavelet, rolling_ball
 
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig
 from nvap.preprocess.denoisers import (
@@ -540,6 +542,166 @@ def stage_restore_branches_near_bright_pixels(
     if np.any(branch_like):
         out[branch_like] = np.maximum(out[branch_like], ref[branch_like] * 0.93)
     return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _normalize_positive_detail(detail: np.ndarray) -> np.ndarray:
+    arr = np.maximum(np.asarray(detail, dtype=np.float32), 0.0)
+    if arr.size == 0:
+        return arr
+    sample = arr
+    if arr.size >= 32 * 1024 * 1024 and arr.ndim == 3:
+        sample = arr[::2, ::4, ::4]
+    hi = float(np.percentile(sample, 99.7))
+    if not np.isfinite(hi) or hi <= 1.0e-6:
+        return np.zeros_like(arr, dtype=np.float32)
+    return np.clip(arr / hi, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _white_tophat_slicewise(volume: np.ndarray, radius: int) -> np.ndarray:
+    arr = np.asarray(volume, dtype=np.float32)
+    radius = int(max(3, radius))
+    footprint = disk(radius)
+    out = np.empty_like(arr, dtype=np.float32)
+    for z in range(int(arr.shape[0])):
+        out[z] = np.asarray(
+            white_tophat(arr[z], footprint=footprint),
+            dtype=np.float32,
+        )
+    return out
+
+
+def _clahe_slicewise(volume: np.ndarray, clip_limit: float = 0.012) -> np.ndarray:
+    arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
+    out = np.empty_like(arr, dtype=np.float32)
+    for z in range(int(arr.shape[0])):
+        plane = np.asarray(arr[z], dtype=np.float32)
+        if float(np.max(plane)) <= 1.0e-6:
+            out[z] = plane
+            continue
+        tile_y = max(16, int(round(plane.shape[0] / 8)))
+        tile_x = max(16, int(round(plane.shape[1] / 8)))
+        out[z] = np.asarray(
+            exposure.equalize_adapthist(
+                plane,
+                kernel_size=(tile_y, tile_x),
+                clip_limit=float(clip_limit),
+            ),
+            dtype=np.float32,
+        )
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+MICROGLIA_ENHANCEMENT_METHODS: dict[str, str] = {
+    "microglia_preserve": "Microglia-preserving combined",
+    "imagej_rolling_ball": "ImageJ/Fiji rolling ball background subtraction",
+    "basic": "BaSiC-style retrospective shading correction",
+    "cidre": "CIDRE-style illumination correction",
+    "white_tophat": "scikit-image white top-hat",
+    "clahe": "scikit-image CLAHE / adaptive histogram equalization",
+}
+
+
+def _rolling_ball_slicewise(volume: np.ndarray, radius: int) -> np.ndarray:
+    arr = np.asarray(volume, dtype=np.float32)
+    out = np.empty_like(arr, dtype=np.float32)
+    radius = int(max(3, radius))
+    for z in range(int(arr.shape[0])):
+        background = rolling_ball(arr[z], radius=radius)
+        out[z] = np.maximum(arr[z] - np.asarray(background, dtype=np.float32), 0.0)
+    return out
+
+
+def _basic_style_correction(volume: np.ndarray) -> np.ndarray:
+    arr = np.asarray(volume, dtype=np.float32)
+    dark = np.percentile(arr, 2.0, axis=0).astype(np.float32, copy=False)
+    signal = np.maximum(arr - dark[np.newaxis, ...], 0.0)
+    flat = np.percentile(signal, 70.0, axis=0).astype(np.float32, copy=False)
+    flat = ndi.gaussian_filter(flat, sigma=24.0, mode="nearest")
+    flat_mean = float(np.mean(flat[flat > 0])) if np.any(flat > 0) else 1.0
+    corrected = signal / np.maximum(flat[np.newaxis, ...] / max(flat_mean, 1.0e-6), 0.15)
+    return _normalize_positive_detail(corrected)
+
+
+def _cidre_style_correction(volume: np.ndarray) -> np.ndarray:
+    arr = np.asarray(volume, dtype=np.float32)
+    dark = np.percentile(arr, 1.0, axis=0).astype(np.float32, copy=False)
+    bright = np.percentile(arr, 92.0, axis=0).astype(np.float32, copy=False)
+    shading = ndi.gaussian_filter(np.maximum(bright - dark, 0.0), sigma=32.0, mode="nearest")
+    shading_mean = float(np.mean(shading[shading > 0])) if np.any(shading > 0) else 1.0
+    corrected = np.maximum(arr - dark[np.newaxis, ...], 0.0)
+    corrected = corrected / np.maximum(shading[np.newaxis, ...] / max(shading_mean, 1.0e-6), 0.15)
+    return _normalize_positive_detail(corrected)
+
+
+def _enhance_microglia_core(
+    arr: np.ndarray,
+    cfg: PreprocessConfig,
+    method: str,
+) -> np.ndarray:
+    """Remove fluorescence background while preserving microglia somas and branches."""
+    sigma_xy = float(max(18.0, cfg.flatfield_sigma_xy))
+    radius = int(np.clip(round(sigma_xy * 0.60), 8, 32))
+    if method == "imagej_rolling_ball":
+        enhanced = _normalize_positive_detail(_rolling_ball_slicewise(arr, radius=radius))
+    elif method == "basic":
+        enhanced = _basic_style_correction(arr)
+    elif method == "cidre":
+        enhanced = _cidre_style_correction(arr)
+    elif method == "white_tophat":
+        enhanced = _normalize_positive_detail(_white_tophat_slicewise(arr, radius=radius))
+    elif method == "clahe":
+        enhanced = _clahe_slicewise(_normalize_positive_detail(arr), clip_limit=0.01)
+    elif method == "microglia_preserve":
+        background = ndi.gaussian_filter(arr, sigma=(0.0, sigma_xy, sigma_xy), mode="nearest")
+        bg_detail = _normalize_positive_detail(arr - (0.88 * background))
+        if float(np.max(bg_detail)) <= 1.0e-6:
+            return arr.copy()
+        top_hat = _normalize_positive_detail(_white_tophat_slicewise(arr, radius=radius))
+        contrast_src = np.maximum(bg_detail, top_hat * 0.85)
+        contrast = _clahe_slicewise(contrast_src, clip_limit=0.012)
+        enhanced = np.clip(
+            (0.62 * bg_detail) + (0.25 * top_hat) + (0.13 * contrast),
+            0.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+    else:
+        raise ValueError(f"Unknown microglia enhancement method: {method}")
+
+    if float(np.max(enhanced)) <= 1.0e-6:
+        return arr.copy()
+
+    branch_map = stage_branch_map_estimation(arr, cfg, "green")
+    branch_protected = _apply_green_branch_preservation(
+        arr,
+        enhanced,
+        branch_map,
+        cfg,
+        mode="post_background",
+    )
+
+    soma_cut = float(np.percentile(arr, 98.8))
+    soma_mask = arr >= soma_cut if np.isfinite(soma_cut) and soma_cut > 0.0 else np.zeros_like(arr, dtype=bool)
+    if np.any(soma_mask):
+        soma_mask = ndi.maximum_filter(soma_mask.astype(np.uint8), size=(1, 5, 5), mode="nearest") > 0
+        branch_protected[soma_mask] = np.maximum(branch_protected[soma_mask], arr[soma_mask] * 0.95)
+
+    restored = stage_restore_branches_near_bright_pixels(arr, branch_protected)
+    restored = stage_speckle_control(restored, branch_map, cfg, "green")
+    return np.clip(restored, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def enhance_microglia_background(
+    volume: np.ndarray,
+    config: PreprocessConfig | None = None,
+    method: str = "microglia_preserve",
+) -> np.ndarray:
+    cfg = config or PreprocessConfig()
+    arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
+    if arr.ndim != 3:
+        raise ValueError(f"Microglia volume must be 3D (z, y, x), got {arr.shape}")
+    if arr.size == 0:
+        return arr.copy()
+    return _enhance_microglia_core(arr, cfg, method)
 
 
 def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> ChannelVolume:

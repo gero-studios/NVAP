@@ -36,6 +36,7 @@ from nvap.cache.processed_cache import (
     save_processed_dataset,
 )
 from nvap.config.types import (
+    ChannelVolume,
     DEFAULT_SPACING,
     DatasetVolume,
     MeshExportConfig,
@@ -60,7 +61,7 @@ from nvap.analysis.microglia_components import (
     filter_components_by_preferred_voxel_floor,
     isolate_component,
 )
-from nvap.preprocess.enhancement import preprocess_dataset
+from nvap.preprocess.enhancement import enhance_microglia_background, preprocess_dataset
 from nvap.plugins.registry import discover_plugins
 from nvap.render.vtk_scene import VTKScene
 from nvap.ui.control_panel import ControlPanel
@@ -219,6 +220,7 @@ class MainWindow(QMainWindow):
         self.controls.psf_config_changed.connect(self._on_psf_config_changed)
         self.controls.render_config_changed.connect(self._on_render_config_changed)
         self.controls.microglia_view_changed.connect(self._on_microglia_view_changed)
+        self.controls.enhance_microglia_requested.connect(self._on_enhance_microglia_requested)
         self.controls.run_microglia_analysis_requested.connect(
             self._on_run_microglia_analysis_requested
         )
@@ -1341,25 +1343,84 @@ class MainWindow(QMainWindow):
 
         return {"red": red_source, "green": green_source}
 
+    def _prompt_load_source_mode(self) -> str | None:
+        chooser = QMessageBox(self)
+        chooser.setWindowTitle("Open Dataset")
+        chooser.setText("Choose how to load images.")
+        chooser.setInformativeText(
+            "Use folder process for an auto-detected dataset folder, or select individual red/green TIFF files or sequence folders."
+        )
+        folder_btn = chooser.addButton("Folder Process", QMessageBox.ButtonRole.AcceptRole)
+        manual_btn = chooser.addButton("Individual TIFF/Sequence", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = chooser.addButton(QMessageBox.StandardButton.Cancel)
+        chooser.exec()
+
+        clicked = chooser.clickedButton()
+        if clicked is None or clicked == cancel_btn:
+            return None
+        if clicked == manual_btn:
+            return "manual"
+        if clicked == folder_btn:
+            return "folder"
+        return None
+
     def _on_load_requested(self) -> None:
         base = self.dataset_root or (Path.cwd() / "Input")
-        channel_overrides = self._prompt_channel_sources_in_order(base)
-        if channel_overrides is None:
+        load_mode = self._prompt_load_source_mode()
+        if load_mode is None:
             return
-
+        channel_overrides: dict[str, str] | None = None
         channel_dirs: dict[str, Path]
-        first_red = Path(channel_overrides["red"]).resolve()
-        self.dataset_root = first_red.parent
-        self._log_info(
-            f"Channel sources selected: red={Path(channel_overrides['red']).resolve()} "
-            f"green={Path(channel_overrides['green']).resolve()}"
-        )
-        channel_dirs = resolve_channel_dirs(self.dataset_root, channel_overrides=channel_overrides)
+
+        if load_mode == "folder":
+            selected = QFileDialog.getExistingDirectory(
+                self,
+                "Select Dataset Folder",
+                str(base),
+            )
+            if not selected:
+                return
+            root = Path(selected).resolve()
+            try:
+                channel_dirs = resolve_channel_dirs(root)
+                self.dataset_root = root
+                self._log_dataset_detection(root, channel_dirs)
+            except FileNotFoundError as exc:
+                self._log_info(f"Auto-detection failed for {root}: {exc}")
+                use_manual = QMessageBox.question(
+                    self,
+                    "Dataset Channels Not Found",
+                    (
+                        "NVAP could not auto-detect red/green channels in the selected folder.\n\n"
+                        "Select individual red/green TIFF files or sequence folders instead?"
+                    ),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if use_manual != QMessageBox.StandardButton.Yes:
+                    return
+                load_mode = "manual"
+                base = root
+
+        if load_mode == "manual":
+            channel_overrides = self._prompt_channel_sources_in_order(base)
+            if channel_overrides is None:
+                return
+            first_red = Path(channel_overrides["red"]).resolve()
+            self.dataset_root = first_red.parent if first_red.is_file() else first_red
+            self._log_info(
+                f"Manual channel sources selected: red={Path(channel_overrides['red']).resolve()} "
+                f"green={Path(channel_overrides['green']).resolve()}"
+            )
+            channel_dirs = resolve_channel_dirs(self.dataset_root, channel_overrides=channel_overrides)
+            self._log_dataset_detection(self.dataset_root, channel_dirs, manual=True)
 
         self._dataset_signature = build_dataset_signature(channel_dirs)
         self._log_debug(f"Dataset signature set: {self._dataset_signature}")
 
         root = self.dataset_root
+        if root is None:
+            return
         preprocess_cfg = self.controls.current_preprocess_config()
         self.preprocess_config = preprocess_cfg
         psf_cfg = self._effective_psf_config(self.current_psf)
@@ -1381,6 +1442,32 @@ class MainWindow(QMainWindow):
             eta_total_seconds=eta_seconds,
             eta_kind="load",
         )
+
+    def _log_dataset_detection(
+        self,
+        root: Path,
+        channel_dirs: dict[str, Path],
+        *,
+        manual: bool = False,
+    ) -> None:
+        mode = "Manual" if manual else "Auto"
+        self._log_info(
+            f"{mode} dataset sources: root={root} "
+            f"green={channel_dirs['green']} red={channel_dirs['red']}"
+        )
+        try:
+            stats = inspect_dataset_stats(root, channel_overrides=channel_dirs)
+        except Exception as exc:
+            self._log_info(f"{mode} dataset stats unavailable: {exc}")
+            self.statusBar().showMessage(f"{mode}-detected dataset sources.", 5000)
+            return
+        summary = (
+            f"{mode}-detected dataset: green/microglia {stats.green.slice_count} slice(s), "
+            f"red/vasculature {stats.red.slice_count} slice(s), "
+            f"shared z {stats.shared_z_range[0]}-{stats.shared_z_range[1]}"
+        )
+        self._log_info(summary)
+        self.statusBar().showMessage(summary, 8000)
 
     def _background_load_dataset(
         self,
@@ -1454,6 +1541,7 @@ class MainWindow(QMainWindow):
         self._publish_busy_progress(percent=97.0, message="Applying initial thresholds + metrics...")
         self._set_busy_message("Applying initial thresholds and computing metrics...")
         self.controls.set_threshold_defaults(result.threshold_green, result.threshold_red)
+        self.controls.set_microglia_enhancement_enabled(True)
         self.scene.apply_render_config(self.current_render)
         self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Load complete.")
@@ -1474,6 +1562,7 @@ class MainWindow(QMainWindow):
         self._push_scene_channels()
         self._publish_busy_progress(percent=98.0, message="Refreshing render + metrics...")
         self._set_busy_message("Refreshing render + metrics...")
+        self.controls.set_microglia_enhancement_enabled(True)
         self.scene.apply_render_config(self.current_render)
         self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Processing complete.")
@@ -1745,6 +1834,75 @@ class MainWindow(QMainWindow):
             # Ignore slider/index changes while isolate mode is already disabled.
             return
         self.scene.apply_render_config(self.current_render)
+
+    def _on_enhance_microglia_requested(self) -> None:
+        if self.processed_dataset is None:
+            self._show_error("No dataset", "Load and render a dataset before enhancing microglia.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+
+        dataset = self.processed_dataset
+        preprocess_cfg = self.preprocess_config
+        enhancement_method = self.controls.current_microglia_enhancement_method()
+        eta_seconds = self._estimate_microglia_separation_eta_seconds(
+            dataset.green.data.shape,
+            float(self.controls.current_microglia_branch_sensitivity()),
+        )
+
+        def _enhance_task() -> DatasetVolume:
+            self._publish_busy_progress(percent=8.0, message="Estimating green background...")
+            enhanced_green = enhance_microglia_background(
+                dataset.green.data,
+                preprocess_cfg,
+                method=enhancement_method,
+            )
+            self._publish_busy_progress(percent=86.0, message="Updating enhanced dataset...")
+            return DatasetVolume(
+                green=ChannelVolume(
+                    name="green",
+                    data=enhanced_green,
+                    z_indices=list(dataset.green.z_indices),
+                    spacing=dataset.green.spacing,
+                ),
+                red=dataset.red,
+                shared_z_range=dataset.shared_z_range,
+            )
+
+        self._start_background_task(
+            title="Enhance Microglia",
+            message=f"Enhancing microglia with {enhancement_method}...",
+            fn=_enhance_task,
+            on_success=self._on_enhance_microglia_success,
+            error_title="Microglia enhancement failed",
+            success_status="Microglia enhancement complete.",
+            eta_total_seconds=eta_seconds,
+            eta_kind="microglia-separation",
+        )
+
+    def _on_enhance_microglia_success(self, result: object) -> None:
+        if not isinstance(result, DatasetVolume):
+            raise TypeError("Invalid microglia enhancement result payload.")
+        self._publish_busy_progress(percent=90.0, message="Preparing enhanced render...")
+        self.processed_dataset = result
+        self._mark_metrics_dirty()
+        self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
+        self.latest_microglia_report = None
+        self.controls.clear_microglia_analysis_table()
+        self._invalidate_microglia_components()
+        self._push_scene_channels()
+        threshold_green = default_green_threshold(result.green.data)
+        threshold_red = default_threshold(result.red.data)
+        self.controls.set_threshold_defaults(threshold_green, threshold_red)
+        self._publish_busy_progress(percent=98.0, message="Refreshing enhanced render...")
+        self.scene.apply_render_config(self.current_render)
+        self._refresh_metrics()
+        self._publish_busy_progress(percent=100.0, message="Microglia enhancement complete.")
+        self._log_info(
+            "Microglia enhancement applied: "
+            f"green_shape={result.green.data.shape} thresholds=(green={threshold_green:.4f}, red={threshold_red:.4f})"
+        )
 
     def _refresh_metrics(self) -> None:
         if self.processed_dataset is None:
