@@ -88,6 +88,33 @@ def test_load_dataset_sorts_z_and_extracts_channels(tmp_path: Path) -> None:
     assert float(dataset.red.data[0, 0, 0]) < float(dataset.red.data[1, 0, 0])
 
 
+def test_load_dataset_from_wrapped_sequence_folder_ignores_exports(tmp_path: Path) -> None:
+    inner = tmp_path / "7951-3_M_CL_cortex_25X"
+    inner.mkdir()
+
+    for z, green, red in [(1, 30, 60), (2, 70, 120)]:
+        _write_rgb(inner / f"7951-3_M_CL_cortex_25X_z{z:03d}c1.png", r=0, g=green, b=0)
+        _write_rgb(inner / f"7951-3_M_CL_cortex_25X_z{z:03d}c2.png", r=red, g=0, b=0)
+        _write_mixed_rg(
+            inner / f"7951-3_M_CL_cortex_25X_z{z:03d}c1+2.png",
+            red=255,
+            green=255,
+        )
+        _write_rgb(inner / f"7951-3_M_CL_cortex_25X_z{z:03d}c1_ORG.png", r=0, g=255, b=0)
+        _write_rgb(inner / f"7951-3_M_CL_cortex_25X_z{z:03d}c2_ORG.png", r=255, g=0, b=0)
+
+    dataset = load_dataset(tmp_path, spacing=VoxelSpacing())
+
+    assert dataset.green.z_indices == [1, 2]
+    assert dataset.red.z_indices == [1, 2]
+    assert dataset.green.data.shape == (2, 8, 8)
+    assert dataset.red.data.shape == (2, 8, 8)
+    assert float(dataset.green.data[0, 0, 0]) == pytest.approx(30 / 255)
+    assert float(dataset.green.data[1, 0, 0]) == pytest.approx(70 / 255)
+    assert float(dataset.red.data[0, 0, 0]) == pytest.approx(60 / 255)
+    assert float(dataset.red.data[1, 0, 0]) == pytest.approx(120 / 255)
+
+
 def test_load_dataset_from_single_folder_combined_rgb_slices(tmp_path: Path) -> None:
     _write_mixed_rg(tmp_path / "sample_z002.png", red=60, green=20)
     _write_mixed_rg(tmp_path / "sample_z001.png", red=10, green=40)

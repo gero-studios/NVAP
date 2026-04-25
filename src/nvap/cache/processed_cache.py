@@ -10,7 +10,7 @@ from nvap.config.types import ChannelVolume, DatasetVolume, PSFConfig, Preproces
 
 logger = logging.getLogger(__name__)
 
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 CACHE_DIRNAME = ".nvap_cache"
 _SUPPORTED_IMAGE_EXTENSIONS = {".png", ".tif", ".tiff"}
 
@@ -67,7 +67,9 @@ def _source_signature(channel_source: Path) -> str:
         (
             p
             for p in channel_source.iterdir()
-            if p.is_file() and p.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS
+            if p.is_file()
+            and p.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS
+            and not p.stem.lower().endswith("_org")
         ),
         key=lambda p: p.name.lower(),
     )

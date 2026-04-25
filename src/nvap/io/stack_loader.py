@@ -18,7 +18,7 @@ FILE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 COMBINED_FILE_PATTERN = re.compile(
-    r"_z(?P<z>\d+)(?:c[12])?(?:\.png|\.tif|\.tiff)$",
+    r"_z(?P<z>\d+)(?:c1\+2)?(?:\.png|\.tif|\.tiff)$",
     re.IGNORECASE,
 )
 CHANNEL_DIR = {"green": "Green", "red": "Red"}
@@ -75,11 +75,32 @@ class DatasetStackStats:
 
 
 def _candidate_segmented_roots(input_root: Path) -> list[Path]:
-    return [
+    candidates = [
         input_root / "Segmented",
         input_root / "Input" / "Segmented",
         input_root,
     ]
+    if input_root.exists() and input_root.is_dir():
+        child_dirs = [child for child in input_root.iterdir() if child.is_dir()]
+        if len(child_dirs) == 1:
+            wrapper = child_dirs[0]
+            candidates.extend(
+                [
+                    wrapper / "Segmented",
+                    wrapper / "Input" / "Segmented",
+                    wrapper,
+                ]
+            )
+    return candidates
+
+
+def _is_supported_input_image(path: Path) -> bool:
+    if path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+        return False
+    stem = path.stem.lower()
+    if stem.endswith("_org"):
+        return False
+    return True
 
 
 def _find_channel_dir(segmented_root: Path, channel_name: str) -> Path | None:
@@ -115,7 +136,7 @@ def _extract_and_normalize_plane(image: np.ndarray, channel_name: str) -> np.nda
 
 def _iter_image_files(channel_source: Path) -> list[Path]:
     if channel_source.is_file():
-        if channel_source.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+        if _is_supported_input_image(channel_source):
             return [channel_source]
         return []
     if not channel_source.exists() or not channel_source.is_dir():
@@ -123,7 +144,7 @@ def _iter_image_files(channel_source: Path) -> list[Path]:
     files = [
         p
         for p in channel_source.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        if p.is_file() and _is_supported_input_image(p)
     ]
     files.sort(key=lambda p: p.name.lower())
     return files
@@ -274,6 +295,16 @@ def _list_channel_files(channel_source: Path, channel_name: str) -> list[tuple[i
         len(pairs),
     )
     return pairs
+
+
+def _has_exact_channel_sequence(channel_source: Path) -> bool:
+    found_channels: set[str] = set()
+    for file_path in _iter_image_files(channel_source):
+        match = FILE_PATTERN.search(file_path.name)
+        if not match:
+            continue
+        found_channels.add(match.group("channel").lower())
+    return {"c1", "c2"}.issubset(found_channels)
 
 
 def _load_volume_from_stack_file(stack_path: Path, channel_name: str) -> tuple[list[int], np.ndarray]:
@@ -557,11 +588,9 @@ def load_dataset(
 
     green_source = channel_dirs["green"]
     red_source = channel_dirs["red"]
-    combined = (
-        _load_combined_channels(green_source, spacing)
-        if green_source == red_source
-        else None
-    )
+    combined = None
+    if green_source == red_source and not _has_exact_channel_sequence(green_source):
+        combined = _load_combined_channels(green_source, spacing)
     if combined is not None:
         green, red = combined
     else:
@@ -611,6 +640,14 @@ def resolve_channel_dirs(
         for candidate in _candidate_segmented_roots(root):
             if not candidate.exists() or not candidate.is_dir():
                 continue
+            if _has_exact_channel_sequence(candidate):
+                channel_dirs["green"] = candidate
+                channel_dirs["red"] = candidate
+                logger.info(
+                    "Auto-detected exact c1/c2 sequence dataset under: %s",
+                    candidate,
+                )
+                return channel_dirs
             if _has_combined_rg_files(candidate):
                 channel_dirs["green"] = candidate
                 channel_dirs["red"] = candidate
