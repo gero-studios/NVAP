@@ -38,5 +38,17 @@ src/nvap/render/__init__.py
 src/nvap/render/vtk_scene.py
 src/nvap/ui/__init__.py
 src/nvap/ui/control_panel.py
+src/nvap/ui/design.py
+src/nvap/ui/home_page.py
+src/nvap/ui/icons.py
 src/nvap/ui/main_window.py
+src/nvap/ui/metrics_panel.py
+src/nvap/ui/sidebar_pages.py
 src/nvap/ui/theme.py
+src/nvap/ui/dialogs/__init__.py
+src/nvap/ui/dialogs/about.py
+src/nvap/ui/services/__init__.py
+src/nvap/ui/services/recent_projects.py
+src/nvap/ui/services/system_status.py
+src/nvap/ui/widgets/__init__.py
+src/nvap/ui/widgets/recent_projects_list.py

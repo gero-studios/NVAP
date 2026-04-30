@@ -611,6 +611,26 @@ def _rolling_ball_slicewise(volume: np.ndarray, radius: int) -> np.ndarray:
     return out
 
 
+def _imagej_rolling_ball_slicewise(
+    volume: np.ndarray,
+    *,
+    radius: int = 5,
+    multiplier: float = 1.5,
+) -> np.ndarray:
+    """ImageJ-style Subtract Background followed by Multiply.
+
+    Matches the requested macro sequence:
+    run("Subtract Background...", "rolling=5 sliding");
+    run("Multiply...", "value=1.5");
+    """
+    subtracted = _rolling_ball_slicewise(volume, radius=int(radius))
+    return np.clip(
+        subtracted * float(multiplier),
+        0.0,
+        1.0,
+    ).astype(np.float32, copy=False)
+
+
 def _basic_style_correction(volume: np.ndarray) -> np.ndarray:
     arr = np.asarray(volume, dtype=np.float32)
     dark = np.percentile(arr, 2.0, axis=0).astype(np.float32, copy=False)
@@ -642,7 +662,7 @@ def _enhance_microglia_core(
     sigma_xy = float(max(18.0, cfg.flatfield_sigma_xy))
     radius = int(np.clip(round(sigma_xy * 0.60), 8, 32))
     if method == "imagej_rolling_ball":
-        enhanced = _normalize_positive_detail(_rolling_ball_slicewise(arr, radius=radius))
+        enhanced = _imagej_rolling_ball_slicewise(arr, radius=5, multiplier=1.5)
     elif method == "basic":
         enhanced = _basic_style_correction(arr)
     elif method == "cidre":
@@ -650,7 +670,12 @@ def _enhance_microglia_core(
     elif method == "white_tophat":
         enhanced = _normalize_positive_detail(_white_tophat_slicewise(arr, radius=radius))
     elif method == "clahe":
-        enhanced = _clahe_slicewise(_normalize_positive_detail(arr), clip_limit=0.01)
+        background = ndi.gaussian_filter(arr, sigma=(0.0, sigma_xy, sigma_xy), mode="nearest")
+        detail = _normalize_positive_detail(arr - (0.88 * background))
+        if float(np.max(detail)) <= 1.0e-6:
+            return arr.copy()
+        contrast = _clahe_slicewise(detail, clip_limit=0.01)
+        enhanced = np.maximum(detail, contrast * 0.75).astype(np.float32, copy=False)
     elif method == "microglia_preserve":
         background = ndi.gaussian_filter(arr, sigma=(0.0, sigma_xy, sigma_xy), mode="nearest")
         bg_detail = _normalize_positive_detail(arr - (0.88 * background))
@@ -687,6 +712,12 @@ def _enhance_microglia_core(
 
     restored = stage_restore_branches_near_bright_pixels(arr, branch_protected)
     restored = stage_speckle_control(restored, branch_map, cfg, "green")
+    if np.any(soma_mask):
+        soma_floor = max(float(np.percentile(restored, 99.0)) * 0.94, 0.84)
+        restored[soma_mask] = np.maximum(
+            restored[soma_mask],
+            np.maximum(arr[soma_mask] * 1.35, soma_floor),
+        )
     return np.clip(restored, 0.0, 1.0).astype(np.float32, copy=False)
 
 

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QScrollArea, QSplitter
+from PySide6.QtWidgets import QScrollArea
 
 from nvap.analysis.microglia_vessel_report import MicrogliaCellReport, MicrogliaCellReportRow
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig, PSFConfig, VoxelSpacing
 from nvap.ui.main_window import MainWindow
 from nvap.ui.control_panel import ControlPanel
+from nvap.ui.services.project_files import load_project_state, save_project_state
 
 
 def _sample_report() -> MicrogliaCellReport:
@@ -126,14 +128,11 @@ def test_main_window_wraps_control_panel_in_scroll_area(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
 
-    splitter = window.centralWidget()
-    assert isinstance(splitter, QSplitter)
-    assert splitter.count() == 2
-
-    scroll_area = splitter.widget(0)
-    assert isinstance(scroll_area, QScrollArea)
-    assert scroll_area.widget() is window.controls
-    assert scroll_area.widgetResizable()
+    # controls is always wrapped in a resizable scroll area (sidebar shell
+    # means centralWidget is no longer the splitter directly)
+    assert isinstance(window.controls_scroll, QScrollArea)
+    assert window.controls_scroll.widget() is window.controls
+    assert window.controls_scroll.widgetResizable()
 
 
 def test_main_window_cache_hit_skips_preprocess(qtbot, monkeypatch) -> None:
@@ -141,8 +140,15 @@ def test_main_window_cache_hit_skips_preprocess(qtbot, monkeypatch) -> None:
     qtbot.addWidget(window)
     dataset = _sample_dataset()
     cached = _sample_dataset()
+    window.dataset_root = Path.cwd()
 
-    monkeypatch.setattr("nvap.ui.main_window.load_processed_dataset", lambda *_args, **_kwargs: cached)
+    cache_base_dirs: list[object] = []
+
+    def _load_cache(*_args, **kwargs):
+        cache_base_dirs.append(kwargs.get("base_dir"))
+        return cached
+
+    monkeypatch.setattr("nvap.ui.main_window.load_processed_dataset", _load_cache)
 
     def _unexpected_preprocess(*_args, **_kwargs):
         raise AssertionError("preprocess_dataset should not run on cache hits")
@@ -158,6 +164,75 @@ def test_main_window_cache_hit_skips_preprocess(qtbot, monkeypatch) -> None:
     )
 
     assert result is cached
+    assert cache_base_dirs == [Path.cwd()]
+
+
+def test_main_window_cache_save_uses_project_root(qtbot, monkeypatch, tmp_path) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _sample_dataset()
+    window.dataset_root = tmp_path
+
+    monkeypatch.setattr("nvap.ui.main_window.load_processed_dataset", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("nvap.ui.main_window.preprocess_dataset", lambda data, _cfg: data)
+    monkeypatch.setattr("nvap.ui.main_window.apply_psf_to_dataset", lambda data, *_args, **_kwargs: data)
+    saved_base_dirs: list[object] = []
+
+    def _save_cache(_key, _dataset, **kwargs):
+        saved_base_dirs.append(kwargs.get("base_dir"))
+        return tmp_path / ".nvap_cache" / "processed_test.npz"
+
+    monkeypatch.setattr("nvap.ui.main_window.save_processed_dataset", _save_cache)
+
+    result = window._get_processed_dataset_with_cache(
+        dataset,
+        PSFConfig(enabled=False, iterations=0),
+        PreprocessConfig(),
+        dataset_signature="sig",
+        cancel_event=None,
+    )
+
+    assert result is dataset
+    assert saved_base_dirs == [tmp_path]
+
+
+def test_recent_project_opens_saved_sources_without_prompt(qtbot, monkeypatch, tmp_path) -> None:
+    project_root = tmp_path / "project"
+    green = project_root / "Segmented" / "Green"
+    red = project_root / "Segmented" / "Red"
+    green.mkdir(parents=True)
+    red.mkdir(parents=True)
+    save_project_state(
+        project_root,
+        channel_sources={"green": green, "red": red},
+        dataset_signature="abc",
+        load_mode="manual",
+        spacing=VoxelSpacing(),
+        psf_config=PSFConfig(enabled=False, iterations=0),
+        preprocess_config=PreprocessConfig(),
+        cache_key="cache123",
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    started: list[tuple[Path, dict[str, object]]] = []
+
+    def _start(root, **kwargs):
+        started.append((root, kwargs))
+
+    monkeypatch.setattr(window, "_start_dataset_load", _start)
+    monkeypatch.setattr(window, "_prompt_load_source_mode", lambda: (_ for _ in ()).throw(AssertionError("prompted")))
+
+    window._open_recent_project(str(project_root))
+
+    assert started
+    assert started[0][0] == project_root.resolve()
+    assert started[0][1]["load_mode"] == "manual"
+    assert started[0][1]["channel_overrides"] == {
+        "green": str(green.resolve()),
+        "red": str(red.resolve()),
+    }
+    assert load_project_state(project_root) is not None
 
 
 def test_main_window_opacity_change_skips_metrics_refresh(qtbot, monkeypatch) -> None:

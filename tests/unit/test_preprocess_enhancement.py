@@ -3,7 +3,12 @@ from __future__ import annotations
 import numpy as np
 
 from nvap.config.types import ChannelVolume, PreprocessConfig, VoxelSpacing
-from nvap.preprocess.enhancement import enhance_microglia_background, preprocess_channel
+from nvap.preprocess.enhancement import (
+    _imagej_rolling_ball_slicewise,
+    _rolling_ball_slicewise,
+    enhance_microglia_background,
+    preprocess_channel,
+)
 
 
 def test_preprocess_preserves_thin_branch_signal() -> None:
@@ -89,3 +94,48 @@ def test_all_microglia_enhancement_methods_run() -> None:
         assert out.shape == arr.shape
         assert out.dtype == np.float32
         assert float(out.max()) > 0.0
+
+
+def test_imagej_rolling_ball_process_uses_radius_5_and_multiply_1_5() -> None:
+    yy, xx = np.mgrid[0:32, 0:32]
+    arr = (0.08 + 0.03 * (xx / 31.0)).astype(np.float32)
+    stack = np.repeat(arr[np.newaxis, ...], 2, axis=0)
+    stack[0, 16, 10:22] += 0.25
+    stack[1, 12:20, 12:20] += 0.35
+    stack = np.clip(stack, 0.0, 1.0)
+
+    out = _imagej_rolling_ball_slicewise(stack)
+    expected = np.clip(_rolling_ball_slicewise(stack, radius=5) * 1.5, 0.0, 1.0)
+
+    assert out.dtype == np.float32
+    assert np.allclose(out, expected)
+
+
+def test_all_microglia_enhancement_methods_preserve_microglia_features() -> None:
+    yy, xx = np.mgrid[0:64, 0:64]
+    smooth_background = (0.08 + 0.035 * (xx / 63.0) + 0.018 * np.sin(yy / 9.0)).astype(
+        np.float32
+    )
+    arr = np.repeat(smooth_background[np.newaxis, ...], 4, axis=0)
+    arr[1:3, 31, 9:55] += 0.14
+    arr[2, 22:33, 25:36] += 0.36
+    arr += 0.004 * np.random.default_rng(11).random(arr.shape, dtype=np.float32)
+    arr = np.clip(arr, 0.0, 1.0)
+
+    cfg = PreprocessConfig(flatfield_sigma_xy=12.0, preserve_branches=True)
+
+    for method in (
+        "microglia_preserve",
+        "imagej_rolling_ball",
+        "basic",
+        "cidre",
+        "white_tophat",
+        "clahe",
+    ):
+        out = enhance_microglia_background(arr, cfg, method=method)
+        branch_signal = float(out[1:3, 31, 12:52].mean())
+        soma_signal = float(out[2, 24:31, 27:34].mean())
+        background_signal = float(out[:, 3:14, 3:14].mean())
+
+        assert branch_signal > background_signal * 2.0, method
+        assert soma_signal >= branch_signal * 0.95, method

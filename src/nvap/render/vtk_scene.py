@@ -4,6 +4,7 @@ import colorsys
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import time
 
 import numpy as np
 from PySide6.QtCore import Qt
@@ -14,12 +15,16 @@ from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkFiltersCore import vtkMarchingCubes
 from vtkmodules.vtkImagingCore import vtkImageResample
 from vtkmodules.vtkIOImage import vtkPNGWriter
+from vtkmodules.vtkInteractionWidgets import vtkOrientationMarkerWidget
+from vtkmodules.vtkRenderingAnnotation import vtkAxesActor, vtkLegendScaleActor
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
     vtkColorTransferFunction,
+    vtkLight,
     vtkPolyDataMapper,
     vtkRenderWindow,
     vtkRenderer,
+    vtkTextActor,
     vtkVolume,
     vtkVolumeProperty,
     vtkWindowToImageFilter,
@@ -168,9 +173,12 @@ class VTKScene:
         self._render_window: vtkRenderWindow = self._widget.GetRenderWindow()
         self._renderer = vtkRenderer()
         self._render_window.AddRenderer(self._renderer)
-        self._renderer.SetBackground(0.04, 0.04, 0.06)
+        self._renderer.SetBackground(0.025, 0.030, 0.042)
+        self._renderer.SetBackground2(0.075, 0.082, 0.110)
+        self._renderer.SetGradientBackground(True)
         # Better rendering quality
         self._render_window.SetMultiSamples(4)  # Anti-aliasing
+        self._render_window.SetAlphaBitPlanes(1)
         self._widget.setFocusPolicy(Qt.StrongFocus)
         self._widget.setMouseTracking(True)
 
@@ -183,9 +191,24 @@ class VTKScene:
         self._current = RenderConfig()
         self._component_coloring: dict[str, int] = {}
         self._debug_overlay_actors: list[vtkActor] = []
+        self._last_render_time = time.perf_counter()
+        self._fps_actor = self._build_fps_actor()
+        self._scale_actor = vtkLegendScaleActor()
+        self._scale_actor.SetLegendVisibility(False)
+        self._scale_actor.SetTopAxisVisibility(False)
+        self._scale_actor.SetRightAxisVisibility(False)
+        self._scale_actor.GetBottomAxis().SetTitle("scale")
+        self._scale_actor.GetBottomAxis().GetProperty().SetColor(0.72, 0.76, 0.82)
+        self._scale_actor.GetBottomAxis().GetLabelTextProperty().SetColor(0.72, 0.76, 0.82)
+        self._scale_actor.GetBottomAxis().GetTitleTextProperty().SetColor(0.86, 0.74, 0.45)
+        self._renderer.AddViewProp(self._fps_actor)
+        self._renderer.AddActor(self._scale_actor)
+        self._configure_lighting()
 
         self._interactor.Initialize()
         self._interactor.Enable()
+        self._orientation_marker = self._build_orientation_marker()
+        self._render_window.AddObserver("EndEvent", self._update_fps_overlay)
         self._interactor.Start()
         logger.info("VTK interactor initialized with TrackballCamera style.")
 
@@ -203,6 +226,73 @@ class VTKScene:
         self.render()
         self.activate_interaction()
         logger.debug("VTK camera reset.")
+
+    def _configure_lighting(self) -> None:
+        self._renderer.RemoveAllLights()
+        self._renderer.SetAmbient(0.16, 0.17, 0.20)
+
+        key = vtkLight()
+        key.SetLightTypeToCameraLight()
+        key.SetIntensity(0.78)
+        key.SetPosition(1.0, 1.2, 1.0)
+        key.SetFocalPoint(0.0, 0.0, 0.0)
+        self._renderer.AddLight(key)
+
+        fill = vtkLight()
+        fill.SetLightTypeToSceneLight()
+        fill.SetIntensity(0.32)
+        fill.SetPosition(-2.0, -1.0, 1.4)
+        fill.SetFocalPoint(0.0, 0.0, 0.0)
+        fill.SetColor(0.78, 0.84, 1.0)
+        self._renderer.AddLight(fill)
+
+        rim = vtkLight()
+        rim.SetLightTypeToSceneLight()
+        rim.SetIntensity(0.24)
+        rim.SetPosition(1.5, -2.0, 2.0)
+        rim.SetFocalPoint(0.0, 0.0, 0.0)
+        rim.SetColor(1.0, 0.88, 0.62)
+        self._renderer.AddLight(rim)
+
+    def _build_orientation_marker(self) -> vtkOrientationMarkerWidget:
+        axes = vtkAxesActor()
+        axes.SetTotalLength(1.0, 1.0, 1.0)
+        axes.SetShaftTypeToCylinder()
+        axes.SetCylinderRadius(0.035)
+        axes.SetConeRadius(0.18)
+        axes.GetXAxisCaptionActor2D().GetCaptionTextProperty().SetColor(0.86, 0.40, 0.44)
+        axes.GetYAxisCaptionActor2D().GetCaptionTextProperty().SetColor(0.38, 0.82, 0.58)
+        axes.GetZAxisCaptionActor2D().GetCaptionTextProperty().SetColor(0.60, 0.70, 1.0)
+
+        marker = vtkOrientationMarkerWidget()
+        marker.SetOrientationMarker(axes)
+        marker.SetInteractor(self._interactor)
+        marker.SetViewport(0.012, 0.012, 0.16, 0.16)
+        marker.SetEnabled(1)
+        marker.InteractiveOff()
+        return marker
+
+    @staticmethod
+    def _build_fps_actor() -> vtkTextActor:
+        actor = vtkTextActor()
+        actor.SetInput("FPS --")
+        actor.SetDisplayPosition(14, 14)
+        prop = actor.GetTextProperty()
+        prop.SetFontFamilyToArial()
+        prop.SetFontSize(12)
+        prop.SetBold(False)
+        prop.SetColor(0.86, 0.74, 0.45)
+        prop.SetBackgroundColor(0.02, 0.025, 0.035)
+        prop.SetBackgroundOpacity(0.62)
+        prop.SetFrame(True)
+        prop.SetFrameColor(0.18, 0.22, 0.28)
+        return actor
+
+    def _update_fps_overlay(self, *_args) -> None:
+        now = time.perf_counter()
+        elapsed = max(1.0e-6, now - self._last_render_time)
+        self._last_render_time = now
+        self._fps_actor.SetInput(f"FPS {1.0 / elapsed:4.1f}")
 
     def clear_debug_overlays(self) -> None:
         for actor in self._debug_overlay_actors:
@@ -714,11 +804,16 @@ class VTKScene:
             color_tf.AddRGBPoint(x + 0.49, red, green, blue)
         return color_tf
 
-    def capture_snapshot(self, output_path: str | Path) -> Path:
+    def capture_snapshot(self, output_path: str | Path, *, scale: int = 2) -> Path:
         path = Path(output_path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.render()
         to_image = vtkWindowToImageFilter()
         to_image.SetInput(self._render_window)
+        if hasattr(to_image, "SetScale"):
+            to_image.SetScale(max(1, int(scale)))
+        if hasattr(to_image, "FixBoundaryOn"):
+            to_image.FixBoundaryOn()
         to_image.ReadFrontBufferOff()
         to_image.Update()
 
@@ -741,6 +836,8 @@ class VTKScene:
         self._actors.clear()
         self._spacing.clear()
         if self._interactor is not None:
+            if hasattr(self, "_orientation_marker"):
+                self._orientation_marker.SetEnabled(0)
             self._interactor.TerminateApp()
         if self._render_window is not None:
             self._render_window.Finalize()

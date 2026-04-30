@@ -12,14 +12,29 @@ from typing import Callable
 import numpy as np
 import scipy.ndimage as ndi
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
@@ -65,6 +80,19 @@ from nvap.preprocess.enhancement import enhance_microglia_background, preprocess
 from nvap.plugins.registry import discover_plugins
 from nvap.render.vtk_scene import VTKScene
 from nvap.ui.control_panel import ControlPanel
+from nvap.ui.design import COLOR, ICON_LG, ICON_MD, ICON_SM, SIDEBAR_WIDTH, SPACE
+from nvap.ui.dialogs.about import AboutDialog
+from nvap.ui.home_page import HomePage
+from nvap.ui.icons import icon, icon_pixmap
+from nvap.ui.metrics_panel import MetricsPanel
+from nvap.ui.services.recent_projects import RecentProjectsStore
+from nvap.ui.services.project_files import (
+    load_project_state,
+    project_channel_sources,
+    save_project_state,
+)
+from nvap.ui.services.system_status import SystemStatus, gpu_status, memory_status
+from nvap.ui.sidebar_pages import SettingsPage
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +119,34 @@ class _MicrogliaComponentsTaskResult:
     threshold: float
     branch_sensitivity: float
     shape: tuple[int, int, int]
+
+
+class _AnalyticsMetricCard(QFrame):
+    def __init__(self, label: str, value: str = "--", helper: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("analyticsMetricCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(6)
+
+        self._value = QLabel(value)
+        self._value.setObjectName("analyticsMetricValue")
+        self._value.setWordWrap(True)
+        layout.addWidget(self._value)
+
+        caption = QLabel(label)
+        caption.setObjectName("analyticsMetricLabel")
+        caption.setWordWrap(True)
+        layout.addWidget(caption)
+
+        self._helper = QLabel(helper)
+        self._helper.setObjectName("analyticsMetricHelper")
+        self._helper.setWordWrap(True)
+        layout.addWidget(self._helper)
+
+    def set_value(self, value: str, helper: str = "") -> None:
+        self._value.setText(value)
+        self._helper.setText(helper)
 
 
 class _LogBridge(QObject):
@@ -144,22 +200,73 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("NVAP - NeuroVascular Analytics Program")
-        self.resize(1540, 920)
+        self.setWindowTitle("NVAP — NeuroVascular Analytics Program")
+        self.resize(1600, 960)
 
+        # ── Core analysis widgets ────────────────────────────────────────
         self.scene = VTKScene(self)
         self.controls = ControlPanel(self)
         self.controls_scroll = QScrollArea(self)
         self.controls_scroll.setObjectName("controlPanelScrollArea")
         self.controls_scroll.setWidgetResizable(True)
-        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.controls_scroll.setWidget(self.controls)
-        splitter = QSplitter(self)
-        splitter.addWidget(self.controls_scroll)
-        splitter.addWidget(self.scene.widget())
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        self.setCentralWidget(splitter)
+
+        # Workspace splitter: inspector | VTK viewport | metrics
+        self._workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._workspace_splitter.addWidget(self.controls_scroll)
+        self._workspace_splitter.addWidget(self.scene.widget())
+        self._workspace_splitter.setStretchFactor(0, 0)
+        self._workspace_splitter.setStretchFactor(1, 1)
+
+        # ── Project store + pages ────────────────────────────────────────
+        self._project_store = RecentProjectsStore()
+        self._home_page = HomePage(self._project_store)
+        self._settings_page = SettingsPage()
+        self._metrics_panel = MetricsPanel()
+        self._analytics_page = self._build_analytics_placeholder()
+
+        self._page_stack = QStackedWidget()
+        self._page_stack.addWidget(self._home_page)           # 0
+        self._page_stack.addWidget(self._workspace_splitter)  # 1
+        self._page_stack.addWidget(self._analytics_page)      # 2
+        self._page_stack.addWidget(self._settings_page)       # 3
+
+        # ── Sidebar + shell ──────────────────────────────────────────────
+        self._sidebar = self._build_sidebar()
+        shell = QFrame()
+        shell.setObjectName("appShell")
+        shell_lo = QHBoxLayout(shell)
+        shell_lo.setContentsMargins(0, 0, 0, 0)
+        shell_lo.setSpacing(0)
+        shell_lo.addWidget(self._sidebar)
+        shell_lo.addWidget(self._page_stack, 1)
+        self.setCentralWidget(shell)
+
+        # Wire home page actions
+        self._home_page.new_project_requested.connect(self._on_load_requested)
+        self._home_page.open_project_requested.connect(self._on_load_requested)
+        self._home_page.import_stack_requested.connect(self._on_load_requested)
+        self._home_page.browse_samples_requested.connect(self._on_load_requested)
+        self._home_page.project_open_requested.connect(self._open_recent_project)
+        # project_remove_requested is handled internally by HomePage; we only
+        # need to wire pin-toggle so the store stays in sync.
+        self._home_page.project_pin_toggled.connect(self._pin_recent_project)
+
+        # Wire settings page actions
+        self._settings_page.open_workspace_requested.connect(
+            lambda: self._nav_to(1)
+        )
+        self._settings_page.open_analytics_requested.connect(
+            lambda: self._nav_to(2)
+        )
+
+        # Wire metrics panel
+        self._metrics_panel.view_details_requested.connect(lambda: self._nav_to(2))
+
+        # Start on home page
+        self._nav_to(0)
+        self._home_page.refresh_projects()
 
         self.spacing = DEFAULT_SPACING
         self.preprocess_config = PreprocessConfig(enabled=True)
@@ -175,6 +282,9 @@ class MainWindow(QMainWindow):
         self.latest_microglia_report: MicrogliaCellReport | None = None
         self.dataset_root: Path | None = None
         self._dataset_signature: str | None = None
+        self._current_channel_sources: dict[str, str] | None = None
+        self._current_load_mode = "folder"
+        self._last_processed_cache_key: str | None = None
         self._busy_dialog: QProgressDialog | None = None
         self._busy_start = 0.0
         self._busy_base_message = ""
@@ -237,8 +347,11 @@ class MainWindow(QMainWindow):
         self._setup_keyboard_shortcuts()
 
         self._refresh_plugin_panel()
+        self._home_page.refresh_projects()
+        QTimer.singleShot(0, self._refresh_system_indicators)
         self.statusBar().showMessage("Load a dataset to begin. Preprocessing is ON by default.")
         self._log_info("NVAP UI initialized: green pass-through mode active.")
+        self._refresh_section_state()
 
     def closeEvent(self, event) -> None:
         if self._active_thread is not None and self._active_thread.isRunning():
@@ -254,8 +367,6 @@ class MainWindow(QMainWindow):
 
     def _setup_keyboard_shortcuts(self) -> None:
         """Setup keyboard shortcuts for common operations."""
-        from PySide6.QtGui import QAction, QKeySequence
-
         # Load dataset
         load_action = QAction("Load Dataset", self)
         load_action.setShortcut(QKeySequence("Ctrl+L"))
@@ -311,6 +422,429 @@ class MainWindow(QMainWindow):
 
     def _log_debug(self, message: str) -> None:
         logger.debug(message)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Sidebar & navigation
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_sidebar(self) -> QFrame:
+        """Construct the left navigation sidebar."""
+        sidebar = QFrame()
+        sidebar.setObjectName("appSidebar")
+        sidebar.setFixedWidth(SIDEBAR_WIDTH)
+
+        lo = QVBoxLayout(sidebar)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.setSpacing(0)
+
+        # ── Logotype ────────────────────────────────────────────────────
+        logo_row = QFrame()
+        logo_row.setObjectName("sidebarLogo")
+        logo_lo = QHBoxLayout(logo_row)
+        logo_lo.setContentsMargins(16, 18, 16, 14)
+        logo_lo.setSpacing(8)
+
+        logo_icon = QLabel()
+        logo_icon.setPixmap(icon_pixmap("logo", 22, COLOR.accent))
+        logo_icon.setFixedSize(24, 24)
+        logo_icon.setScaledContents(True)
+        logo_lo.addWidget(logo_icon)
+
+        app_lbl = QLabel("NVAP")
+        app_lbl.setObjectName("sidebarAppName")
+        logo_lo.addWidget(app_lbl, 1)
+        lo.addWidget(logo_row)
+
+        # ── Nav separator ────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setObjectName("sidebarSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lo.addWidget(sep)
+
+        # ── Navigation buttons ───────────────────────────────────────────
+        nav_lo = QVBoxLayout()
+        nav_lo.setContentsMargins(8, 8, 8, 8)
+        nav_lo.setSpacing(2)
+
+        _nav_items = [
+            ("home",      "Home",      0),
+            ("layers",    "Workspace", 1),
+            ("bar-chart", "Analytics", 2),
+            ("settings",  "Settings",  3),
+        ]
+        self._nav_buttons: list[QPushButton] = []
+        for icon_name, label, page_idx in _nav_items:
+            btn = QPushButton(f"  {label}")
+            btn.setObjectName("navButton")
+            btn.setIcon(icon(icon_name, ICON_MD, COLOR.text_tertiary))
+            btn.setCheckable(True)
+            btn.setFlat(True)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setFixedHeight(40)
+            _idx = page_idx  # capture for lambda
+            btn.clicked.connect(lambda _checked, i=_idx: self._nav_to(i))
+            nav_lo.addWidget(btn)
+            self._nav_buttons.append(btn)
+
+        lo.addLayout(nav_lo)
+        lo.addStretch(1)
+
+        # ── Bottom strip ─────────────────────────────────────────────────
+        sep2 = QFrame()
+        sep2.setObjectName("sidebarSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lo.addWidget(sep2)
+
+        bottom_lo = QVBoxLayout()
+        bottom_lo.setContentsMargins(8, 8, 8, 8)
+        bottom_lo.setSpacing(2)
+
+        # GPU / memory status pills
+        self._gpu_pill = self._make_status_pill("GPU", "unknown")
+        self._mem_pill = self._make_status_pill("MEM", "unknown")
+        bottom_lo.addWidget(self._gpu_pill)
+        bottom_lo.addWidget(self._mem_pill)
+
+        bottom_sep = QFrame()
+        bottom_sep.setObjectName("sidebarSep")
+        bottom_sep.setFrameShape(QFrame.Shape.HLine)
+        bottom_lo.addWidget(bottom_sep)
+
+        about_btn = QPushButton("  About")
+        about_btn.setObjectName("navButton")
+        about_btn.setIcon(icon("info", ICON_SM, COLOR.text_tertiary))
+        about_btn.setFlat(True)
+        about_btn.setFixedHeight(36)
+        about_btn.clicked.connect(self._open_about)
+        bottom_lo.addWidget(about_btn)
+
+        try:
+            import importlib.metadata as _imeta
+            _ver = _imeta.version("nvap")
+        except Exception:
+            _ver = "dev"
+        ver_lbl = QLabel(f"v{_ver}")
+        ver_lbl.setObjectName("sidebarVersion")
+        ver_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bottom_lo.addWidget(ver_lbl)
+
+        lo.addLayout(bottom_lo)
+        return sidebar
+
+    def _build_analytics_placeholder(self) -> QWidget:
+        """Analytics overview with dataset metrics and per-cell drilldown."""
+        w = QWidget()
+        w.setObjectName("sectionPage")
+        lo = QVBoxLayout(w)
+        lo.setContentsMargins(56, 48, 56, 48)
+        lo.setSpacing(0)
+
+        eyebrow = QLabel("ANALYTICS")
+        eyebrow.setObjectName("pageEyebrow")
+        lo.addWidget(eyebrow)
+
+        title = QLabel("Analytics")
+        title.setObjectName("pageTitle")
+        lo.addWidget(title)
+
+        intro = QLabel(
+            "Dataset-scale channel metrics, microglia-vessel summary, and "
+            "per-cell morphology drilldown from the latest analysis run."
+        )
+        intro.setObjectName("pageIntro")
+        intro.setWordWrap(True)
+        lo.addWidget(intro)
+        lo.addSpacing(28)
+
+        card_grid = QGridLayout()
+        card_grid.setHorizontalSpacing(16)
+        card_grid.setVerticalSpacing(16)
+        self._analytics_cards: dict[str, _AnalyticsMetricCard] = {
+            "cells": _AnalyticsMetricCard("Separated cells", "--", "Run microglia analysis to populate."),
+            "volume": _AnalyticsMetricCard("Microglia volume", "--", "Thresholded green channel."),
+            "distance": _AnalyticsMetricCard("Mean vessel distance", "--", "Nearest vasculature per cell."),
+            "overlap": _AnalyticsMetricCard("Channel overlap", "--", "Green/red shared voxels."),
+            "green_components": _AnalyticsMetricCard("Green components", "--", "Connected thresholded objects."),
+            "red_components": _AnalyticsMetricCard("Red components", "--", "Connected thresholded objects."),
+        }
+        for idx, card in enumerate(self._analytics_cards.values()):
+            card_grid.addWidget(card, idx // 3, idx % 3)
+        lo.addLayout(card_grid)
+        lo.addSpacing(24)
+
+        drilldown_header = QHBoxLayout()
+        drilldown_title = QLabel("Per-Cell Drilldown")
+        drilldown_title.setObjectName("sectionTitle")
+        drilldown_header.addWidget(drilldown_title)
+        drilldown_header.addStretch(1)
+        self._analytics_table_status = QLabel("No analysis run")
+        self._analytics_table_status.setObjectName("sectionSubtle")
+        drilldown_header.addWidget(self._analytics_table_status)
+        lo.addLayout(drilldown_header)
+        lo.addSpacing(12)
+
+        self._analytics_table = QTableWidget(0, 8)
+        self._analytics_table.setObjectName("analyticsCellTable")
+        self._analytics_table.setAlternatingRowColors(True)
+        self._analytics_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._analytics_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._analytics_table.setHorizontalHeaderLabels(
+            [
+                "Cell",
+                "Voxels",
+                "Volume um^3",
+                "Soma um^3",
+                "Branches",
+                "Endpoints",
+                "Distance um",
+                "Events",
+            ]
+        )
+        header = self._analytics_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header.setMinimumSectionSize(88)
+        self._analytics_table.verticalHeader().setVisible(False)
+        self._analytics_table.setMinimumHeight(300)
+        lo.addWidget(self._analytics_table)
+        lo.addStretch(1)
+        return w
+
+    def _set_analytics_table_item(self, row: int, col: int, text: str) -> None:
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._analytics_table.setItem(row, col, item)
+
+    def _refresh_analytics_metrics(self) -> None:
+        if not hasattr(self, "_analytics_cards"):
+            return
+
+        for card in self._analytics_cards.values():
+            card.set_value("--", "Load a dataset to populate.")
+
+        if self.latest_metrics is not None:
+            by_channel = {item.channel.lower(): item for item in self.latest_metrics.channel_results}
+            green = by_channel.get("green")
+            red = by_channel.get("red")
+            if green is not None:
+                self._analytics_cards["volume"].set_value(
+                    f"{green.volume_um3:,.1f}",
+                    f"{green.voxel_count:,} voxels",
+                )
+                self._analytics_cards["green_components"].set_value(
+                    f"{green.component_count:,}",
+                    f"largest {green.largest_component_voxels:,} voxels",
+                )
+            if red is not None:
+                self._analytics_cards["red_components"].set_value(
+                    f"{red.component_count:,}",
+                    f"largest {red.largest_component_voxels:,} voxels",
+                )
+            self._analytics_cards["overlap"].set_value(
+                f"{self.latest_metrics.overlap_volume_um3:,.1f}",
+                f"{self.latest_metrics.overlap_voxel_count:,} voxels",
+            )
+
+        self._refresh_analytics_report()
+
+    def _refresh_analytics_report(self) -> None:
+        if not hasattr(self, "_analytics_table"):
+            return
+        report = self.latest_microglia_report
+        if report is None:
+            self._analytics_cards["cells"].set_value("--", "Run microglia analysis to populate.")
+            self._analytics_cards["distance"].set_value("--", "No per-cell distances yet.")
+            self._analytics_table.setRowCount(0)
+            self._analytics_table_status.setText("No analysis run")
+            return
+
+        rows = list(report.rows)
+        self._analytics_cards["cells"].set_value(f"{report.cell_count:,}", "Separated microglia objects")
+        distances = [
+            float(row.distance_to_vasculature_um)
+            for row in rows
+            if np.isfinite(float(row.distance_to_vasculature_um))
+        ]
+        if distances:
+            self._analytics_cards["distance"].set_value(
+                f"{sum(distances) / len(distances):,.1f} um",
+                f"min {min(distances):,.1f} / max {max(distances):,.1f}",
+            )
+        else:
+            self._analytics_cards["distance"].set_value("--", "No finite distance values.")
+
+        self._analytics_table.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            values = [
+                f"{int(row.cell_index):,}",
+                f"{int(row.voxel_count):,}",
+                f"{float(row.volume_um3):,.1f}",
+                "--" if not np.isfinite(float(row.soma_volume_um3)) else f"{float(row.soma_volume_um3):,.1f}",
+                f"{int(row.branch_count):,}",
+                f"{int(row.branch_endpoint_count):,}",
+                "--" if not np.isfinite(float(row.distance_to_vasculature_um)) else f"{float(row.distance_to_vasculature_um):,.1f}",
+                f"{int(row.tip_near_multiple_vessel_count):,}",
+            ]
+            for col_idx, value in enumerate(values):
+                self._set_analytics_table_item(row_idx, col_idx, value)
+        self._analytics_table_status.setText(f"{len(rows):,} cell rows")
+
+    def _nav_to(self, page_idx: int) -> None:
+        """Switch the page stack and update nav button checked states."""
+        self._page_stack.setCurrentIndex(page_idx)
+        for i, btn in enumerate(self._nav_buttons):
+            btn.setChecked(i == page_idx)
+            # Refresh icon color to reflect active state
+            icon_names = ["home", "layers", "bar-chart", "settings"]
+            color = COLOR.accent if i == page_idx else COLOR.text_tertiary
+            btn.setIcon(icon(icon_names[i], ICON_MD, color))
+
+    def _open_about(self) -> None:
+        AboutDialog(self).exec()
+
+    # ── Status pills ───────────────────────────────────────────────────
+
+    def _make_status_pill(self, label: str, status: str) -> QFrame:
+        pill = QFrame()
+        pill.setObjectName("statusPill")
+        pill_lo = QHBoxLayout(pill)
+        pill_lo.setContentsMargins(10, 4, 10, 4)
+        pill_lo.setSpacing(6)
+
+        dot = QLabel("●")
+        dot.setObjectName(f"statusDot_{status}")
+        dot.setFixedWidth(10)
+        pill_lo.addWidget(dot)
+
+        text = QLabel(label)
+        text.setObjectName("statusPillLabel")
+        pill_lo.addWidget(text, 1)
+
+        pill._nvap_dot = dot   # type: ignore[attr-defined]
+        pill._nvap_text = text  # type: ignore[attr-defined]
+        return pill
+
+    def _update_status_pill(self, pill: QFrame, status: SystemStatus) -> None:
+        dot: QLabel = pill._nvap_dot  # type: ignore[attr-defined]
+        text: QLabel = pill._nvap_text  # type: ignore[attr-defined]
+        color_map = {
+            "good":    COLOR.success,
+            "warn":    COLOR.warning,
+            "bad":     COLOR.danger,
+            "idle":    COLOR.text_disabled,
+            "unknown": COLOR.text_disabled,
+        }
+        color = color_map.get(status.status, COLOR.text_disabled)
+        dot.setStyleSheet(f"color: {color};")
+        text.setText(status.label)
+        if status.detail:
+            pill.setToolTip(status.detail)
+
+    def _refresh_system_indicators(self) -> None:
+        try:
+            self._update_status_pill(self._gpu_pill, gpu_status())
+        except Exception:
+            pass
+        try:
+            self._update_status_pill(self._mem_pill, memory_status())
+        except Exception:
+            pass
+
+    # ── Recent project management ──────────────────────────────────────
+
+    def _record_current_project(
+        self,
+        *,
+        samples: int | None = None,
+        status: str | None = None,
+    ) -> None:
+        if self.dataset_root is None:
+            return
+        name = self.dataset_root.name
+        self._project_store.upsert(
+            str(self.dataset_root),
+            name=name,
+            samples=samples if samples is not None else 0,
+            status=status if status is not None else "Open",
+        )
+        self._home_page.refresh_projects()
+
+    def _save_current_project_state(self) -> None:
+        if (
+            self.dataset_root is None
+            or self._current_channel_sources is None
+            or self._dataset_signature is None
+        ):
+            return
+        try:
+            save_project_state(
+                self.dataset_root,
+                channel_sources=self._current_channel_sources,
+                dataset_signature=self._dataset_signature,
+                load_mode=self._current_load_mode,
+                spacing=self.spacing,
+                psf_config=self.current_psf,
+                preprocess_config=self.preprocess_config,
+                cache_key=self._last_processed_cache_key,
+            )
+        except OSError as exc:
+            self._log_info(f"Project metadata save failed: {exc}")
+
+    def _project_cache_base_dir(self) -> Path:
+        return self.dataset_root or Path.cwd()
+
+    def _refresh_section_state(self) -> None:
+        dataset_name = self.dataset_root.name if self.dataset_root is not None else "No dataset loaded"
+        cache_root = str(self._project_cache_base_dir() / ".nvap_cache")
+        plugin_summary = self.controls.plugin_text.toPlainText().strip() or "No plugins discovered"
+        auto_apply = bool(self.controls.auto_apply_checkbox.isChecked())
+        self._settings_page.set_runtime_details(
+            dataset_name=dataset_name,
+            auto_apply_enabled=auto_apply,
+            plugin_summary=plugin_summary,
+            cache_root=cache_root,
+        )
+        if self.dataset_root is not None:
+            self._home_page.set_preview_summary(
+                "ACTIVE",
+                self.dataset_root.name,
+                f"{self.dataset_root}\nCache: {cache_root}",
+            )
+        self._home_page.refresh_projects()
+
+    def _sync_recent_project_pages(self) -> None:
+        """Compat shim — kept so any old call sites still work."""
+        self._home_page.refresh_projects()
+
+    def _open_recent_project(self, path: str) -> None:
+        p = Path(path)
+        if not p.exists():
+            QMessageBox.warning(
+                self,
+                "Project Not Found",
+                f"The dataset folder no longer exists:\n{path}",
+            )
+            self._project_store.remove(path)
+            self._home_page.refresh_projects()
+            return
+        try:
+            state = load_project_state(p)
+            channel_overrides = project_channel_sources(state) if state is not None else None
+            channel_dirs = resolve_channel_dirs(p, channel_overrides=channel_overrides)
+        except Exception as exc:
+            self._show_error("Project load failed", str(exc))
+            return
+        self.dataset_root = p.resolve()
+        self._nav_to(1)
+        self._start_dataset_load(
+            self.dataset_root,
+            channel_overrides=channel_overrides,
+            channel_dirs=channel_dirs,
+            load_mode=str(state.get("load_mode", "project")) if state is not None else "project",
+        )
+
+    def _pin_recent_project(self, path: str, pinned: bool) -> None:
+        self._project_store.set_pinned(path, pinned)
+        self._home_page.refresh_projects()
 
     def _display_spacing(self, spacing: VoxelSpacing) -> VoxelSpacing:
         # Visual-only Z squeeze for less depth exaggeration. Metrics stay in physical units.
@@ -968,7 +1502,7 @@ class MainWindow(QMainWindow):
                 psf_cfg,
                 preprocess_config=preprocess_cfg,
             )
-            cache_hit = has_processed_cache(cache_key)
+            cache_hit = has_processed_cache(cache_key, base_dir=root)
             self._log_debug(f"ETA cache key={cache_key} hit={cache_hit}")
 
         total_slices = int(stats.green.slice_count + stats.red.slice_count)
@@ -1040,7 +1574,7 @@ class MainWindow(QMainWindow):
                 psf_cfg,
                 preprocess_config=preprocess_cfg,
             )
-            cache_hit = has_processed_cache(cache_key)
+            cache_hit = has_processed_cache(cache_key, base_dir=self._project_cache_base_dir())
         if cache_hit:
             self._log_info("Estimated PSF ETA=6.0s (cache hit).")
             return 6.0
@@ -1276,6 +1810,7 @@ class MainWindow(QMainWindow):
         if not plugins:
             self.controls.set_plugin_text("No plugins discovered in 'nvap.plugins'.")
             self._log_info("No plugins discovered.")
+            self._refresh_section_state()
             return
         lines = []
         for plugin in plugins:
@@ -1285,6 +1820,7 @@ class MainWindow(QMainWindow):
                 lines.append(f"- {plugin.plugin_id} error: {plugin.error}")
         self._log_info(f"Discovered {len(plugins)} plugin descriptor(s).")
         self.controls.set_plugin_text("\n".join(lines))
+        self._refresh_section_state()
 
     def _prompt_channel_source(self, channel_label: str, start_dir: Path) -> str | None:
         chooser = QMessageBox(self)
@@ -1364,6 +1900,52 @@ class MainWindow(QMainWindow):
             return "folder"
         return None
 
+    def _start_dataset_load(
+        self,
+        root: Path,
+        *,
+        channel_overrides: dict[str, str | Path] | None,
+        channel_dirs: dict[str, Path],
+        load_mode: str,
+    ) -> None:
+        root = root.resolve()
+        self.dataset_root = root
+        self._current_load_mode = str(load_mode or "folder")
+        self._current_channel_sources = {
+            "green": str(channel_dirs["green"].resolve()),
+            "red": str(channel_dirs["red"].resolve()),
+        }
+        self._dataset_signature = build_dataset_signature(channel_dirs)
+        self._log_debug(f"Dataset signature set: {self._dataset_signature}")
+
+        preprocess_cfg = self.controls.current_preprocess_config()
+        self.preprocess_config = preprocess_cfg
+        psf_cfg = self._effective_psf_config(self.current_psf)
+        self.current_psf = psf_cfg
+        eta_seconds = self._estimate_load_eta_seconds(
+            root,
+            channel_overrides,
+            psf_cfg,
+            preprocess_cfg,
+            dataset_signature=self._dataset_signature,
+        )
+        self._refresh_section_state()
+        self._start_background_task(
+            title="Load Dataset",
+            message="Loading stacks and processing...",
+            fn=lambda: self._background_load_dataset(
+                root,
+                channel_overrides,
+                psf_cfg,
+                preprocess_cfg,
+            ),
+            on_success=self._on_load_task_success,
+            error_title="Dataset load failed",
+            success_status=f"Loaded dataset: {root}",
+            eta_total_seconds=eta_seconds,
+            eta_kind="load",
+        )
+
     def _on_load_requested(self) -> None:
         base = self.dataset_root or (Path.cwd() / "Input")
         load_mode = self._prompt_load_source_mode()
@@ -1415,32 +1997,14 @@ class MainWindow(QMainWindow):
             channel_dirs = resolve_channel_dirs(self.dataset_root, channel_overrides=channel_overrides)
             self._log_dataset_detection(self.dataset_root, channel_dirs, manual=True)
 
-        self._dataset_signature = build_dataset_signature(channel_dirs)
-        self._log_debug(f"Dataset signature set: {self._dataset_signature}")
-
         root = self.dataset_root
         if root is None:
             return
-        preprocess_cfg = self.controls.current_preprocess_config()
-        self.preprocess_config = preprocess_cfg
-        psf_cfg = self._effective_psf_config(self.current_psf)
-        self.current_psf = psf_cfg
-        eta_seconds = self._estimate_load_eta_seconds(
+        self._start_dataset_load(
             root,
-            channel_overrides,
-            psf_cfg,
-            preprocess_cfg,
-            dataset_signature=self._dataset_signature,
-        )
-        self._start_background_task(
-            title="Load Dataset",
-            message="Loading stacks and processing...",
-            fn=lambda: self._background_load_dataset(root, channel_overrides, psf_cfg, preprocess_cfg),
-            on_success=self._on_load_task_success,
-            error_title="Dataset load failed",
-            success_status=f"Loaded dataset: {self.dataset_root}",
-            eta_total_seconds=eta_seconds,
-            eta_kind="load",
+            channel_overrides=channel_overrides,
+            channel_dirs=channel_dirs,
+            load_mode=load_mode,
         )
 
     def _log_dataset_detection(
@@ -1546,6 +2110,11 @@ class MainWindow(QMainWindow):
         self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Load complete.")
         self._log_info("Dataset load and initial render completed.")
+        # Navigate to workspace and record in recent projects
+        self._nav_to(1)
+        self._save_current_project_state()
+        self._record_current_project(samples=1, status="Open")
+        self._refresh_section_state()
 
     def _on_psf_task_success(self, result: object) -> None:
         if not isinstance(result, DatasetVolume):
@@ -1567,6 +2136,9 @@ class MainWindow(QMainWindow):
         self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Processing complete.")
         self._log_info("Processing applied and scene refreshed.")
+        self._save_current_project_state()
+        self._record_current_project(samples=1, status="Open")
+        self._refresh_section_state()
 
     def _get_processed_dataset_with_cache(
         self,
@@ -1594,7 +2166,12 @@ class MainWindow(QMainWindow):
                 preprocess_config=preprocess_cfg,
             )
             self._log_info(f"Cache pipeline: lookup key={cache_key}")
-            cached = load_processed_dataset(cache_key, self.spacing)
+            self._last_processed_cache_key = cache_key
+            cached = load_processed_dataset(
+                cache_key,
+                self.spacing,
+                base_dir=self._project_cache_base_dir(),
+            )
             if cached is not None:
                 publish_process_progress(1.0, "Loaded processed dataset from cache.")
                 self._log_info("Using cached processed dataset.")
@@ -1657,7 +2234,11 @@ class MainWindow(QMainWindow):
         if cache_key is not None and (cancel_event is None or not cancel_event.is_set()):
             publish_process_progress(0.96, "Saving processed dataset to cache...")
             self._log_info("Cache pipeline: saving processed dataset to cache.")
-            save_processed_dataset(cache_key, processed)
+            save_processed_dataset(
+                cache_key,
+                processed,
+                base_dir=self._project_cache_base_dir(),
+            )
             self._log_info(f"Cache pipeline: cache save complete key={cache_key}")
         publish_process_progress(1.0, "Processed dataset ready.")
         return processed
@@ -1912,6 +2493,8 @@ class MainWindow(QMainWindow):
             self.latest_metrics = compute_metrics(self.processed_dataset, self.current_render)
             self._metrics_cache_key = cache_key
         self._set_metrics_text_from_result(self.latest_metrics)
+        self._metrics_panel.update_from_metrics(self.latest_metrics)
+        self._refresh_analytics_metrics()
         self._log_debug("Metrics updated.")
 
     def _on_export_metrics_requested(self) -> None:
@@ -1995,6 +2578,8 @@ class MainWindow(QMainWindow):
             self._publish_busy_progress(percent=99.0, message="Updating analysis table...")
             self.latest_microglia_report = result
             self.controls.set_microglia_analysis_report(result)
+            self._metrics_panel.update_from_report(result)
+            self._refresh_analytics_report()
             # Defer VTK overlay upload until after the busy dialog closes.
             QTimer.singleShot(0, self._refresh_microglia_analysis_overlays)
             self.statusBar().showMessage(
