@@ -9,7 +9,7 @@ import numpy as np
 import scipy.ndimage as ndi
 from skimage import exposure
 from skimage.filters import frangi, meijering, sato, threshold_otsu
-from skimage.morphology import disk, white_tophat
+from skimage.morphology import binary_closing, binary_dilation, remove_small_holes, remove_small_objects, disk, white_tophat
 from skimage.restoration import denoise_bilateral, denoise_nl_means, denoise_wavelet, rolling_ball
 
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig
@@ -557,6 +557,19 @@ def _normalize_positive_detail(detail: np.ndarray) -> np.ndarray:
     return np.clip(arr / hi, 0.0, 1.0).astype(np.float32, copy=False)
 
 
+def _normalize_positive_percentile(detail: np.ndarray, percentile: float) -> np.ndarray:
+    arr = np.maximum(np.asarray(detail, dtype=np.float32), 0.0)
+    if arr.size == 0:
+        return arr
+    sample = arr
+    if arr.size >= 32 * 1024 * 1024 and arr.ndim == 3:
+        sample = arr[::2, ::4, ::4]
+    hi = float(np.percentile(sample, float(percentile)))
+    if not np.isfinite(hi) or hi <= 1.0e-6:
+        return np.zeros_like(arr, dtype=np.float32)
+    return np.clip(arr / hi, 0.0, 1.0).astype(np.float32, copy=False)
+
+
 def _white_tophat_slicewise(volume: np.ndarray, radius: int) -> np.ndarray:
     arr = np.asarray(volume, dtype=np.float32)
     radius = int(max(3, radius))
@@ -591,8 +604,304 @@ def _clahe_slicewise(volume: np.ndarray, clip_limit: float = 0.012) -> np.ndarra
     return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
 
 
+def _branch_soma_preserve_2d(
+    raw: np.ndarray,
+    processed: np.ndarray,
+    *,
+    branch_strength: float = 0.45,
+    soma_strength: float = 0.90,
+) -> np.ndarray:
+    """Lift branch ridges and soma cores after background/noise suppression."""
+    arr = np.clip(np.asarray(raw, dtype=np.float32), 0.0, 1.0)
+    out = np.clip(np.asarray(processed, dtype=np.float32), 0.0, 1.0).copy()
+    if arr.shape != out.shape or arr.ndim != 2 or arr.size == 0:
+        return out
+
+    raw_detail = _normalize_positive_detail(
+        np.maximum(arr - ndi.gaussian_filter(arr, sigma=2.5, mode="nearest"), 0.0)
+    )
+    try:
+        branch_response = sato(
+            _normalize_positive_detail(arr),
+            sigmas=[0.7, 1.1, 1.6],
+            black_ridges=False,
+            mode="reflect",
+        )
+        branch = _normalize_positive_detail(branch_response)
+    except Exception:
+        branch = raw_detail
+    branch = ndi.gaussian_filter(branch, sigma=0.45, mode="nearest")
+    branch_mask = branch > 0.18
+    if np.any(branch_mask):
+        out[branch_mask] = np.maximum(
+            out[branch_mask],
+            raw_detail[branch_mask] * float(branch_strength),
+        )
+
+    soma_cut = float(np.percentile(arr, 99.2))
+    if np.isfinite(soma_cut) and soma_cut > 0.0:
+        soma_mask = arr >= soma_cut
+        soma_mask = ndi.binary_dilation(
+            soma_mask,
+            structure=np.ones((7, 7), dtype=bool),
+            iterations=1,
+        )
+        raw_norm = _normalize_positive_detail(arr)
+        out[soma_mask] = np.maximum(
+            out[soma_mask],
+            raw_norm[soma_mask] * float(soma_strength),
+        )
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _despeckle_slicewise(
+    volume: np.ndarray,
+    *,
+    threshold_pct: float = 99.2,
+    min_size: int = 4,
+    attenuation: float = 0.20,
+) -> np.ndarray:
+    arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
+    out = arr.copy()
+    min_size = max(2, int(min_size))
+    for z in range(int(arr.shape[0])):
+        plane = arr[z]
+        threshold = float(np.percentile(plane, threshold_pct))
+        mask = plane >= threshold
+        labels, count = ndi.label(mask, structure=np.ones((3, 3), dtype=np.uint8))
+        if count <= 0:
+            continue
+        sizes = np.bincount(labels.ravel())
+        small_labels = np.where((sizes > 0) & (sizes < min_size))[0]
+        small_labels = small_labels[small_labels != 0]
+        if small_labels.size > 0:
+            out[z][np.isin(labels, small_labels)] *= float(attenuation)
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _wavelet_denoise_slicewise_light(volume: np.ndarray) -> np.ndarray:
+    arr = np.asarray(volume, dtype=np.float32)
+    out = np.empty_like(arr, dtype=np.float32)
+    for z in range(int(arr.shape[0])):
+        try:
+            denoised = denoise_wavelet(
+                np.clip(arr[z], 0.0, 1.0),
+                sigma=0.018,
+                method="BayesShrink",
+                mode="soft",
+                rescale_sigma=True,
+                channel_axis=None,
+            )
+            out[z] = np.asarray(denoised, dtype=np.float32)
+        except Exception:
+            out[z] = ndi.gaussian_filter(arr[z], sigma=0.25, mode="nearest")
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _tuned_microglia_preserve_background(volume: np.ndarray) -> np.ndarray:
+    """Tuned background suppression that keeps microglia branches and somas."""
+    arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
+    background = ndi.gaussian_filter(arr, sigma=(0.0, 24.0, 24.0), mode="nearest")
+    detail = _normalize_positive_detail(np.maximum(arr - (0.94 * background), 0.0))
+    contrast = _clahe_slicewise(detail, clip_limit=0.004)
+    enhanced = np.clip((0.72 * detail) + (0.28 * contrast), 0.0, 1.0)
+
+    preserved = np.empty_like(enhanced, dtype=np.float32)
+    for z in range(int(arr.shape[0])):
+        preserved[z] = _branch_soma_preserve_2d(
+            arr[z],
+            enhanced[z],
+            branch_strength=0.45,
+            soma_strength=0.92,
+        )
+
+    cleaned = _wavelet_denoise_slicewise_light(preserved)
+    cleaned = _despeckle_slicewise(
+        cleaned,
+        threshold_pct=99.2,
+        min_size=4,
+        attenuation=0.20,
+    )
+
+    for z in range(int(arr.shape[0])):
+        cleaned[z] = _branch_soma_preserve_2d(
+            arr[z],
+            cleaned[z],
+            branch_strength=0.41,
+            soma_strength=0.90,
+        )
+    return np.clip(cleaned, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _keep_process_like_components(
+    mask: np.ndarray,
+    vesselness: np.ndarray,
+    detail: np.ndarray,
+) -> np.ndarray:
+    """Keep branch-like connected components and reject dot-like speckles."""
+    labels, count = ndi.label(np.asarray(mask, dtype=bool), structure=np.ones((3, 3), dtype=bool))
+    if count <= 0:
+        return np.zeros_like(mask, dtype=bool)
+
+    keep = np.zeros(int(count) + 1, dtype=bool)
+    for label, bbox in enumerate(ndi.find_objects(labels), start=1):
+        if bbox is None:
+            continue
+        component = labels[bbox] == label
+        area = int(np.count_nonzero(component))
+        if area <= 0:
+            continue
+
+        height, width = component.shape
+        longest = max(height, width)
+        shortest = max(1, min(height, width))
+        aspect = float(longest) / float(shortest)
+        extent = float(area) / float(max(1, height * width))
+        vessel_mean = float(np.mean(vesselness[bbox][component]))
+        detail_mean = float(np.mean(detail[bbox][component]))
+
+        broad_process = area >= 44 and vessel_mean >= 0.12 and detail_mean >= 0.035
+        elongated_process = (
+            area >= 7
+            and longest >= 6
+            and aspect >= 1.8
+            and vessel_mean >= 0.10
+            and detail_mean >= 0.030
+        )
+        compact_but_supported = (
+            area >= 20
+            and longest >= 6
+            and extent <= 0.78
+            and vessel_mean >= 0.24
+            and detail_mean >= 0.055
+        )
+        keep[label] = broad_process or elongated_process or compact_but_supported
+
+    if not np.any(keep):
+        return np.zeros_like(mask, dtype=bool)
+    return keep[labels]
+
+
+def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
+    """Library-first microscopy cleanup for microglia soma and processes."""
+    arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
+    if arr.size == 0:
+        return arr.copy()
+
+    out = np.zeros_like(arr, dtype=np.float32)
+    raw_norm = _normalize_positive_detail(arr)
+    closing_fp = disk(1)
+    soma_fp = disk(2)
+
+    for z in range(int(arr.shape[0])):
+        plane = np.asarray(arr[z], dtype=np.float32)
+        if plane.size == 0:
+            continue
+        plane_smooth = ndi.gaussian_filter(plane, sigma=0.65, mode="nearest")
+
+        try:
+            background = rolling_ball(plane_smooth, radius=18)
+            detail = np.maximum(plane_smooth - np.asarray(background, dtype=np.float32), 0.0)
+        except Exception:
+            background = ndi.gaussian_filter(plane_smooth, sigma=18.0, mode="nearest")
+            detail = np.maximum(plane_smooth - (0.95 * background), 0.0)
+
+        detail = _normalize_positive_percentile(detail, 99.8)
+        local_detail = _normalize_positive_detail(
+            np.maximum(
+                plane_smooth - ndi.gaussian_filter(plane_smooth, sigma=2.0, mode="nearest"),
+                0.0,
+            )
+        )
+        vessel_input = _normalize_positive_percentile((0.62 * detail) + (0.38 * local_detail), 99.7)
+        vessel_input = ndi.gaussian_filter(vessel_input, sigma=0.45, mode="nearest")
+        try:
+            branch_response = sato(
+                vessel_input,
+                sigmas=[0.7, 1.1, 1.6, 2.2],
+                black_ridges=False,
+                mode="reflect",
+            )
+        except Exception:
+            branch_response = frangi(
+                vessel_input,
+                sigmas=[0.7, 1.1, 1.6, 2.2],
+                black_ridges=False,
+                mode="reflect",
+            )
+        branch = _normalize_positive_percentile(branch_response, 99.5)
+        branch = ndi.gaussian_filter(branch, sigma=0.35, mode="nearest")
+
+        branch_cut = max(0.10, float(np.percentile(branch, 96.5)))
+        detail_cut = max(0.035, float(np.percentile(detail, 90.0)))
+        local_cut = max(0.055, float(np.percentile(local_detail, 88.0)))
+        process_mask = (branch >= branch_cut) & (detail >= detail_cut)
+        process_mask |= (branch >= 0.20) & (local_detail >= local_cut) & (detail >= 0.025)
+        process_mask |= (local_detail >= 0.34) & (branch >= 0.12) & (detail >= 0.08)
+        process_mask = binary_closing(process_mask, footprint=closing_fp)
+        process_mask = _keep_process_like_components(process_mask, branch, detail)
+        loose_process = (branch >= 0.075) & (detail >= 0.025) & (local_detail >= 0.045)
+        loose_process = binary_closing(loose_process, footprint=closing_fp)
+        loose_process = _keep_process_like_components(loose_process, branch, detail)
+        process_context = loose_process | (
+            binary_dilation(process_mask, footprint=disk(2))
+            & ((branch >= 0.060) | (local_detail >= 0.085))
+            & (detail >= 0.020)
+        )
+
+        soma_cut = float(np.percentile(plane, 98.7))
+        soma_mask = (
+            plane >= soma_cut
+            if np.isfinite(soma_cut) and soma_cut > 0.0
+            else np.zeros_like(plane, dtype=bool)
+        )
+        soma_mask = binary_closing(soma_mask, footprint=soma_fp)
+        soma_mask = remove_small_holes(soma_mask, area_threshold=16)
+        soma_mask = remove_small_objects(soma_mask, min_size=18)
+        soma_mask = binary_dilation(soma_mask, footprint=soma_fp)
+
+        support = process_mask | soma_mask
+        support = remove_small_objects(support, min_size=8)
+
+        plane_out = np.zeros_like(plane, dtype=np.float32)
+        process_signal = np.maximum.reduce(
+            (
+                detail * 0.92,
+                branch * 1.14,
+                local_detail * 0.90,
+            )
+        )
+        process_alpha = np.clip(
+            ndi.gaussian_filter(process_mask.astype(np.float32), sigma=1.1, mode="nearest"),
+            0.0,
+            1.0,
+        )
+        context_alpha = np.maximum(process_alpha, np.where(loose_process, 0.56, 0.0))
+        context_alpha = np.maximum(context_alpha, np.where(process_context, 0.34, 0.0))
+        plane_out[process_context] = process_signal[process_context] * context_alpha[process_context]
+        plane_out[process_mask] = np.maximum(plane_out[process_mask], process_signal[process_mask])
+
+        soma_signal = np.maximum(raw_norm[z] * 1.25, detail * 1.08)
+        plane_out[soma_mask] = np.maximum(plane_out[soma_mask], soma_signal[soma_mask])
+
+        halo = binary_dilation(support, footprint=disk(2)) & (~support)
+        halo_keep = halo & (branch > 0.34) & (detail > 0.16)
+        plane_out[halo_keep] = np.maximum(plane_out[halo_keep], process_signal[halo_keep] * 0.08)
+
+        visible = plane_out >= 0.025
+        visible = remove_small_objects(visible, min_size=32)
+        plane_out[~visible] = 0.0
+        plane_out = ndi.gaussian_filter(plane_out, sigma=0.35, mode="nearest")
+        plane_out[~binary_dilation(visible, footprint=closing_fp)] = 0.0
+        plane_out[plane_out < 0.018] = 0.0
+        out[z] = np.clip(plane_out, 0.0, 1.0)
+
+    return out.astype(np.float32, copy=False)
+
+
 MICROGLIA_ENHANCEMENT_METHODS: dict[str, str] = {
     "microglia_preserve": "Microglia-preserving combined",
+    "microscopy_clean": "Microscopy clean soma/branch enhancement",
     "imagej_rolling_ball": "ImageJ/Fiji rolling ball background subtraction",
     "basic": "BaSiC-style retrospective shading correction",
     "cidre": "CIDRE-style illumination correction",
@@ -631,6 +940,159 @@ def _imagej_rolling_ball_slicewise(
     ).astype(np.float32, copy=False)
 
 
+def _restore_soma_interiors_after_imagej_rolling_ball(
+    raw: np.ndarray,
+    imagej_enhanced: np.ndarray,
+) -> np.ndarray:
+    """Fill soma interiors that strict rolling-ball subtraction turns into rings."""
+    arr = np.clip(np.asarray(raw, dtype=np.float32), 0.0, 1.0)
+    out = np.clip(np.asarray(imagej_enhanced, dtype=np.float32), 0.0, 1.0).copy()
+    if arr.shape != out.shape or arr.ndim != 3 or arr.size == 0:
+        return out
+
+    raw_norm = _normalize_positive_detail(arr)
+    structure = np.ones((3, 3), dtype=np.uint8)
+    for z in range(int(arr.shape[0])):
+        raw_plane = arr[z]
+        out_plane = out[z]
+        if raw_plane.size == 0:
+            continue
+
+        raw_cut = float(np.percentile(raw_plane, 98.8))
+        imagej_cut = float(np.percentile(out_plane, 99.0))
+        raw_seed = raw_plane >= raw_cut if np.isfinite(raw_cut) and raw_cut > 0.0 else np.zeros_like(raw_plane, dtype=bool)
+        ring_seed = (
+            out_plane >= max(imagej_cut, 0.04)
+            if np.isfinite(imagej_cut) and imagej_cut > 0.0
+            else np.zeros_like(out_plane, dtype=bool)
+        )
+        candidate = raw_seed | ring_seed
+        if not np.any(candidate):
+            continue
+
+        candidate = ndi.binary_dilation(candidate, structure=structure, iterations=1)
+        candidate = ndi.binary_closing(candidate, structure=np.ones((5, 5), dtype=bool), iterations=1)
+        candidate = ndi.binary_fill_holes(candidate)
+
+        labels, count = ndi.label(candidate, structure=structure)
+        if count <= 0:
+            continue
+
+        sizes = np.bincount(labels.ravel(), minlength=int(count) + 1)
+        dist = ndi.distance_transform_edt(candidate)
+        max_dists = np.asarray(
+            ndi.maximum(dist, labels=labels, index=np.arange(1, int(count) + 1)),
+            dtype=np.float32,
+        )
+        keep_labels = np.flatnonzero((sizes[1:] >= 16) & (max_dists >= 2.0)) + 1
+        restore_mask = np.isin(labels, keep_labels) if keep_labels.size > 0 else np.zeros_like(candidate, dtype=bool)
+
+        if np.any(restore_mask):
+            soma_floor = raw_norm[z] * 0.92
+            out[z][restore_mask] = np.maximum(out_plane[restore_mask], soma_floor[restore_mask])
+
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _refine_imagej_rolling_ball_microglia(
+    raw: np.ndarray,
+    imagej_enhanced: np.ndarray,
+) -> np.ndarray:
+    arr = np.clip(np.asarray(raw, dtype=np.float32), 0.0, 1.0)
+    out = _restore_soma_interiors_after_imagej_rolling_ball(arr, imagej_enhanced)
+    if arr.shape != out.shape or arr.ndim != 3 or arr.size == 0:
+        return out
+
+    for z in range(int(arr.shape[0])):
+        raw_plane = arr[z]
+        out_plane = out[z]
+        raw_detail = _normalize_positive_detail(
+            np.maximum(
+                raw_plane - ndi.gaussian_filter(raw_plane, sigma=2.5, mode="nearest"),
+                0.0,
+            )
+        )
+        try:
+            branch_response = sato(
+                _normalize_positive_detail(raw_plane),
+                sigmas=[0.7, 1.1, 1.6],
+                black_ridges=False,
+                mode="reflect",
+            )
+            branch = _normalize_positive_detail(branch_response)
+        except Exception:
+            branch = raw_detail
+        branch = ndi.gaussian_filter(branch, sigma=0.45, mode="nearest")
+
+        support_cut = float(np.percentile(out_plane, 88.0))
+        if not np.isfinite(support_cut):
+            support_cut = 0.02
+        support = ndi.maximum_filter(out_plane, size=11, mode="nearest") > max(support_cut, 0.018)
+        branch_mask = (branch > 0.18) & support & (raw_detail > 0.10)
+        branch_labels, branch_count = ndi.label(branch_mask, structure=np.ones((3, 3), dtype=np.uint8))
+        branch_keep = np.zeros_like(branch_mask, dtype=bool)
+        if branch_count > 0:
+            branch_sizes = np.bincount(branch_labels.ravel(), minlength=int(branch_count) + 1)
+            keep_branch_labels = np.flatnonzero(branch_sizes >= 8)
+            keep_branch_labels = keep_branch_labels[keep_branch_labels != 0]
+            if keep_branch_labels.size > 0:
+                branch_keep = np.isin(branch_labels, keep_branch_labels)
+        if np.any(branch_keep):
+            out[z][branch_keep] = np.maximum(
+                out_plane[branch_keep],
+                raw_detail[branch_keep] * 0.62,
+            )
+
+        raw_cut = float(np.percentile(raw_plane, 98.8))
+        raw_bright = (
+            raw_plane >= raw_cut
+            if np.isfinite(raw_cut) and raw_cut > 0.0
+            else np.zeros_like(raw_plane, dtype=bool)
+        )
+        raw_labels, raw_count = ndi.label(raw_bright, structure=np.ones((3, 3), dtype=np.uint8))
+        soma_like = np.zeros_like(raw_bright, dtype=bool)
+        if raw_count > 0:
+            raw_sizes = np.bincount(raw_labels.ravel(), minlength=int(raw_count) + 1)
+            raw_dist = ndi.distance_transform_edt(raw_bright)
+            raw_max_dists = np.asarray(
+                ndi.maximum(raw_dist, labels=raw_labels, index=np.arange(1, int(raw_count) + 1)),
+                dtype=np.float32,
+            )
+            soma_labels = np.flatnonzero((raw_sizes[1:] >= 16) & (raw_max_dists >= 2.0)) + 1
+            if soma_labels.size > 0:
+                soma_like = np.isin(raw_labels, soma_labels)
+        protect = ndi.binary_dilation(
+            branch_keep | soma_like,
+            structure=np.ones((5, 5), dtype=bool),
+            iterations=1,
+        )
+        tiny_branch_like = branch_mask & (~branch_keep) & (raw_detail > 0.70) & (~soma_like)
+        if np.any(tiny_branch_like):
+            out[z][tiny_branch_like] *= 0.12
+        unsupported_islands = (out[z] >= 0.04) & (~protect)
+        island_labels, island_count = ndi.label(
+            unsupported_islands,
+            structure=np.ones((3, 3), dtype=np.uint8),
+        )
+        if island_count > 0:
+            island_sizes = np.bincount(island_labels.ravel())
+            small_islands = np.flatnonzero((island_sizes > 0) & (island_sizes < 20))
+            small_islands = small_islands[small_islands != 0]
+            if small_islands.size > 0:
+                out[z][np.isin(island_labels, small_islands)] *= 0.12
+        bright_cut = max(0.08, float(np.percentile(out[z], 99.0)))
+        bright = (out[z] >= bright_cut) & (~protect)
+        labels, count = ndi.label(bright, structure=np.ones((3, 3), dtype=np.uint8))
+        if count > 0:
+            sizes = np.bincount(labels.ravel())
+            small = np.flatnonzero((sizes > 0) & (sizes < 8))
+            small = small[small != 0]
+            if small.size > 0:
+                out[z][np.isin(labels, small)] *= 0.12
+
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+
 def _basic_style_correction(volume: np.ndarray) -> np.ndarray:
     arr = np.asarray(volume, dtype=np.float32)
     dark = np.percentile(arr, 2.0, axis=0).astype(np.float32, copy=False)
@@ -663,6 +1125,9 @@ def _enhance_microglia_core(
     radius = int(np.clip(round(sigma_xy * 0.60), 8, 32))
     if method == "imagej_rolling_ball":
         enhanced = _imagej_rolling_ball_slicewise(arr, radius=5, multiplier=1.5)
+        return _refine_imagej_rolling_ball_microglia(arr, enhanced)
+    elif method == "microscopy_clean":
+        return _microscopy_clean_background(arr)
     elif method == "basic":
         enhanced = _basic_style_correction(arr)
     elif method == "cidre":
@@ -677,18 +1142,8 @@ def _enhance_microglia_core(
         contrast = _clahe_slicewise(detail, clip_limit=0.01)
         enhanced = np.maximum(detail, contrast * 0.75).astype(np.float32, copy=False)
     elif method == "microglia_preserve":
-        background = ndi.gaussian_filter(arr, sigma=(0.0, sigma_xy, sigma_xy), mode="nearest")
-        bg_detail = _normalize_positive_detail(arr - (0.88 * background))
-        if float(np.max(bg_detail)) <= 1.0e-6:
-            return arr.copy()
-        top_hat = _normalize_positive_detail(_white_tophat_slicewise(arr, radius=radius))
-        contrast_src = np.maximum(bg_detail, top_hat * 0.85)
-        contrast = _clahe_slicewise(contrast_src, clip_limit=0.012)
-        enhanced = np.clip(
-            (0.62 * bg_detail) + (0.25 * top_hat) + (0.13 * contrast),
-            0.0,
-            1.0,
-        ).astype(np.float32, copy=False)
+        enhanced = _tuned_microglia_preserve_background(arr)
+        return enhanced
     else:
         raise ValueError(f"Unknown microglia enhancement method: {method}")
 

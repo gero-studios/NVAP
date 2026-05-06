@@ -1,0 +1,56 @@
+{
+  "source": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\01_original_green_absolute.png",
+  "mask_metadata": {
+    "branch_pixels": 26334,
+    "soma_pixels": 35226,
+    "background_pixels": 352464
+  },
+  "metrics": {
+    "original": {
+      "name": "original",
+      "branch_mean": 0.3768129348754883,
+      "soma_mean": 0.5129102468490601,
+      "branch_to_soma": 0.734656671786823,
+      "background_mean": 0.13461323082447052,
+      "background_std": 0.03453462943434715,
+      "branch_persistence": 1.0,
+      "soma_persistence": 1.0,
+      "branch_to_background": 2.799226588408944,
+      "soma_to_background": 3.810251367622782,
+      "speckle_count": 0,
+      "p99": 0.6117647290229797,
+      "max": 0.9960784316062927
+    },
+    "imagej_refined": {
+      "name": "imagej_refined",
+      "branch_mean": 0.2959415018558502,
+      "soma_mean": 0.450248658657074,
+      "branch_to_soma": 0.6572845830091638,
+      "background_mean": 0.0023806351236999035,
+      "background_std": 0.01736575923860073,
+      "branch_persistence": 0.7853804221281291,
+      "soma_persistence": 0.877831280273825,
+      "branch_to_background": 124.31199510990488,
+      "soma_to_background": 189.12963779065504,
+      "speckle_count": 0,
+      "p99": 0.6200000047683716,
+      "max": 0.9200000166893005
+    },
+    "threshold_vessel_clean": {
+      "name": "threshold_vessel_clean",
+      "branch_mean": 0.47491705417633057,
+      "soma_mean": 0.6076926589012146,
+      "branch_to_soma": 0.7815086248286113,
+      "background_mean": 0.002410609507933259,
+      "background_std": 0.015445254743099213,
+      "branch_persistence": 1.2603523133654082,
+      "soma_persistence": 1.1847933681076317,
+      "branch_to_background": 197.01119265206154,
+      "soma_to_background": 252.09087448685173,
+      "speckle_count": 0,
+      "p99": 1.0,
+      "max": 1.0
+    }
+  },
+  "corroboration": "Microscopy clean is now background subtraction followed by adaptive thresholding, vesselness, process-like connected-component filtering, soft branch-context rendering, soma restoration, and light output smoothing. Metrics use branch/soma/background masks; montage visually checks branch brightness and pixel noise."
+}

@@ -455,6 +455,9 @@ class ControlPanel(QWidget):
             "Microglia-preserving combined", "microglia_preserve"
         )
         self.microglia_enhancement_method.addItem(
+            "Microscopy clean soma/branch", "microscopy_clean"
+        )
+        self.microglia_enhancement_method.addItem(
             "ImageJ/Fiji rolling ball", "imagej_rolling_ball"
         )
         self.microglia_enhancement_method.addItem("BaSiC-style correction", "basic")

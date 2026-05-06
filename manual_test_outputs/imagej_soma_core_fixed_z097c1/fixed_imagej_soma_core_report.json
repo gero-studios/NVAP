@@ -1,0 +1,26 @@
+{
+  "original": {
+    "component_count": 170,
+    "soma_area_px": 35226,
+    "core_mean": 0.6610781941130357,
+    "rim_mean": 0.39751238097599956,
+    "full_mean": 0.5129102555665735,
+    "core_off_fraction": 0.0
+  },
+  "strict_imagej": {
+    "component_count": 170,
+    "soma_area_px": 35226,
+    "core_mean": 0.09896676622055971,
+    "rim_mean": 0.06408767884463192,
+    "full_mean": 0.0795136302671931,
+    "core_off_fraction": 0.4834970150392193
+  },
+  "fixed_imagej": {
+    "component_count": 170,
+    "soma_area_px": 35226,
+    "core_mean": 0.6138909744256462,
+    "rim_mean": 0.31934595179204667,
+    "full_mean": 0.4483940902557411,
+    "core_off_fraction": 0.06212469709483796
+  }
+}

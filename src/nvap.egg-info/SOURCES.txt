@@ -48,6 +48,7 @@ src/nvap/ui/theme.py
 src/nvap/ui/dialogs/__init__.py
 src/nvap/ui/dialogs/about.py
 src/nvap/ui/services/__init__.py
+src/nvap/ui/services/project_files.py
 src/nvap/ui/services/recent_projects.py
 src/nvap/ui/services/system_status.py
 src/nvap/ui/widgets/__init__.py

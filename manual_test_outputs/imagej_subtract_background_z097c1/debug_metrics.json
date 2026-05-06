@@ -1,0 +1,96 @@
+{
+  "source": "C:\\Users\\giaco\\Downloads\\7951-3_M_CL_cortex_25X-20260421T003724Z-3-001\\7951-3_M_CL_cortex_25X\\7951-3_M_CL_cortex_25X_z097c1.png",
+  "shape": [
+    1024,
+    1024,
+    3
+  ],
+  "dtype": "uint8",
+  "channel_used": "rgb_green_index_1",
+  "operation": "ImageJ-style Subtract Background rolling=5 sliding; Multiply value=1.5",
+  "outputs": {
+    "original_abs": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\01_original_green_absolute.png",
+    "background_abs": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\02_estimated_background_absolute.png",
+    "subtracted_abs": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\03_subtract_background_radius5_absolute.png",
+    "multiplied_abs": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\04_subtract_background_radius5_multiply1p5_absolute.png",
+    "original_stretch": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\05_original_green_stretched.png",
+    "background_stretch": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\06_estimated_background_stretched.png",
+    "subtracted_stretch": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\07_subtract_background_radius5_stretched.png",
+    "multiplied_stretch": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\08_subtract_background_radius5_multiply1p5_stretched.png",
+    "montage": "C:\\Users\\giaco\\Documents\\NVAP\\NVAP\\manual_test_outputs\\imagej_subtract_background_z097c1\\09_debug_montage_stretched.png"
+  },
+  "stats": {
+    "original": {
+      "min": 0.0,
+      "p01": 0.05882352963089943,
+      "p05": 0.0941176488995552,
+      "p25": 0.16078431904315948,
+      "median": 0.2078431397676468,
+      "p75": 0.2666666805744171,
+      "p95": 0.3843137323856354,
+      "p99": 0.6117647290229797,
+      "p997": 0.9333333373069763,
+      "max": 0.9960784316062927,
+      "mean": 0.22313803434371948,
+      "std": 0.10438257455825806,
+      "nonzero_fraction": 0.9999227523803711,
+      "saturated_fraction": 0.0
+    },
+    "estimated_background": {
+      "min": 0.0,
+      "p01": 0.05882352963089943,
+      "p05": 0.0941176488995552,
+      "p25": 0.1568627506494522,
+      "median": 0.2029811143875122,
+      "p75": 0.24705882370471954,
+      "p95": 0.3323928713798523,
+      "p99": 0.5176470875740051,
+      "p997": 0.8265105485916138,
+      "max": 0.9960784316062927,
+      "mean": 0.2095550000667572,
+      "std": 0.08865530043840408,
+      "nonzero_fraction": 0.9999227523803711,
+      "saturated_fraction": 0.0
+    },
+    "subtracted_radius5": {
+      "min": 0.0,
+      "p01": 0.0,
+      "p05": 0.0,
+      "p25": 0.0,
+      "median": 0.0,
+      "p75": 0.004862010478973389,
+      "p95": 0.08329340815544128,
+      "p99": 0.15388163924217224,
+      "p997": 0.21270515024662018,
+      "max": 0.6075963973999023,
+      "mean": 0.01358302216976881,
+      "std": 0.033244695514440536,
+      "nonzero_fraction": 0.2701120376586914,
+      "saturated_fraction": 0.0
+    },
+    "subtracted_radius5_multiply1p5": {
+      "min": 0.0,
+      "p01": 0.0,
+      "p05": 0.0,
+      "p25": 0.0,
+      "median": 0.0,
+      "p75": 0.007293015718460083,
+      "p95": 0.12494011223316193,
+      "p99": 0.23082245886325836,
+      "p997": 0.31905773282051086,
+      "max": 0.9113945960998535,
+      "mean": 0.020374534651637077,
+      "std": 0.04986703768372536,
+      "nonzero_fraction": 0.2701120376586914,
+      "saturated_fraction": 0.0
+    }
+  },
+  "roi_like_metrics": {
+    "background_quartile_mean_original": 0.12291618436574936,
+    "background_quartile_mean_after": 0.0001639199472265318,
+    "bright_p99_mean_original": 0.816015362739563,
+    "bright_p99_mean_after": 0.16049106419086456,
+    "bright_to_background_original": 6.638794898986816,
+    "bright_to_background_after": 979.0819702148438
+  }
+}
