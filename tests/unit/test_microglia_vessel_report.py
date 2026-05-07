@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+from nvap.analysis import microglia_vessel_report
 from nvap.analysis.microglia_vessel_report import (
     MICROGLIA_CELL_REPORT_COLUMNS,
     MicrogliaCellReport,
@@ -69,6 +70,37 @@ def test_touching_microglia_and_vessel_has_zero_distance() -> None:
     assert row.microglia_closest_x_um == row.vessel_closest_x_um
     assert row.microglia_closest_y_um == row.vessel_closest_y_um
     assert row.microglia_closest_z_um == row.vessel_closest_z_um
+
+
+def test_closest_surface_pair_avoids_full_component_coordinate_expansion(monkeypatch) -> None:
+    component = np.zeros((3, 16, 40), dtype=bool)
+    red_mask = np.zeros_like(component)
+    component[1, 8, 4:24] = True
+    red_mask[1, 8, 29:33] = True
+    spacing = VoxelSpacing(x_um=1.0, y_um=1.0, z_um=1.0)
+    surface = microglia_vessel_report._surface_mask(component)
+    vessel_surface_dist_um, vessel_surface_indices = microglia_vessel_report._compute_vessel_surface_distance_maps(
+        red_mask,
+        spacing,
+    )
+
+    def _fail_coords(*_args, **_kwargs):
+        raise AssertionError("nearest-vessel lookup should not expand full component coordinates")
+
+    monkeypatch.setattr(microglia_vessel_report, "_coords_from_local_mask", _fail_coords)
+
+    distance_um, micro_idx, vessel_idx = microglia_vessel_report._closest_surface_pair_for_component(
+        component_local=component,
+        component_surface_local=surface,
+        component_slice=(slice(0, 3), slice(0, 16), slice(0, 40)),
+        red_mask=red_mask,
+        vessel_surface_dist_um=vessel_surface_dist_um,
+        vessel_surface_indices=vessel_surface_indices,
+    )
+
+    assert distance_um == 6.0
+    assert micro_idx == (1, 8, 23)
+    assert vessel_idx == (1, 8, 29)
 
 
 def test_branch_endpoint_and_junction_counts() -> None:

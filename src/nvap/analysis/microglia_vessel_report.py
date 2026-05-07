@@ -338,52 +338,71 @@ def _coords_from_local_mask(
     )
 
 
-def _closest_surface_pair_from_coords(
-    component_coords: tuple[np.ndarray, np.ndarray, np.ndarray],
-    component_surface_coords: tuple[np.ndarray, np.ndarray, np.ndarray],
+def _local_to_global_voxel(
+    local_voxel: tuple[int, int, int],
+    comp_slice: tuple[slice, slice, slice],
+) -> tuple[int, int, int]:
+    return (
+        int(local_voxel[0]) + int(comp_slice[0].start or 0),
+        int(local_voxel[1]) + int(comp_slice[1].start or 0),
+        int(local_voxel[2]) + int(comp_slice[2].start or 0),
+    )
+
+
+def _first_global_mask_coord(
+    local_mask: np.ndarray,
+    comp_slice: tuple[slice, slice, slice],
+) -> tuple[int, int, int]:
+    mask = np.asarray(local_mask, dtype=bool)
+    if not np.any(mask):
+        return (0, 0, 0)
+    first_flat = int(np.argmax(mask))
+    local_voxel = np.unravel_index(first_flat, mask.shape)
+    return _local_to_global_voxel(
+        (int(local_voxel[0]), int(local_voxel[1]), int(local_voxel[2])),
+        comp_slice,
+    )
+
+
+def _closest_surface_pair_for_component(
+    component_local: np.ndarray,
+    component_surface_local: np.ndarray,
+    component_slice: tuple[slice, slice, slice],
     red_mask: np.ndarray,
     vessel_surface_dist_um: np.ndarray | None,
     vessel_surface_indices: np.ndarray | None,
 ) -> tuple[float, tuple[int, int, int], tuple[int, int, int] | None]:
-    if component_coords[0].size <= 0:
+    component_mask = np.asarray(component_local, dtype=bool)
+    if not np.any(component_mask):
         return float("nan"), (0, 0, 0), None
 
-    touching = red_mask[component_coords]
-    if np.any(touching):
-        touch_idx = int(np.flatnonzero(touching)[0])
-        micro_idx = (
-            int(component_coords[0][touch_idx]),
-            int(component_coords[1][touch_idx]),
-            int(component_coords[2][touch_idx]),
-        )
+    touching_local = np.asarray(red_mask[component_slice], dtype=bool) & component_mask
+    if np.any(touching_local):
+        micro_idx = _first_global_mask_coord(touching_local, component_slice)
         return 0.0, micro_idx, micro_idx
 
+    candidate_mask = np.asarray(component_surface_local, dtype=bool)
+    if not np.any(candidate_mask):
+        candidate_mask = component_mask
+    micro_idx = _first_global_mask_coord(candidate_mask, component_slice)
+
     if vessel_surface_dist_um is None or vessel_surface_indices is None:
-        if component_surface_coords[0].size > 0:
-            micro_idx = (
-                int(component_surface_coords[0][0]),
-                int(component_surface_coords[1][0]),
-                int(component_surface_coords[2][0]),
-            )
-        else:
-            micro_idx = (
-                int(component_coords[0][0]),
-                int(component_coords[1][0]),
-                int(component_coords[2][0]),
-            )
         return float("nan"), micro_idx, None
 
-    candidate_coords = component_surface_coords
-    if candidate_coords[0].size <= 0:
-        candidate_coords = component_coords
-    candidate_dist = vessel_surface_dist_um[candidate_coords]
-    best_local = int(np.argmin(candidate_dist))
-    micro_idx = (
-        int(candidate_coords[0][best_local]),
-        int(candidate_coords[1][best_local]),
-        int(candidate_coords[2][best_local]),
+    candidate_flat = np.flatnonzero(candidate_mask)
+    if candidate_flat.size <= 0:
+        return float("nan"), micro_idx, None
+
+    local_distances = np.asarray(vessel_surface_dist_um[component_slice], dtype=np.float32)
+    distance_flat = local_distances.reshape(-1)
+    best_local = int(np.argmin(distance_flat[candidate_flat]))
+    best_flat = int(candidate_flat[best_local])
+    best_local_voxel = np.unravel_index(best_flat, candidate_mask.shape)
+    micro_idx = _local_to_global_voxel(
+        (int(best_local_voxel[0]), int(best_local_voxel[1]), int(best_local_voxel[2])),
+        component_slice,
     )
-    best_distance = float(candidate_dist[best_local])
+    best_distance = float(distance_flat[best_flat])
     vessel_idx = (
         int(vessel_surface_indices[0][micro_idx]),
         int(vessel_surface_indices[1][micro_idx]),
@@ -976,11 +995,10 @@ def _analyze_single_microglia_component(
         )
 
     component_surface_local = _surface_mask(component_local)
-    component_coords = _coords_from_local_mask(component_local, comp_slice)
-    component_surface_coords = _coords_from_local_mask(component_surface_local, comp_slice)
-    distance_um, micro_idx, vessel_idx = _closest_surface_pair_from_coords(
-        component_coords=component_coords,
-        component_surface_coords=component_surface_coords,
+    distance_um, micro_idx, vessel_idx = _closest_surface_pair_for_component(
+        component_local=component_local,
+        component_surface_local=component_surface_local,
+        component_slice=comp_slice,
         red_mask=red_mask,
         vessel_surface_dist_um=vessel_surface_dist_um,
         vessel_surface_indices=vessel_surface_indices,
@@ -1416,12 +1434,12 @@ def analyze_microglia_vessel(
                 if result is not None:
                     component_results.append(result)
                 if completed == 1 or completed == total_cells or (completed % progress_stride == 0):
-                    frac = 0.46 + (0.44 * (float(completed - 1) / max(1.0, float(total_cells))))
+                    frac = 0.46 + (0.44 * (float(completed) / max(1.0, float(total_cells))))
                     _publish_progress(frac, f"Analyzing microglia cell {completed}/{total_cells}...", log=True)
     else:
         for completed, (cell_index, component_id, component_slice) in enumerate(component_jobs, start=1):
             if completed == 1 or completed == total_cells or (completed % progress_stride == 0):
-                frac = 0.46 + (0.44 * (float(completed - 1) / max(1.0, float(total_cells))))
+                frac = 0.46 + (0.44 * (float(completed) / max(1.0, float(total_cells))))
                 _publish_progress(frac, f"Analyzing microglia cell {completed}/{total_cells}...", log=True)
             result = _analyze_single_microglia_component(
                 cell_index=cell_index,
@@ -1446,8 +1464,11 @@ def analyze_microglia_vessel(
             if result is not None:
                 component_results.append(result)
 
+    aggregate_total = max(1, len(component_results))
+    aggregate_stride = max(1, aggregate_total // 10)
+    _publish_progress(0.91, f"Aggregating results from {aggregate_total} cell(s)...", log=True)
     component_results.sort(key=lambda item: int(item.cell_index))
-    for result in component_results:
+    for aggregate_index, result in enumerate(component_results, start=1):
         rows.append(result.row)
         soma_core_labels[result.component_slice][result.soma_local] = int(result.cell_index)
         overlay_points.extend(result.overlay_points)
@@ -1510,6 +1531,16 @@ def analyze_microglia_vessel(
                         "points_xyz_um": [[float(v) for v in tip_xyz], [float(v) for v in tip_vessel_xyz]],
                     }
                 )
+
+        if (
+            aggregate_index == aggregate_total
+            or aggregate_index % aggregate_stride == 0
+        ):
+            frac = 0.91 + (0.04 * (float(aggregate_index) / float(aggregate_total)))
+            _publish_progress(
+                frac,
+                f"Aggregating cell {aggregate_index}/{aggregate_total}...",
+            )
 
     if overlay_state["crossings"]:
         for crossing in crossing_rows:
