@@ -10,8 +10,7 @@ import numpy as np
 from PySide6.QtCore import Qt
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.util.numpy_support import numpy_to_vtk
-from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkImageData, vtkPiecewiseFunction, vtkPolyData, vtkPolyLine
-from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPiecewiseFunction
 from vtkmodules.vtkFiltersCore import vtkMarchingCubes
 from vtkmodules.vtkImagingCore import vtkImageResample
 from vtkmodules.vtkIOImage import vtkPNGWriter
@@ -42,6 +41,7 @@ _RENDER_CUBIC_MAX_OUTPUT_VOXELS = 240_000_000
 _RENDER_SAMPLE_RATIO_DEFAULT = 0.18
 _RENDER_SAMPLE_RATIO_ANISO = 0.16
 _RENDER_SAMPLE_RATIO_LABELS = 0.14
+_SURFACE_PIPELINE_MAX_VOXELS = 96_000_000
 
 
 def _volume_debug_summary(volume: np.ndarray) -> str:
@@ -164,7 +164,8 @@ class _ChannelActors:
     volume_mapper: object
     volume_property: vtkVolumeProperty
     iso_actor: vtkActor
-    marching: vtkMarchingCubes
+    marching: vtkMarchingCubes | None = None
+    surface_allowed: bool = True
 
 
 class VTKScene:
@@ -190,7 +191,6 @@ class VTKScene:
         self._spacing: dict[str, VoxelSpacing] = {}
         self._current = RenderConfig()
         self._component_coloring: dict[str, int] = {}
-        self._debug_overlay_actors: list[vtkActor] = []
         self._last_render_time = time.perf_counter()
         self._fps_actor = self._build_fps_actor()
         self._scale_actor = vtkLegendScaleActor()
@@ -294,142 +294,6 @@ class VTKScene:
         self._last_render_time = now
         self._fps_actor.SetInput(f"FPS {1.0 / elapsed:4.1f}")
 
-    def clear_debug_overlays(self) -> None:
-        for actor in self._debug_overlay_actors:
-            self._renderer.RemoveActor(actor)
-        self._debug_overlay_actors.clear()
-        self.render()
-
-    def set_debug_overlays(
-        self,
-        points: list[dict[str, object]] | None = None,
-        lines: list[dict[str, object]] | None = None,
-        *,
-        visibility: dict[str, bool] | None = None,
-    ) -> None:
-        self.clear_debug_overlays()
-        visibility = visibility or {}
-        grouped_points: dict[str, list[tuple[float, float, float]]] = {}
-        for item in points or []:
-            kind = str(item.get("kind", "point"))
-            if not self._debug_kind_visible(kind, visibility):
-                continue
-            xyz = item.get("xyz_um")
-            if not isinstance(xyz, list | tuple) or len(xyz) != 3:
-                continue
-            grouped_points.setdefault(kind, []).append((float(xyz[0]), float(xyz[1]), float(xyz[2])))
-        for kind, coords in grouped_points.items():
-            actor = self._make_point_actor(coords, self._debug_color(kind), point_size=self._debug_point_size(kind))
-            self._renderer.AddActor(actor)
-            self._debug_overlay_actors.append(actor)
-
-        grouped_lines: dict[str, list[list[tuple[float, float, float]]]] = {}
-        for item in lines or []:
-            kind = str(item.get("kind", "line"))
-            if not self._debug_kind_visible(kind, visibility):
-                continue
-            raw_points = item.get("points_xyz_um")
-            if not isinstance(raw_points, list | tuple):
-                continue
-            coords = []
-            for raw in raw_points:
-                if isinstance(raw, list | tuple) and len(raw) == 3:
-                    coords.append((float(raw[0]), float(raw[1]), float(raw[2])))
-            if len(coords) >= 2:
-                grouped_lines.setdefault(kind, []).append(coords)
-        for kind, paths in grouped_lines.items():
-            actor = self._make_line_actor(paths, self._debug_color(kind))
-            self._renderer.AddActor(actor)
-            self._debug_overlay_actors.append(actor)
-        self.render()
-
-    @staticmethod
-    def _debug_kind_visible(kind: str, visibility: dict[str, bool]) -> bool:
-        mapping = {
-            "soma_center": "soma",
-            "branch_path": "branches",
-            "tip": "tips",
-            "cell_to_vessel": "connectors",
-            "tip_to_vessel": "connectors",
-            "nearest_vessel_point": "vessels",
-            "diameter_sample": "diameter",
-            "vessel_crossing": "crossings",
-        }
-        key = mapping.get(kind, kind)
-        return bool(visibility.get(key, True))
-
-    @staticmethod
-    def _debug_color(kind: str) -> tuple[float, float, float]:
-        colors = {
-            "soma_center": (1.0, 0.92, 0.0),
-            "branch_path": (0.0, 0.72, 1.0),
-            "tip": (1.0, 0.0, 0.9),
-            "cell_to_vessel": (1.0, 1.0, 1.0),
-            "tip_to_vessel": (0.7, 0.7, 1.0),
-            "nearest_vessel_point": (1.0, 0.25, 0.15),
-            "diameter_sample": (1.0, 0.55, 0.0),
-            "vessel_crossing": (1.0, 1.0, 1.0),
-        }
-        return colors.get(kind, (1.0, 1.0, 1.0))
-
-    @staticmethod
-    def _debug_point_size(kind: str) -> float:
-        if kind == "vessel_crossing":
-            return 11.0
-        if kind in {"soma_center", "tip"}:
-            return 8.0
-        return 6.0
-
-    @staticmethod
-    def _make_point_actor(
-        coords: list[tuple[float, float, float]],
-        color: tuple[float, float, float],
-        *,
-        point_size: float,
-    ) -> vtkActor:
-        points = vtkPoints()
-        vertices = vtkCellArray()
-        for x, y, z in coords:
-            point_id = points.InsertNextPoint(float(x), float(y), float(z))
-            vertices.InsertNextCell(1)
-            vertices.InsertCellPoint(point_id)
-        poly = vtkPolyData()
-        poly.SetPoints(points)
-        poly.SetVerts(vertices)
-        mapper = vtkPolyDataMapper()
-        mapper.SetInputData(poly)
-        actor = vtkActor()
-        actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(*color)
-        actor.GetProperty().SetPointSize(float(point_size))
-        actor.GetProperty().SetRenderPointsAsSpheres(True)
-        return actor
-
-    @staticmethod
-    def _make_line_actor(
-        paths: list[list[tuple[float, float, float]]],
-        color: tuple[float, float, float],
-    ) -> vtkActor:
-        points = vtkPoints()
-        cells = vtkCellArray()
-        for path in paths:
-            polyline = vtkPolyLine()
-            polyline.GetPointIds().SetNumberOfIds(len(path))
-            for idx, (x, y, z) in enumerate(path):
-                point_id = points.InsertNextPoint(float(x), float(y), float(z))
-                polyline.GetPointIds().SetId(idx, point_id)
-            cells.InsertNextCell(polyline)
-        poly = vtkPolyData()
-        poly.SetPoints(points)
-        poly.SetLines(cells)
-        mapper = vtkPolyDataMapper()
-        mapper.SetInputData(poly)
-        actor = vtkActor()
-        actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(*color)
-        actor.GetProperty().SetLineWidth(2.0)
-        return actor
-
     def set_channel_component_coloring(
         self,
         channel: str,
@@ -451,6 +315,8 @@ class VTKScene:
             raise ValueError("channel must be 'green' or 'red'.")
         if volume.ndim != 3:
             raise ValueError("volume must have shape (z, y, x).")
+        voxel_count = int(np.prod(np.asarray(volume.shape, dtype=np.int64)))
+        surface_allowed = voxel_count <= _SURFACE_PIPELINE_MAX_VOXELS
         render_spacing = _cubic_render_spacing(volume.shape, spacing)
         needs_resample = not _same_spacing(render_spacing, spacing)
         logger.info(
@@ -466,6 +332,15 @@ class VTKScene:
             render_spacing.z_um,
             needs_resample,
         )
+        if not surface_allowed:
+            logger.warning(
+                "VTK isosurface disabled for channel=%s: shape=%s voxels=%d exceeds limit=%d; "
+                "falling back to volume rendering.",
+                channel,
+                volume.shape,
+                voxel_count,
+                _SURFACE_PIPELINE_MAX_VOXELS,
+            )
 
         if channel in self._actors:
             actor = self._actors[channel]
@@ -532,15 +407,7 @@ class VTKScene:
         volume_actor.SetMapper(mapper)
         volume_actor.SetProperty(prop)
 
-        marching = vtkMarchingCubes()
-        self._set_pipeline_input(marching, mapper_input)
-        marching.SetValue(0, self._current.iso_green if channel == "green" else self._current.iso_red)
-        marching.ComputeNormalsOn()
-        marching.ComputeGradientsOn()
-        iso_mapper = vtkPolyDataMapper()
-        iso_mapper.SetInputConnection(marching.GetOutputPort())
         iso_actor = vtkActor()
-        iso_actor.SetMapper(iso_mapper)
 
         if channel == "green":
             rgb = (0.08, 0.95, 0.18)
@@ -565,7 +432,8 @@ class VTKScene:
             volume_mapper=mapper,
             volume_property=prop,
             iso_actor=iso_actor,
-            marching=marching,
+            marching=None,
+            surface_allowed=surface_allowed,
         )
         self._spacing[channel] = render_spacing
         self.apply_render_config(self._current)
@@ -689,6 +557,36 @@ class VTKScene:
         )
         return mapper
 
+    def _surface_input(self, actor: _ChannelActors):
+        if actor.resample is not None:
+            return actor.resample.GetOutputPort()
+        return actor.image
+
+    def _ensure_surface_pipeline(
+        self,
+        channel: str,
+        actor: _ChannelActors,
+        iso_value: float,
+    ) -> bool:
+        if not actor.surface_allowed:
+            return False
+        if actor.marching is None:
+            marching = vtkMarchingCubes()
+            self._set_pipeline_input(marching, self._surface_input(actor))
+            marching.SetValue(0, iso_value)
+            marching.ComputeNormalsOn()
+            marching.ComputeGradientsOff()
+
+            iso_mapper = vtkPolyDataMapper()
+            iso_mapper.SetInputConnection(marching.GetOutputPort())
+            actor.iso_actor.SetMapper(iso_mapper)
+            actor.marching = marching
+            logger.info("VTK isosurface pipeline created: channel=%s", channel)
+            return True
+
+        actor.marching.SetValue(0, iso_value)
+        return True
+
     def apply_render_config(self, config: RenderConfig) -> None:
         self._current = config
         logger.debug(
@@ -755,9 +653,10 @@ class VTKScene:
             actor.volume_property.SetColor(color_tf)
             actor.volume_property.SetScalarOpacity(scalar_opacity)
             actor.volume_property.SetGradientOpacity(0, gradient_opacity)
-            actor.volume_actor.SetVisibility(1 if visible else 0)
-            actor.marching.SetValue(0, 0.5)
-            actor.iso_actor.SetVisibility(0)
+            # Surface mode avoids the slab-like label volume when inspecting 3D components.
+            surface_visible = bool(visible and show_iso and self._ensure_surface_pipeline(channel, actor, 0.5))
+            actor.volume_actor.SetVisibility(1 if (visible and not surface_visible) else 0)
+            actor.iso_actor.SetVisibility(1 if surface_visible else 0)
             return
 
         color_tf = vtkColorTransferFunction()
@@ -786,9 +685,10 @@ class VTKScene:
         actor.volume_property.SetColor(color_tf)
         actor.volume_property.SetScalarOpacity(scalar_opacity)
         actor.volume_property.SetGradientOpacity(0, gradient_opacity)
-        actor.volume_actor.SetVisibility(1 if visible else 0)
-        actor.marching.SetValue(0, iso)
-        actor.iso_actor.SetVisibility(1 if (visible and show_iso) else 0)
+        # Prefer a clean isosurface shell when surface mode is enabled.
+        surface_visible = bool(visible and show_iso and self._ensure_surface_pipeline(channel, actor, iso))
+        actor.volume_actor.SetVisibility(1 if (visible and not surface_visible) else 0)
+        actor.iso_actor.SetVisibility(1 if surface_visible else 0)
 
     @staticmethod
     def _component_color_transfer_function(label_count: int) -> vtkColorTransferFunction:
@@ -829,7 +729,6 @@ class VTKScene:
 
     def cleanup(self) -> None:
         """Release VTK resources to avoid GPU/memory leaks on window close."""
-        self.clear_debug_overlays()
         for actor in self._actors.values():
             self._renderer.RemoveVolume(actor.volume_actor)
             self._renderer.RemoveActor(actor.iso_actor)

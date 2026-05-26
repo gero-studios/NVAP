@@ -1,8 +1,6 @@
 """NVAP right-side quantitative summary panel."""
 from __future__ import annotations
 
-import math
-
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
@@ -14,7 +12,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from nvap.analysis.microglia_vessel_report import MicrogliaCellReport
 from nvap.config.types import MetricsComputation
 
 
@@ -84,7 +81,7 @@ class _StatusRow(QWidget):
 
 
 class MetricsPanel(QWidget):
-    """Right-side quantitative summary panel showing microglia-separation metrics."""
+    """Right-side quantitative summary panel showing dataset metrics."""
 
     view_details_requested = Signal()
 
@@ -110,30 +107,27 @@ class MetricsPanel(QWidget):
         summary_lbl = QLabel("Quantitative Summary")
         summary_lbl.setObjectName("panelSectionTitle")
         layout.addWidget(summary_lbl)
-        self._summary_hint = QLabel(
-            "Run microglia separation in Analytics to populate this summary."
-        )
+        self._summary_hint = QLabel("Load a dataset to populate this summary.")
         self._summary_hint.setObjectName("summaryHint")
         self._summary_hint.setWordWrap(True)
         layout.addWidget(self._summary_hint)
         layout.addSpacing(16)
 
-        self._microglia_count = _MetricRow("\u2726", "Separated Cells")
-        self._microglia_volume = _MetricRow("\u29c1", "Total Volume")
-        self._soma_volume = _MetricRow("\u25c9", "Soma Volume")
-        self._branch_mean = _MetricRow("\u2442", "Mean Branches")
-        self._distance_mean = _MetricRow("\u2194", "Mean Vessel Distance")
-        self._interactions = _MetricRow("\u229d", "Interaction Events")
+        self._green_voxels = _MetricRow("\u2726", "Green Voxels")
+        self._green_volume = _MetricRow("\u29c1", "Green Volume")
+        self._red_voxels = _MetricRow("\u25c9", "Red Voxels")
+        self._red_volume = _MetricRow("\u2442", "Red Volume")
+        self._overlap = _MetricRow("\u2194", "Overlap Volume")
+        self._components = _MetricRow("\u229d", "Components")
         self._dataset_loaded = False
-        self._report_ready = False
 
         for row in (
-            self._microglia_count,
-            self._microglia_volume,
-            self._soma_volume,
-            self._branch_mean,
-            self._distance_mean,
-            self._interactions,
+            self._green_voxels,
+            self._green_volume,
+            self._red_voxels,
+            self._red_volume,
+            self._overlap,
+            self._components,
         ):
             layout.addWidget(row)
             sep = QFrame()
@@ -156,11 +150,9 @@ class MetricsPanel(QWidget):
         status_layout.setSpacing(4)
 
         self._status_reconstruction = _StatusRow("3D Reconstruction")
-        self._status_separation = _StatusRow("Microglia Separation")
         self._status_summary = _StatusRow("Quantitative Summary")
 
         status_layout.addWidget(self._status_reconstruction)
-        status_layout.addWidget(self._status_separation)
         status_layout.addWidget(self._status_summary)
 
         layout.addWidget(status_card)
@@ -185,17 +177,17 @@ class MetricsPanel(QWidget):
 
     def _clear_values(self) -> None:
         for row in (
-            self._microglia_count,
-            self._microglia_volume,
-            self._soma_volume,
-            self._branch_mean,
-            self._distance_mean,
-            self._interactions,
+            self._green_voxels,
+            self._green_volume,
+            self._red_voxels,
+            self._red_volume,
+            self._overlap,
+            self._components,
         ):
             row.set_value("\u2014")
 
     def update_from_metrics(self, metrics: MetricsComputation) -> None:
-        """Update dataset readiness without exposing summary values before separation runs."""
+        """Update dataset-scale summary values."""
         self._dataset_loaded = bool(metrics.channel_results)
         if self._dataset_loaded:
             self._status_reconstruction.set_complete()
@@ -203,73 +195,26 @@ class MetricsPanel(QWidget):
             self.clear()
             return
 
-        if not self._report_ready:
-            self._clear_values()
-            self._status_separation.set_pending()
-            self._status_summary.set_pending()
-            self._summary_hint.setText(
-                "Run microglia separation in Analytics to populate this summary."
-            )
-
-    def update_from_report(self, report: MicrogliaCellReport | None) -> None:
-        """Populate the panel from the latest microglia-separation report."""
-        self._report_ready = report is not None
-        if report is None:
-            self._clear_values()
-            if self._dataset_loaded:
-                self._status_reconstruction.set_complete()
-            else:
-                self._status_reconstruction.set_pending()
-            self._status_separation.set_pending()
-            self._status_summary.set_pending()
-            self._summary_hint.setText(
-                "Run microglia separation in Analytics to populate this summary."
-            )
-            return
-
-        self._dataset_loaded = True
-        self._status_reconstruction.set_complete()
-        self._status_separation.set_complete()
         self._status_summary.set_complete()
-        self._summary_hint.setText(
-            "Summary derived from the latest microglia separation run."
-        )
+        self._summary_hint.setText("Summary derived from the current render thresholds.")
 
-        rows = list(report.rows)
-        cell_count = int(report.cell_count)
-        total_volume = float(sum(float(row.volume_um3) for row in rows))
-        soma_volumes = [float(row.soma_volume_um3) for row in rows if math.isfinite(float(row.soma_volume_um3))]
-        distance_values = [
-            float(row.distance_to_vasculature_um)
-            for row in rows
-            if math.isfinite(float(row.distance_to_vasculature_um))
-        ]
-        branch_mean = (
-            sum(float(row.branch_count) for row in rows) / float(cell_count)
-            if cell_count > 0
-            else 0.0
-        )
-        interaction_events = int(sum(int(row.tip_near_multiple_vessel_count) for row in rows))
-
-        self._microglia_count.set_value(f"{cell_count:,}")
-        self._microglia_volume.set_value(self._format_volume_um3(total_volume))
-        self._soma_volume.set_value(self._format_volume_um3(sum(soma_volumes) if soma_volumes else 0.0))
-        self._branch_mean.set_value(f"{branch_mean:.1f}/cell")
-        if distance_values:
-            mean_distance = sum(distance_values) / float(len(distance_values))
-            self._distance_mean.set_value(f"{mean_distance:.1f} um")
-        else:
-            self._distance_mean.set_value("\u2014")
-        self._interactions.set_value(f"{interaction_events:,}")
+        by_channel = {item.channel.lower(): item for item in metrics.channel_results}
+        green = by_channel.get("green")
+        red = by_channel.get("red")
+        if green is not None:
+            self._green_voxels.set_value(f"{green.voxel_count:,}")
+            self._green_volume.set_value(self._format_volume_um3(float(green.volume_um3)))
+        if red is not None:
+            self._red_voxels.set_value(f"{red.voxel_count:,}")
+            self._red_volume.set_value(self._format_volume_um3(float(red.volume_um3)))
+        self._overlap.set_value(self._format_volume_um3(float(metrics.overlap_volume_um3)))
+        component_total = sum(int(item.component_count) for item in metrics.channel_results)
+        self._components.set_value(f"{component_total:,}")
 
     def clear(self) -> None:
         """Reset all metrics to placeholder dashes."""
         self._dataset_loaded = False
-        self._report_ready = False
         self._clear_values()
         self._status_reconstruction.set_pending()
-        self._status_separation.set_pending()
         self._status_summary.set_pending()
-        self._summary_hint.setText(
-            "Load a dataset to unlock microglia separation analytics."
-        )
+        self._summary_hint.setText("Load a dataset to populate this summary.")

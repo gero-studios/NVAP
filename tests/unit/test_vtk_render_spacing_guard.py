@@ -48,3 +48,4 @@ def test_recommended_sample_distance_label_mode_is_tighter() -> None:
 
     assert label_step < default_step
     assert label_step > 0.0
+

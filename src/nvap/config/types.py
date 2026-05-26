@@ -102,7 +102,7 @@ class RenderConfig:
     opacity_red: float = 0.35
     iso_green: float = 0.25
     iso_red: float = 0.25
-    display_z_scale: float = 2.0 / 3.0
+    display_z_scale: float = 0.5
     trim_first_slices: int = 20
     trim_last_slices: int = 20
     offset_x_um: float = 0.0
@@ -110,8 +110,8 @@ class RenderConfig:
     offset_z_um: float = 0.0
     show_green: bool = True
     show_red: bool = True
-    show_iso_green: bool = False
-    show_iso_red: bool = False
+    show_iso_green: bool = True
+    show_iso_red: bool = True
 
 
 @dataclass(frozen=True)

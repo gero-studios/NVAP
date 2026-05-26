@@ -1050,10 +1050,15 @@ def _detect_soma_blobs(
         )
         contrast_positive = contrast[finite & (contrast > 0.0)]
         if contrast_positive.size > 0:
-            contrast_norm = contrast / max(1.0e-6, float(np.quantile(contrast_positive, 0.98)))
+            contrast_norm = np.asarray(
+                contrast / max(1.0e-6, float(np.quantile(contrast_positive, 0.98))),
+                dtype=np.float32,
+            )
+            contrast_norm *= float(0.42 if dense_mode else 0.28)
+            contrast_norm += np.asarray(detect, dtype=np.float32)
+            seed_score = contrast_norm
         else:
-            contrast_norm = np.zeros_like(detect, dtype=np.float32)
-        seed_score = np.asarray(detect + ((0.42 if dense_mode else 0.28) * contrast_norm), dtype=np.float32)
+            seed_score = np.asarray(detect, dtype=np.float32)
 
     peak_quantile = float(np.clip(0.85 - (0.07 * (sensitivity_scale - 1.0)), 0.70, 0.90))
     peak_floor = float(max(threshold, np.quantile(detect_positive, peak_quantile)))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -79,7 +80,7 @@ def test_scene_uses_vtk_cubic_resample_for_anisotropic_volume() -> None:
 
     actor = scene._actors["green"]
     assert actor.resample is not None
-    assert actor.resample.GetInterpolationModeAsString().lower() == "cubic"
+    assert actor.resample.GetInterpolationModeAsString().lower() == "linear"
     assert scene._spacing["green"].z_um < 0.66
 
     scene.widget().close()
@@ -104,6 +105,63 @@ def test_snapshot_export(tmp_path: Path) -> None:
 
     assert out.exists()
     assert out.stat().st_size > 0
+
+
+@pytest.mark.integration
+def test_scene_builds_surface_pipeline_only_when_surface_mode_is_enabled() -> None:
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    pytest.importorskip("vtkmodules")
+
+    from nvap.config.types import RenderConfig
+    from nvap.render.vtk_scene import VTKScene
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scene = VTKScene()
+    scene.apply_render_config(RenderConfig(show_iso_green=False, show_iso_red=False))
+    volume = np.zeros((8, 24, 24), dtype=np.float32)
+    volume[:, 12, 12] = 1.0
+
+    scene.set_channel_data("green", volume, VoxelSpacing())
+
+    actor = scene._actors["green"]
+    assert actor.marching is None
+    assert actor.volume_actor.GetVisibility() == 1
+    assert actor.iso_actor.GetVisibility() == 0
+
+    scene.apply_render_config(replace(scene._current, show_iso_green=True))
+
+    assert actor.marching is not None
+    assert actor.volume_actor.GetVisibility() == 0
+    assert actor.iso_actor.GetVisibility() == 1
+
+    scene.widget().close()
+    app.processEvents()
+
+
+@pytest.mark.integration
+def test_scene_falls_back_to_volume_render_when_surface_pipeline_is_blocked(monkeypatch) -> None:
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    pytest.importorskip("vtkmodules")
+
+    from nvap.render import vtk_scene as vtk_scene_module
+    from nvap.render.vtk_scene import VTKScene
+
+    monkeypatch.setattr(vtk_scene_module, "_SURFACE_PIPELINE_MAX_VOXELS", 32)
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scene = VTKScene()
+    volume = np.zeros((4, 4, 4), dtype=np.float32)
+    volume[1:3, 1:3, 1:3] = 1.0
+
+    scene.set_channel_data("green", volume, VoxelSpacing())
+
+    actor = scene._actors["green"]
+    assert actor.marching is None
+    assert actor.volume_actor.GetVisibility() == 1
+    assert actor.iso_actor.GetVisibility() == 0
+
+    scene.widget().close()
+    app.processEvents()
 
 
 @pytest.mark.integration

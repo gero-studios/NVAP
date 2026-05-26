@@ -14,13 +14,11 @@ import scipy.ndimage as ndi
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -30,19 +28,12 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
-    QTableWidget,
-    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
-from nvap.analysis.microglia_vessel_report import (
-    MicrogliaCellReport,
-    analyze_microglia_vessel,
-    export_microglia_analysis_bundle,
-)
 from nvap.cache.processed_cache import (
     build_dataset_signature,
     build_processed_cache_key,
@@ -279,7 +270,6 @@ class MainWindow(QMainWindow):
         self.latest_metrics: MetricsComputation | None = None
         self._metrics_revision = 0
         self._metrics_cache_key: tuple[int, float, float, float, float, float] | None = None
-        self.latest_microglia_report: MicrogliaCellReport | None = None
         self.dataset_root: Path | None = None
         self._dataset_signature: str | None = None
         self._current_channel_sources: dict[str, str] | None = None
@@ -297,7 +287,6 @@ class MainWindow(QMainWindow):
         self._eta_scale_load = 1.0
         self._eta_scale_psf = 1.0
         self._eta_scale_microglia_separation = 1.0
-        self._eta_scale_microglia_analysis = 1.0
         self._eta_scale_mesh_export = 1.0
         self._display_z_scale = float(max(0.05, self.current_render.display_z_scale))
         self._busy_timer = QTimer(self)
@@ -331,15 +320,6 @@ class MainWindow(QMainWindow):
         self.controls.render_config_changed.connect(self._on_render_config_changed)
         self.controls.microglia_view_changed.connect(self._on_microglia_view_changed)
         self.controls.enhance_microglia_requested.connect(self._on_enhance_microglia_requested)
-        self.controls.run_microglia_analysis_requested.connect(
-            self._on_run_microglia_analysis_requested
-        )
-        self.controls.microglia_analysis_overlay_changed.connect(
-            self._refresh_microglia_analysis_overlays
-        )
-        self.controls.export_microglia_analysis_requested.connect(
-            self._on_export_microglia_analysis_requested
-        )
         self.controls.export_metrics_requested.connect(self._on_export_metrics_requested)
         self.controls.export_snapshot_requested.connect(self._on_export_snapshot_requested)
         self.controls.export_mesh_requested.connect(self._on_export_mesh_requested)
@@ -532,7 +512,7 @@ class MainWindow(QMainWindow):
         return sidebar
 
     def _build_analytics_placeholder(self) -> QWidget:
-        """Analytics overview with dataset metrics and per-cell drilldown."""
+        """Analytics overview with dataset-level metrics only."""
         w = QWidget()
         w.setObjectName("sectionPage")
         lo = QVBoxLayout(w)
@@ -547,10 +527,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("pageTitle")
         lo.addWidget(title)
 
-        intro = QLabel(
-            "Dataset-scale channel metrics, microglia-vessel summary, and "
-            "per-cell morphology drilldown from the latest analysis run."
-        )
+        intro = QLabel("Dataset-scale channel metrics from the current render thresholds.")
         intro.setObjectName("pageIntro")
         intro.setWordWrap(True)
         lo.addWidget(intro)
@@ -560,59 +537,16 @@ class MainWindow(QMainWindow):
         card_grid.setHorizontalSpacing(16)
         card_grid.setVerticalSpacing(16)
         self._analytics_cards: dict[str, _AnalyticsMetricCard] = {
-            "cells": _AnalyticsMetricCard("Separated cells", "--", "Run microglia analysis to populate."),
-            "volume": _AnalyticsMetricCard("Microglia volume", "--", "Thresholded green channel."),
-            "distance": _AnalyticsMetricCard("Mean vessel distance", "--", "Nearest vasculature per cell."),
+            "volume": _AnalyticsMetricCard("Green volume", "--", "Thresholded green channel."),
             "overlap": _AnalyticsMetricCard("Channel overlap", "--", "Green/red shared voxels."),
             "green_components": _AnalyticsMetricCard("Green components", "--", "Connected thresholded objects."),
             "red_components": _AnalyticsMetricCard("Red components", "--", "Connected thresholded objects."),
         }
         for idx, card in enumerate(self._analytics_cards.values()):
-            card_grid.addWidget(card, idx // 3, idx % 3)
+            card_grid.addWidget(card, idx // 2, idx % 2)
         lo.addLayout(card_grid)
-        lo.addSpacing(24)
-
-        drilldown_header = QHBoxLayout()
-        drilldown_title = QLabel("Per-Cell Drilldown")
-        drilldown_title.setObjectName("sectionTitle")
-        drilldown_header.addWidget(drilldown_title)
-        drilldown_header.addStretch(1)
-        self._analytics_table_status = QLabel("No analysis run")
-        self._analytics_table_status.setObjectName("sectionSubtle")
-        drilldown_header.addWidget(self._analytics_table_status)
-        lo.addLayout(drilldown_header)
-        lo.addSpacing(12)
-
-        self._analytics_table = QTableWidget(0, 8)
-        self._analytics_table.setObjectName("analyticsCellTable")
-        self._analytics_table.setAlternatingRowColors(True)
-        self._analytics_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._analytics_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._analytics_table.setHorizontalHeaderLabels(
-            [
-                "Cell",
-                "Voxels",
-                "Volume um^3",
-                "Soma um^3",
-                "Branches",
-                "Endpoints",
-                "Distance um",
-                "Events",
-            ]
-        )
-        header = self._analytics_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        header.setMinimumSectionSize(88)
-        self._analytics_table.verticalHeader().setVisible(False)
-        self._analytics_table.setMinimumHeight(300)
-        lo.addWidget(self._analytics_table)
         lo.addStretch(1)
         return w
-
-    def _set_analytics_table_item(self, row: int, col: int, text: str) -> None:
-        item = QTableWidgetItem(text)
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._analytics_table.setItem(row, col, item)
 
     def _refresh_analytics_metrics(self) -> None:
         if not hasattr(self, "_analytics_cards"):
@@ -621,72 +555,30 @@ class MainWindow(QMainWindow):
         for card in self._analytics_cards.values():
             card.set_value("--", "Load a dataset to populate.")
 
-        if self.latest_metrics is not None:
-            by_channel = {item.channel.lower(): item for item in self.latest_metrics.channel_results}
-            green = by_channel.get("green")
-            red = by_channel.get("red")
-            if green is not None:
-                self._analytics_cards["volume"].set_value(
-                    f"{green.volume_um3:,.1f}",
-                    f"{green.voxel_count:,} voxels",
-                )
-                self._analytics_cards["green_components"].set_value(
-                    f"{green.component_count:,}",
-                    f"largest {green.largest_component_voxels:,} voxels",
-                )
-            if red is not None:
-                self._analytics_cards["red_components"].set_value(
-                    f"{red.component_count:,}",
-                    f"largest {red.largest_component_voxels:,} voxels",
-                )
-            self._analytics_cards["overlap"].set_value(
-                f"{self.latest_metrics.overlap_volume_um3:,.1f}",
-                f"{self.latest_metrics.overlap_voxel_count:,} voxels",
-            )
-
-        self._refresh_analytics_report()
-
-    def _refresh_analytics_report(self) -> None:
-        if not hasattr(self, "_analytics_table"):
-            return
-        report = self.latest_microglia_report
-        if report is None:
-            self._analytics_cards["cells"].set_value("--", "Run microglia analysis to populate.")
-            self._analytics_cards["distance"].set_value("--", "No per-cell distances yet.")
-            self._analytics_table.setRowCount(0)
-            self._analytics_table_status.setText("No analysis run")
+        if self.latest_metrics is None:
             return
 
-        rows = list(report.rows)
-        self._analytics_cards["cells"].set_value(f"{report.cell_count:,}", "Separated microglia objects")
-        distances = [
-            float(row.distance_to_vasculature_um)
-            for row in rows
-            if np.isfinite(float(row.distance_to_vasculature_um))
-        ]
-        if distances:
-            self._analytics_cards["distance"].set_value(
-                f"{sum(distances) / len(distances):,.1f} um",
-                f"min {min(distances):,.1f} / max {max(distances):,.1f}",
+        by_channel = {item.channel.lower(): item for item in self.latest_metrics.channel_results}
+        green = by_channel.get("green")
+        red = by_channel.get("red")
+        if green is not None:
+            self._analytics_cards["volume"].set_value(
+                f"{green.volume_um3:,.1f}",
+                f"{green.voxel_count:,} voxels",
             )
-        else:
-            self._analytics_cards["distance"].set_value("--", "No finite distance values.")
-
-        self._analytics_table.setRowCount(len(rows))
-        for row_idx, row in enumerate(rows):
-            values = [
-                f"{int(row.cell_index):,}",
-                f"{int(row.voxel_count):,}",
-                f"{float(row.volume_um3):,.1f}",
-                "--" if not np.isfinite(float(row.soma_volume_um3)) else f"{float(row.soma_volume_um3):,.1f}",
-                f"{int(row.branch_count):,}",
-                f"{int(row.branch_endpoint_count):,}",
-                "--" if not np.isfinite(float(row.distance_to_vasculature_um)) else f"{float(row.distance_to_vasculature_um):,.1f}",
-                f"{int(row.tip_near_multiple_vessel_count):,}",
-            ]
-            for col_idx, value in enumerate(values):
-                self._set_analytics_table_item(row_idx, col_idx, value)
-        self._analytics_table_status.setText(f"{len(rows):,} cell rows")
+            self._analytics_cards["green_components"].set_value(
+                f"{green.component_count:,}",
+                f"largest {green.largest_component_voxels:,} voxels",
+            )
+        if red is not None:
+            self._analytics_cards["red_components"].set_value(
+                f"{red.component_count:,}",
+                f"largest {red.largest_component_voxels:,} voxels",
+            )
+        self._analytics_cards["overlap"].set_value(
+            f"{self.latest_metrics.overlap_volume_um3:,.1f}",
+            f"{self.latest_metrics.overlap_voxel_count:,} voxels",
+        )
 
     def _nav_to(self, page_idx: int) -> None:
         """Switch the page stack and update nav button checked states."""
@@ -939,35 +831,8 @@ class MainWindow(QMainWindow):
         self._green_component_sparse = {}
         self._green_component_coloring_active = False
         self.scene.set_channel_component_coloring("green", False)
-        self.scene.clear_debug_overlays()
         self.controls.set_microglia_component_summary(0, 0, 0)
         self.controls.microglia_info.setText("Enable 'View one microglia' to detect components.")
-
-    def _refresh_microglia_analysis_overlays(self) -> None:
-        if self.latest_microglia_report is None:
-            self.scene.clear_debug_overlays()
-            return
-        overlay_state = self.controls.current_microglia_debug_overlay_state()
-        if not any(overlay_state.values()):
-            self.scene.clear_debug_overlays()
-            return
-        measurements = self.latest_microglia_report.debug_measurements
-        points = measurements.get("overlay_points", []) if isinstance(measurements, dict) else []
-        lines = measurements.get("overlay_lines", []) if isinstance(measurements, dict) else []
-        t0 = time.perf_counter()
-        self._log_info(
-            "Applying microglia overlays: "
-            f"points={len(points) if isinstance(points, list) else 0} "
-            f"lines={len(lines) if isinstance(lines, list) else 0}"
-        )
-        self.scene.set_debug_overlays(
-            points=points if isinstance(points, list) else [],
-            lines=lines if isinstance(lines, list) else [],
-            visibility=overlay_state,
-        )
-        self._log_info(
-            f"Microglia overlays applied in {time.perf_counter() - t0:.2f}s"
-        )
 
     def _compute_microglia_components(
         self,
@@ -1307,8 +1172,6 @@ class MainWindow(QMainWindow):
             return float(self._eta_scale_psf)
         if kind == "microglia-separation":
             return float(self._eta_scale_microglia_separation)
-        if kind == "microglia-analysis":
-            return float(self._eta_scale_microglia_analysis)
         if kind == "mesh-export":
             return float(self._eta_scale_mesh_export)
         return 1.0
@@ -1319,7 +1182,6 @@ class MainWindow(QMainWindow):
             "load",
             "psf",
             "microglia-separation",
-            "microglia-analysis",
             "mesh-export",
         }:
             return
@@ -1333,8 +1195,6 @@ class MainWindow(QMainWindow):
             self._eta_scale_psf = updated
         elif kind == "microglia-separation":
             self._eta_scale_microglia_separation = updated
-        elif kind == "microglia-analysis":
-            self._eta_scale_microglia_analysis = updated
         elif kind == "mesh-export":
             self._eta_scale_mesh_export = updated
         self._log_debug(
@@ -1408,42 +1268,6 @@ class MainWindow(QMainWindow):
             "Estimated microglia separation ETA="
             f"{total:.1f}s (scale={scale:.2f}, voxels={total_voxels}, "
             f"branch_sensitivity={branch_sensitivity:.2f})"
-        )
-        return total
-
-    def _estimate_microglia_analysis_eta_seconds(
-        self,
-        dataset: DatasetVolume,
-        overlay_state: dict[str, bool],
-    ) -> float | None:
-        green_voxels = int(dataset.green.data.size)
-        red_voxels = int(dataset.red.data.size)
-        total_voxels = green_voxels + red_voxels
-        if total_voxels <= 0:
-            return None
-
-        overlay_enabled = sum(1 for enabled in overlay_state.values() if enabled)
-        overlay_ratio = float(overlay_enabled / max(1, len(overlay_state)))
-        segmentation_seconds = green_voxels * 1.7e-7
-        vessel_seconds = red_voxels * 1.2e-7
-        pairing_seconds = total_voxels * 3.5e-8
-        overlay_seconds = green_voxels * (0.7e-8 + (1.1e-8 * overlay_ratio))
-        scale = self._eta_scale_for_kind("microglia-analysis")
-        total = max(
-            8.0,
-            (
-                5.0
-                + segmentation_seconds
-                + vessel_seconds
-                + pairing_seconds
-                + overlay_seconds
-            )
-            * scale,
-        )
-        self._log_info(
-            "Estimated microglia analysis ETA="
-            f"{total:.1f}s (scale={scale:.2f}, voxels={total_voxels}, "
-            f"overlay_enabled={overlay_enabled}/{len(overlay_state)})"
         )
         return total
 
@@ -2098,8 +1922,6 @@ class MainWindow(QMainWindow):
         self.processed_dataset = result.processed_dataset
         self._mark_metrics_dirty()
         self.visual_dataset = result.visual_dataset
-        self.latest_microglia_report = None
-        self.controls.clear_microglia_analysis_table()
         self._invalidate_microglia_components()
         self._push_scene_channels()
         self._publish_busy_progress(percent=97.0, message="Applying initial thresholds + metrics...")
@@ -2124,8 +1946,6 @@ class MainWindow(QMainWindow):
         self.processed_dataset = result
         self._mark_metrics_dirty()
         self.visual_dataset = prepare_dataset_for_mesh(self.processed_dataset, self.preprocess_config)
-        self.latest_microglia_report = None
-        self.controls.clear_microglia_analysis_table()
         self._publish_busy_progress(percent=94.0, message="Uploading channels to VTK...")
         self._invalidate_microglia_components()
         self._push_scene_channels()
@@ -2469,8 +2289,6 @@ class MainWindow(QMainWindow):
         self.processed_dataset = result
         self._mark_metrics_dirty()
         self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
-        self.latest_microglia_report = None
-        self.controls.clear_microglia_analysis_table()
         self._invalidate_microglia_components()
         self._push_scene_channels()
         threshold_green = default_green_threshold(result.green.data)
@@ -2522,125 +2340,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_info(f"Metrics export failed: {exc}")
             self._show_error("Export failed", str(exc))
-
-    def _on_run_microglia_analysis_requested(self) -> None:
-        if self.processed_dataset is None:
-            self._show_error("No dataset", "Load a dataset before running microglia analysis.")
-            return
-        dataset = self.processed_dataset
-        preprocess_cfg = self.preprocess_config
-        render = self.current_render
-        segmentation_mode = "internal"
-        threshold_source = self.controls.current_microglia_analysis_threshold_mode()
-        overlay_state = self.controls.current_microglia_debug_overlay_state()
-        eta_seconds = self._estimate_microglia_analysis_eta_seconds(dataset, overlay_state)
-
-        def _run_analysis() -> MicrogliaCellReport:
-            self._publish_busy_progress(percent=8.0, message="Preparing microglia analysis...")
-
-            progress_lock = threading.Lock()
-            progress_state = {"last_emit": 0.0, "last_time": 0.0}
-
-            def on_analysis_progress(progress: float, message: str) -> None:
-                frac = float(np.clip(progress, 0.0, 1.0))
-                now = time.perf_counter()
-                with progress_lock:
-                    delta = frac - float(progress_state["last_emit"])
-                    elapsed = now - float(progress_state["last_time"])
-                    should_emit = (
-                        frac >= 1.0
-                        or delta >= 0.01
-                        or elapsed >= 0.5
-                    )
-                    if not should_emit:
-                        return
-                    progress_state["last_emit"] = frac
-                    progress_state["last_time"] = now
-                percent = 12.0 + (84.0 * frac)
-                self._publish_busy_progress(percent=percent, message=message)
-
-            report = analyze_microglia_vessel(
-                dataset,
-                render,
-                preprocess_cfg,
-                segmentation_mode=segmentation_mode,
-                branch_sensitivity=float(self.controls.current_microglia_branch_sensitivity()),
-                threshold_source=threshold_source,
-                progress_callback=on_analysis_progress,
-                overlay_options=overlay_state,
-            )
-            self._publish_busy_progress(percent=98.0, message="Finalizing analysis output...")
-            return report
-
-        def _on_success(result: object) -> None:
-            if not isinstance(result, MicrogliaCellReport):
-                raise TypeError("Invalid microglia analysis result payload.")
-            self._publish_busy_progress(percent=99.0, message="Updating analysis table...")
-            self.latest_microglia_report = result
-            self.controls.set_microglia_analysis_report(result)
-            self._metrics_panel.update_from_report(result)
-            self._refresh_analytics_report()
-            # Defer VTK overlay upload until after the busy dialog closes.
-            QTimer.singleShot(0, self._refresh_microglia_analysis_overlays)
-            self.statusBar().showMessage(
-                f"Microglia analysis complete: {result.cell_count} cell(s) detected.",
-                5000,
-            )
-
-        self._start_background_task(
-            title="Microglia Analysis",
-            message="Computing per-cell microglia to vessel distances...",
-            fn=_run_analysis,
-            on_success=_on_success,
-            error_title="Microglia analysis failed",
-            success_status="Microglia analysis complete.",
-            eta_total_seconds=eta_seconds,
-            eta_kind="microglia-analysis",
-        )
-
-    def _on_export_microglia_analysis_requested(self) -> None:
-        if self.latest_microglia_report is None:
-            self._show_error("No analysis", "Run microglia analysis before exporting.")
-            return
-        start = str((self.dataset_root or Path.cwd()) / "microglia_analysis.csv")
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Microglia Analysis Bundle",
-            start,
-            "CSV files (*.csv)",
-        )
-        if not file_path:
-            return
-        try:
-            with self._busy("Export Microglia Analysis", "Writing analysis bundle..."):
-                self._publish_busy_progress(percent=20.0, message="Collecting analysis bundle...")
-                green_volume = None
-                red_volume = None
-                if self.processed_dataset is not None:
-                    green_volume = self.processed_dataset.green.data
-                    red_volume = self.processed_dataset.red.data
-                self._publish_busy_progress(percent=70.0, message="Writing bundle files...")
-                outputs = export_microglia_analysis_bundle(
-                    self.latest_microglia_report,
-                    file_path,
-                    green_volume=green_volume,
-                    red_volume=red_volume,
-                )
-                out = outputs.get("cells", Path(file_path))
-                self._publish_busy_progress(percent=100.0, message="Analysis export complete.")
-            debug_measurements = outputs.get("debug_measurements")
-            debug_dir = debug_measurements.parent if isinstance(debug_measurements, Path) else None
-            if debug_dir is not None:
-                status = f"Analysis bundle exported: {out.name} + {debug_dir.name}"
-                log_message = f"Microglia analysis bundle exported: cells={out} debug_dir={debug_dir}"
-            else:
-                status = f"Microglia analysis exported to {out}"
-                log_message = f"Microglia analysis exported: {out}"
-            self.statusBar().showMessage(status, 5000)
-            self._log_info(log_message)
-        except Exception as exc:
-            self._log_info(f"Microglia analysis export failed: {exc}")
-            self._show_error("Microglia analysis export failed", str(exc))
 
     def _on_export_snapshot_requested(self) -> None:
         start = str((self.dataset_root or Path.cwd()) / "snapshot.png")

@@ -20,17 +20,11 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
-    QTableWidget,
-    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from nvap.analysis.microglia_vessel_report import (
-    MICROGLIA_CELL_REPORT_COLUMNS,
-    MicrogliaCellReport,
-)
 from nvap.config.types import MeshExportConfig, PSFConfig, PreprocessConfig, RenderConfig
 from nvap.ui.design import COLOR, ICON_MD, ICON_SM, SPACE
 from nvap.ui.icons import icon, icon_pixmap
@@ -149,9 +143,6 @@ class ControlPanel(QWidget):
     psf_config_changed                = Signal(object)
     microglia_view_changed            = Signal()
     enhance_microglia_requested       = Signal()
-    run_microglia_analysis_requested  = Signal()
-    export_microglia_analysis_requested = Signal()
-    microglia_analysis_overlay_changed  = Signal()
     export_metrics_requested          = Signal()
     export_snapshot_requested         = Signal()
     export_mesh_requested             = Signal()
@@ -200,7 +191,6 @@ class ControlPanel(QWidget):
 
         self._build_rendering_section(slo)
         self._build_microglia_viewer_section(slo)
-        self._build_analysis_section(slo)
         self._processing_section = self._build_processing_section(slo)
         self._build_metrics_export_section(slo)
         self._build_system_section(slo)
@@ -344,10 +334,14 @@ class ControlPanel(QWidget):
         iso_row = QHBoxLayout()
         iso_row.setSpacing(12)
         self.show_iso_green = QCheckBox("Green")
+        self.show_iso_green.setChecked(True)
         self.show_iso_green.setObjectName("channelGreen")
+        self.show_iso_green.setToolTip("Render the green channel as a 3D surface.")
         self.show_iso_green.stateChanged.connect(self._on_render_setting_changed)
         self.show_iso_red = QCheckBox("Red")
+        self.show_iso_red.setChecked(True)
         self.show_iso_red.setObjectName("channelRed")
+        self.show_iso_red.setToolTip("Render the red channel as a 3D surface.")
         self.show_iso_red.stateChanged.connect(self._on_render_setting_changed)
         iso_row.addWidget(self.show_iso_green)
         iso_row.addWidget(self.show_iso_red)
@@ -367,7 +361,8 @@ class ControlPanel(QWidget):
         form.addRow(_ir, self.iso_red)
 
         # Z / trim / offset
-        self.display_z_scale = self._make_unit_spinbox(0.2, 3.0, 0.05, 2.0 / 3.0)
+        self.display_z_scale = self._make_unit_spinbox(0.2, 3.0, 0.05, 0.5)
+        self.display_z_scale.setToolTip("Visual-only Z scale. Lower values flatten the stack; 1.0 matches physical spacing.")
         self.display_z_scale.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Z height scale", self.display_z_scale)
 
@@ -478,100 +473,6 @@ class ControlPanel(QWidget):
         )
         self.enhance_microglia_btn.clicked.connect(self.enhance_microglia_requested.emit)
         sec.add_widget(self.enhance_microglia_btn)
-
-        return sec
-
-    def _build_analysis_section(self, parent_lo: QVBoxLayout) -> _CollapsibleSection:
-        sec = _CollapsibleSection("Analysis", "activity", expanded=True, parent=self)
-        parent_lo.addWidget(sec)
-
-        # Threshold mode row
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
-        mode_row.addWidget(QLabel("Thresholds"))
-        self.microglia_analysis_threshold_mode = QComboBox()
-        self.microglia_analysis_threshold_mode.addItem("Adaptive thresholds", "adaptive")
-        self.microglia_analysis_threshold_mode.addItem(
-            "Use render thresholds", "render"
-        )
-        mode_row.addWidget(self.microglia_analysis_threshold_mode, 1)
-        sec.add_layout(mode_row)
-
-        # Action row
-        action_row = QHBoxLayout()
-        action_row.setSpacing(8)
-        self.run_microglia_analysis_btn = QPushButton("  Run Analysis")
-        self.run_microglia_analysis_btn.setObjectName("primaryAction")
-        self.run_microglia_analysis_btn.setIcon(icon("zap", ICON_SM, COLOR.text_inverse))
-        self.run_microglia_analysis_btn.clicked.connect(
-            self.run_microglia_analysis_requested.emit
-        )
-        action_row.addWidget(self.run_microglia_analysis_btn)
-
-        self.export_microglia_analysis_btn = QPushButton("  Export Bundle")
-        self.export_microglia_analysis_btn.setIcon(
-            icon("download", ICON_SM, COLOR.text_secondary)
-        )
-        self.export_microglia_analysis_btn.setEnabled(False)
-        self.export_microglia_analysis_btn.setToolTip(
-            "Export cell, branch, tip, and vessel-crossing CSVs plus debug outputs."
-        )
-        self.export_microglia_analysis_btn.clicked.connect(
-            self.export_microglia_analysis_requested.emit
-        )
-        action_row.addWidget(self.export_microglia_analysis_btn)
-        sec.add_layout(action_row)
-
-        # Debug overlay toggles — inside a compact sub-section
-        overlay_lbl = QLabel("Visual Debuggers")
-        overlay_lbl.setObjectName("sectionHeaderTitle")
-        sec.add_widget(overlay_lbl)
-
-        self.debug_overlay_soma        = QCheckBox("Soma cores")
-        self.debug_overlay_branches    = QCheckBox("Branch skeletons")
-        self.debug_overlay_tips        = QCheckBox("Branch tips")
-        self.debug_overlay_connectors  = QCheckBox("Nearest-vessel connectors")
-        self.debug_overlay_vessels     = QCheckBox("Vessel points")
-        self.debug_overlay_diameter    = QCheckBox("Diameter samples")
-        self.debug_overlay_crossings   = QCheckBox("Vessel crossings")
-
-        overlay_grid = QHBoxLayout()
-        col_a = QVBoxLayout()
-        col_b = QVBoxLayout()
-        overlays = [
-            self.debug_overlay_soma,
-            self.debug_overlay_branches,
-            self.debug_overlay_tips,
-            self.debug_overlay_connectors,
-        ]
-        overlays_b = [
-            self.debug_overlay_vessels,
-            self.debug_overlay_diameter,
-            self.debug_overlay_crossings,
-        ]
-        for cb in overlays:
-            cb.setChecked(True)
-            cb.toggled.connect(lambda _: self.microglia_analysis_overlay_changed.emit())
-            col_a.addWidget(cb)
-        for cb in overlays_b:
-            cb.setChecked(True)
-            cb.toggled.connect(lambda _: self.microglia_analysis_overlay_changed.emit())
-            col_b.addWidget(cb)
-
-        overlay_grid.addLayout(col_a)
-        overlay_grid.addLayout(col_b)
-        sec.add_layout(overlay_grid)
-
-        # Results table
-        self.microglia_analysis_table = QTableWidget(
-            0, len(MICROGLIA_CELL_REPORT_COLUMNS)
-        )
-        self.microglia_analysis_table.setHorizontalHeaderLabels(
-            MICROGLIA_CELL_REPORT_COLUMNS
-        )
-        self.microglia_analysis_table.setAlternatingRowColors(True)
-        self.microglia_analysis_table.setMinimumHeight(140)
-        sec.add_widget(self.microglia_analysis_table)
 
         return sec
 
@@ -867,20 +768,6 @@ class ControlPanel(QWidget):
     def current_microglia_branch_sensitivity(self) -> float:
         return float(self.microglia_branch_sensitivity.value())
 
-    def current_microglia_analysis_threshold_mode(self) -> str:
-        return str(self.microglia_analysis_threshold_mode.currentData())
-
-    def current_microglia_debug_overlay_state(self) -> dict[str, bool]:
-        return {
-            "soma":       self.debug_overlay_soma.isChecked(),
-            "branches":   self.debug_overlay_branches.isChecked(),
-            "tips":       self.debug_overlay_tips.isChecked(),
-            "connectors": self.debug_overlay_connectors.isChecked(),
-            "vessels":    self.debug_overlay_vessels.isChecked(),
-            "diameter":   self.debug_overlay_diameter.isChecked(),
-            "crossings":  self.debug_overlay_crossings.isChecked(),
-        }
-
     # ══════════════════════════════════════════════════════════════════════════
     # Public update API (called from main_window)
     # ══════════════════════════════════════════════════════════════════════════
@@ -939,23 +826,6 @@ class ControlPanel(QWidget):
 
     def set_plugin_text(self, text: str) -> None:
         self.plugin_text.setPlainText(text)
-
-    def set_microglia_analysis_report(self, report: MicrogliaCellReport) -> None:
-        self.microglia_analysis_table.setRowCount(0)
-        self.microglia_analysis_table.setRowCount(len(report.rows))
-        for row_idx, row in enumerate(report.rows):
-            values = row.__dict__
-            for col_idx, key in enumerate(MICROGLIA_CELL_REPORT_COLUMNS):
-                self.microglia_analysis_table.setItem(
-                    row_idx,
-                    col_idx,
-                    QTableWidgetItem(str(values.get(key, ""))),
-                )
-        self.export_microglia_analysis_btn.setEnabled(len(report.rows) > 0)
-
-    def clear_microglia_analysis_table(self) -> None:
-        self.microglia_analysis_table.setRowCount(0)
-        self.export_microglia_analysis_btn.setEnabled(False)
 
     def append_debug_text(self, text: str) -> None:
         self.debug_text.append(text)
