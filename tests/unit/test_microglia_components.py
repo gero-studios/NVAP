@@ -207,6 +207,36 @@ def test_segment_soma_markers_skips_edt_for_large_candidates(monkeypatch) -> Non
     assert int(np.max(labels)) >= 1
 
 
+def test_segment_soma_markers_skips_watershed_for_large_volume(monkeypatch) -> None:
+    working = np.zeros((3, 12, 12), dtype=np.float32)
+    working[:, 3:9, 3:9] = 0.45
+    finite = np.isfinite(working)
+    seed = np.zeros_like(working, dtype=bool)
+    seed[1, 5, 5] = True
+
+    monkeypatch.setattr(microglia_components, "_LARGE_VOLUME_VOXELS", 1)
+
+    def _fail_watershed(*_args, **_kwargs):
+        raise AssertionError("large-volume path should bypass watershed")
+
+    monkeypatch.setattr(microglia_components, "_watershed", _fail_watershed)
+
+    labels = microglia_components._segment_soma_markers_from_reduced_threshold(
+        seed,
+        working,
+        finite,
+        low_floor=0.1,
+        high_t=0.35,
+        branch_sensitivity=1.0,
+        min_keep=2,
+        spacing_zyx=np.asarray((1.0, 1.0, 1.0), dtype=np.float32),
+        structure=microglia_components._CUBIC_STRUCTURE,
+    )
+
+    assert labels.shape == working.shape
+    assert int(np.max(labels)) >= 1
+
+
 def test_compute_component_labels_skips_branch_reassignment_for_oversized_label_volume(
     monkeypatch,
 ) -> None:

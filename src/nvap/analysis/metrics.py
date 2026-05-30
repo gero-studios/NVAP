@@ -15,6 +15,25 @@ def mask_from_threshold(volume: np.ndarray, threshold: float) -> np.ndarray:
     return volume >= float(threshold)
 
 
+def _apply_render_trim(mask: np.ndarray, trim_first_slices: int, trim_last_slices: int) -> np.ndarray:
+    """Zero the first/last z-slices so metrics match the trimmed render and analysis."""
+    arr = np.asarray(mask, dtype=bool)
+    if arr.ndim != 3 or arr.shape[0] <= 0:
+        return arr
+    trim_first = max(0, int(trim_first_slices))
+    trim_last = max(0, int(trim_last_slices))
+    if trim_first <= 0 and trim_last <= 0:
+        return arr
+    if trim_first + trim_last >= int(arr.shape[0]):
+        return np.zeros_like(arr)
+    out = arr.copy()
+    if trim_first > 0:
+        out[:trim_first] = False
+    if trim_last > 0:
+        out[-trim_last:] = False
+    return out
+
+
 def _component_stats(mask: np.ndarray) -> tuple[int, int]:
     structure = np.ones((3, 3, 3), dtype=np.uint8)
     labels, count = ndi.label(mask, structure=structure)
@@ -81,8 +100,14 @@ def compute_metrics(dataset: DatasetVolume, render: RenderConfig) -> MetricsComp
     spacing = green.spacing
     voxel_volume_um3 = spacing.voxel_volume_um3
 
-    green_mask = mask_from_threshold(green.data, render.threshold_green)
-    red_mask = mask_from_threshold(red.data, render.threshold_red)
+    trim_first = int(render.trim_first_slices)
+    trim_last = int(render.trim_last_slices)
+    green_mask = _apply_render_trim(
+        mask_from_threshold(green.data, render.threshold_green), trim_first, trim_last
+    )
+    red_mask = _apply_render_trim(
+        mask_from_threshold(red.data, render.threshold_red), trim_first, trim_last
+    )
 
     green_components, green_largest = _component_stats(green_mask)
     red_components, red_largest = _component_stats(red_mask)

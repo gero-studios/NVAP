@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import colorsys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import time
@@ -10,8 +10,10 @@ import numpy as np
 from PySide6.QtCore import Qt
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.util.numpy_support import numpy_to_vtk
-from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPiecewiseFunction
+from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkImageData, vtkPiecewiseFunction, vtkPolyData
 from vtkmodules.vtkFiltersCore import vtkMarchingCubes
+from vtkmodules.vtkFiltersSources import vtkSphereSource
 from vtkmodules.vtkImagingCore import vtkImageResample
 from vtkmodules.vtkIOImage import vtkPNGWriter
 from vtkmodules.vtkInteractionWidgets import vtkOrientationMarkerWidget
@@ -19,6 +21,7 @@ from vtkmodules.vtkRenderingAnnotation import vtkAxesActor, vtkLegendScaleActor
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
     vtkColorTransferFunction,
+    vtkGlyph3DMapper,
     vtkLight,
     vtkPolyDataMapper,
     vtkRenderWindow,
@@ -168,6 +171,16 @@ class _ChannelActors:
     surface_allowed: bool = True
 
 
+@dataclass(frozen=True)
+class MicrogliaDebugOverlay:
+    voxel_points_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    branch_points_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    soma_points_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    tip_points_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    tip_segments_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 2, 3), dtype=np.float32))
+    cell_segments_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 2, 3), dtype=np.float32))
+
+
 class VTKScene:
     def __init__(self, parent=None) -> None:
         self._widget = QVTKRenderWindowInteractor(parent)
@@ -191,6 +204,7 @@ class VTKScene:
         self._spacing: dict[str, VoxelSpacing] = {}
         self._current = RenderConfig()
         self._component_coloring: dict[str, int] = {}
+        self._microglia_debug_actors: list[vtkActor] = []
         self._last_render_time = time.perf_counter()
         self._fps_actor = self._build_fps_actor()
         self._scale_actor = vtkLegendScaleActor()
@@ -308,6 +322,177 @@ class VTKScene:
             self._component_coloring.pop(channel, None)
         if channel in self._actors:
             self.apply_render_config(self._current)
+
+    def set_microglia_analysis_debug(self, overlay: MicrogliaDebugOverlay | None) -> None:
+        for actor in self._microglia_debug_actors:
+            self._renderer.RemoveActor(actor)
+        self._microglia_debug_actors.clear()
+
+        if overlay is None:
+            self.render()
+            return
+
+        voxel_points = np.asarray(overlay.voxel_points_xyz, dtype=np.float32)
+        branch_points = np.asarray(overlay.branch_points_xyz, dtype=np.float32)
+        soma_points = np.asarray(overlay.soma_points_xyz, dtype=np.float32)
+        tip_points = np.asarray(overlay.tip_points_xyz, dtype=np.float32)
+        tip_segments = np.asarray(overlay.tip_segments_xyz, dtype=np.float32)
+        cell_segments = np.asarray(overlay.cell_segments_xyz, dtype=np.float32)
+
+        # Markers live in physical (micron) world coordinates, so their radius has
+        # to scale with the cell's extent or they render as invisible specks on
+        # large stacks. Derive a characteristic size from the overlay bounding box.
+        marker = self._overlay_marker_unit(
+            [voxel_points, branch_points, soma_points, tip_points],
+            tip_segments,
+            cell_segments,
+        )
+
+        if voxel_points.size > 0:
+            actor = self._build_debug_point_actor(
+                voxel_points,
+                color=(0.30, 0.80, 0.42),
+                radius=marker * 0.45,
+                opacity=0.36,
+            )
+            self._renderer.AddActor(actor)
+            self._microglia_debug_actors.append(actor)
+        if branch_points.size > 0:
+            actor = self._build_debug_point_actor(
+                branch_points,
+                color=(0.18, 0.92, 0.78),
+                radius=marker * 0.6,
+                opacity=0.82,
+            )
+            self._renderer.AddActor(actor)
+            self._microglia_debug_actors.append(actor)
+        if soma_points.size > 0:
+            actor = self._build_debug_point_actor(
+                soma_points,
+                color=(1.0, 0.82, 0.34),
+                radius=marker * 0.9,
+            )
+            self._renderer.AddActor(actor)
+            self._microglia_debug_actors.append(actor)
+        if tip_points.size > 0:
+            actor = self._build_debug_point_actor(
+                tip_points,
+                color=(0.28, 0.88, 1.0),
+                radius=marker * 0.7,
+            )
+            self._renderer.AddActor(actor)
+            self._microglia_debug_actors.append(actor)
+        if tip_segments.size > 0:
+            actor = self._build_debug_line_actor(tip_segments, color=(0.92, 0.34, 1.0), width=4.0)
+            self._renderer.AddActor(actor)
+            self._microglia_debug_actors.append(actor)
+        if cell_segments.size > 0:
+            actor = self._build_debug_line_actor(cell_segments, color=(1.0, 0.55, 0.22), width=3.0)
+            self._renderer.AddActor(actor)
+            self._microglia_debug_actors.append(actor)
+
+        self.render()
+
+    @staticmethod
+    def _overlay_marker_unit(
+        point_arrays: list[np.ndarray],
+        *segment_arrays: np.ndarray,
+    ) -> float:
+        """Characteristic marker radius (microns) from the overlay's spatial extent."""
+        pieces: list[np.ndarray] = []
+        for arr in point_arrays:
+            a = np.asarray(arr, dtype=np.float32)
+            if a.size > 0:
+                pieces.append(a.reshape(-1, 3))
+        for seg in segment_arrays:
+            s = np.asarray(seg, dtype=np.float32)
+            if s.size > 0:
+                pieces.append(s.reshape(-1, 3))
+        if not pieces:
+            return 0.2
+        points = np.vstack(pieces)
+        extent = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+        # ~1.5% of the cell diagonal, with a floor so tiny cells stay visible.
+        return float(max(0.15, extent * 0.015))
+
+    def _build_debug_point_actor(
+        self,
+        points_xyz: np.ndarray,
+        *,
+        color: tuple[float, float, float],
+        radius: float,
+        opacity: float = 0.95,
+    ) -> vtkActor:
+        vtk_points = vtkPoints()
+        for point in np.asarray(points_xyz, dtype=np.float32).tolist():
+            vtk_points.InsertNextPoint(float(point[0]), float(point[1]), float(point[2]))
+
+        poly = vtkPolyData()
+        poly.SetPoints(vtk_points)
+
+        sphere = vtkSphereSource()
+        sphere.SetRadius(float(max(0.01, radius)))
+        sphere.SetThetaResolution(18)
+        sphere.SetPhiResolution(18)
+
+        mapper = vtkGlyph3DMapper()
+        mapper.SetInputData(poly)
+        mapper.SetSourceConnection(sphere.GetOutputPort())
+        mapper.ScalingOff()
+
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetSpecular(0.0)
+        prop.SetOpacity(float(np.clip(opacity, 0.05, 1.0)))
+        return actor
+
+    def _build_debug_line_actor(
+        self,
+        segments_xyz: np.ndarray,
+        *,
+        color: tuple[float, float, float],
+        width: float,
+    ) -> vtkActor:
+        vtk_points = vtkPoints()
+        vtk_lines = vtkCellArray()
+        for segment in np.asarray(segments_xyz, dtype=np.float32).tolist():
+            start_idx = vtk_points.InsertNextPoint(
+                float(segment[0][0]),
+                float(segment[0][1]),
+                float(segment[0][2]),
+            )
+            end_idx = vtk_points.InsertNextPoint(
+                float(segment[1][0]),
+                float(segment[1][1]),
+                float(segment[1][2]),
+            )
+            vtk_lines.InsertNextCell(2)
+            vtk_lines.InsertCellPoint(start_idx)
+            vtk_lines.InsertCellPoint(end_idx)
+
+        poly = vtkPolyData()
+        poly.SetPoints(vtk_points)
+        poly.SetLines(vtk_lines)
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetSpecular(0.0)
+        prop.SetOpacity(0.96)
+        prop.SetLineWidth(float(max(1.0, width)))
+        if hasattr(prop, "SetRenderLinesAsTubes"):
+            prop.SetRenderLinesAsTubes(True)
+        return actor
 
     def set_channel_data(self, channel: str, volume: np.ndarray, spacing: VoxelSpacing) -> None:
         channel = channel.lower()
@@ -729,6 +914,9 @@ class VTKScene:
 
     def cleanup(self) -> None:
         """Release VTK resources to avoid GPU/memory leaks on window close."""
+        for actor in self._microglia_debug_actors:
+            self._renderer.RemoveActor(actor)
+        self._microglia_debug_actors.clear()
         for actor in self._actors.values():
             self._renderer.RemoveVolume(actor.volume_actor)
             self._renderer.RemoveActor(actor.iso_actor)

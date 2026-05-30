@@ -12,6 +12,7 @@ dependencies = [
   "numpy>=1.26",
   "scipy>=1.11",
   "scikit-image>=0.22",
+  "skan>=0.11",
   "pandas>=2.1",
   "imageio>=2.33",
   "PySide6>=6.6",

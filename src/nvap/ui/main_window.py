@@ -14,6 +14,7 @@ import scipy.ndimage as ndi
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
     QFrame,
@@ -28,11 +29,15 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from nvap.analysis.microglia_analysis import MicrogliaAnalysisResult, analyze_microglia_cells
+from nvap.analysis.microglia_analysis import build_microglia_cell_debug
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
 from nvap.cache.processed_cache import (
     build_dataset_signature,
@@ -69,7 +74,7 @@ from nvap.analysis.microglia_components import (
 )
 from nvap.preprocess.enhancement import enhance_microglia_background, preprocess_dataset
 from nvap.plugins.registry import discover_plugins
-from nvap.render.vtk_scene import VTKScene
+from nvap.render.vtk_scene import MicrogliaDebugOverlay, VTKScene
 from nvap.ui.control_panel import ControlPanel
 from nvap.ui.design import COLOR, ICON_LG, ICON_MD, ICON_SM, SIDEBAR_WIDTH, SPACE
 from nvap.ui.dialogs.about import AboutDialog
@@ -268,8 +273,11 @@ class MainWindow(QMainWindow):
         self.current_psf = self.controls.current_psf_config()
         self.current_render = self.controls.current_render_config()
         self.latest_metrics: MetricsComputation | None = None
+        self.latest_microglia_analysis: MicrogliaAnalysisResult | None = None
         self._metrics_revision = 0
+        self._microglia_analysis_revision = 0
         self._metrics_cache_key: tuple[int, float, float, float, float, float] | None = None
+        self._microglia_analysis_cache_key: tuple[int, tuple[int, int, int], float, float, int, int, float, float, float, float] | None = None
         self.dataset_root: Path | None = None
         self._dataset_signature: str | None = None
         self._current_channel_sources: dict[str, str] | None = None
@@ -303,6 +311,7 @@ class MainWindow(QMainWindow):
         self._green_component_coloring_active = False
         self._microglia_isolate_active = bool(self.controls.microglia_view_state()[0])
         self._microglia_label_cache_max_bytes = 256 * 1024 * 1024
+        self._analytics_selection_sync = False
 
         self._log_bridge = _LogBridge(self)
         self._log_bridge.message.connect(self.controls.append_debug_text)
@@ -319,6 +328,12 @@ class MainWindow(QMainWindow):
         self.controls.psf_config_changed.connect(self._on_psf_config_changed)
         self.controls.render_config_changed.connect(self._on_render_config_changed)
         self.controls.microglia_view_changed.connect(self._on_microglia_view_changed)
+        self.controls.run_microglia_segmentation_requested.connect(
+            self._on_run_microglia_segmentation_requested
+        )
+        self.controls.run_microglia_analysis_requested.connect(
+            self._on_run_microglia_analysis_requested
+        )
         self.controls.enhance_microglia_requested.connect(self._on_enhance_microglia_requested)
         self.controls.export_metrics_requested.connect(self._on_export_metrics_requested)
         self.controls.export_snapshot_requested.connect(self._on_export_snapshot_requested)
@@ -512,7 +527,7 @@ class MainWindow(QMainWindow):
         return sidebar
 
     def _build_analytics_placeholder(self) -> QWidget:
-        """Analytics overview with dataset-level metrics only."""
+        """Analytics overview for dataset and per-cell microglia metrics."""
         w = QWidget()
         w.setObjectName("sectionPage")
         lo = QVBoxLayout(w)
@@ -545,6 +560,54 @@ class MainWindow(QMainWindow):
         for idx, card in enumerate(self._analytics_cards.values()):
             card_grid.addWidget(card, idx // 2, idx % 2)
         lo.addLayout(card_grid)
+
+        section = QLabel("MICROGLIA ANALYSIS")
+        section.setObjectName("pageEyebrow")
+        lo.addSpacing(28)
+        lo.addWidget(section)
+
+        self._analytics_microglia_hint = QLabel(
+            "Open Analytics on a rendered dataset to measure separated microglia against visible vasculature."
+        )
+        self._analytics_microglia_hint.setObjectName("pageIntro")
+        self._analytics_microglia_hint.setWordWrap(True)
+        lo.addWidget(self._analytics_microglia_hint)
+        lo.addSpacing(20)
+
+        analysis_grid = QGridLayout()
+        analysis_grid.setHorizontalSpacing(16)
+        analysis_grid.setVerticalSpacing(16)
+        self._analytics_microglia_cards: dict[str, _AnalyticsMetricCard] = {
+            "cells": _AnalyticsMetricCard("Cells analyzed", "--", "Visible separated microglia."),
+            "branches": _AnalyticsMetricCard("Avg branches", "--", "Branch tips per visible cell."),
+            "soma": _AnalyticsMetricCard("Avg soma volume", "--", "Non-branched soma body volume."),
+            "distance": _AnalyticsMetricCard("Closest vessel distance", "--", "Shortest cell-to-vessel distance."),
+        }
+        for idx, card in enumerate(self._analytics_microglia_cards.values()):
+            analysis_grid.addWidget(card, idx // 2, idx % 2)
+        lo.addLayout(analysis_grid)
+        lo.addSpacing(20)
+
+        self._analytics_cell_table = QTableWidget(0, 6)
+        self._analytics_cell_table.setObjectName("analyticsCellTable")
+        self._analytics_cell_table.setHorizontalHeaderLabels(
+            [
+                "Cell",
+                "Branches",
+                "Soma (um^3)",
+                "Tip -> Vessel (um)",
+                "Cell -> Vessel (um)",
+                "Soma -> Vessel (um)",
+            ]
+        )
+        self._analytics_cell_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._analytics_cell_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._analytics_cell_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._analytics_cell_table.verticalHeader().setVisible(False)
+        self._analytics_cell_table.horizontalHeader().setStretchLastSection(True)
+        self._analytics_cell_table.setMinimumHeight(260)
+        self._analytics_cell_table.itemSelectionChanged.connect(self._on_analytics_cell_selected)
+        lo.addWidget(self._analytics_cell_table)
         lo.addStretch(1)
         return w
 
@@ -579,6 +642,346 @@ class MainWindow(QMainWindow):
             f"{self.latest_metrics.overlap_volume_um3:,.1f}",
             f"{self.latest_metrics.overlap_voxel_count:,} voxels",
         )
+        if self._page_stack.currentIndex() == 2 or self.latest_microglia_analysis is not None:
+            self._refresh_microglia_analysis()
+        else:
+            self._clear_analytics_microglia_widgets(
+                "Open Analytics to compute per-cell microglia measurements for the current view."
+            )
+
+    def _refresh_microglia_analysis(self) -> None:
+        if self.visual_dataset is None:
+            self._clear_analytics_microglia_widgets("Load a dataset to analyze separated microglia.")
+            return
+
+        cache_key = self._microglia_analysis_cache_key_for_render(self.current_render)
+        if self.latest_microglia_analysis is None or self._microglia_analysis_cache_key != cache_key:
+            labels, order, _sizes = self._ensure_microglia_components_current()
+            branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
+            self.latest_microglia_analysis = analyze_microglia_cells(
+                self.visual_dataset.green.data,
+                self.visual_dataset.red.data,
+                labels,
+                order,
+                spacing=self.visual_dataset.green.spacing,
+                render=self.current_render,
+                branch_sensitivity=branch_sensitivity,
+            )
+            self._microglia_analysis_cache_key = cache_key
+
+        self._set_analytics_microglia_result(self.latest_microglia_analysis)
+
+    def _ensure_microglia_components_current(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self.visual_dataset is None:
+            raise RuntimeError("No visual dataset loaded.")
+
+        threshold = float(self.current_render.threshold_green)
+        branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
+        green = np.asarray(self.visual_dataset.green.data, dtype=np.float32)
+        if (
+            self._green_component_sizes is not None
+            and self._green_component_threshold is not None
+            and self._green_component_branch_sensitivity is not None
+            and np.isclose(self._green_component_threshold, threshold, atol=1.0e-6)
+            and np.isclose(self._green_component_branch_sensitivity, branch_sensitivity, atol=1.0e-6)
+            and self._green_component_shape == green.shape
+            and self._green_component_labels is not None
+        ):
+            return (
+                np.asarray(self._green_component_labels, dtype=np.int32),
+                np.asarray(self._green_component_order, dtype=np.int32),
+                np.asarray(self._green_component_sizes, dtype=np.int64),
+            )
+
+        labels, order, sizes = self._compute_microglia_components(green, threshold)
+        selected_index = int(self.controls.microglia_view_state()[1])
+        self._cache_microglia_components(
+            labels,
+            order,
+            sizes,
+            threshold=threshold,
+            branch_sensitivity=branch_sensitivity,
+            shape=green.shape,
+            selected_index=selected_index,
+        )
+        return labels, order, sizes
+
+    def _set_analytics_microglia_result(self, analysis: MicrogliaAnalysisResult) -> None:
+        if not hasattr(self, "_analytics_microglia_cards"):
+            return
+
+        self._analytics_microglia_cards["cells"].set_value(
+            f"{analysis.analyzed_cell_count:,}",
+            "Visible separated cells in the current view.",
+        )
+        self._analytics_microglia_cards["branches"].set_value(
+            f"{analysis.mean_branch_count:,.2f}",
+            f"Avg process branches per cell ({analysis.mean_tip_count:,.1f} tips, "
+            f"{analysis.mean_process_length_um:,.1f} um length).",
+        )
+        self._analytics_microglia_cards["soma"].set_value(
+            f"{analysis.mean_soma_volume_um3:,.1f}",
+            "Average soma-body volume in um^3.",
+        )
+        closest_distance = (
+            "--"
+            if analysis.min_cell_to_vessel_um is None
+            else f"{analysis.min_cell_to_vessel_um:,.2f}"
+        )
+        self._analytics_microglia_cards["distance"].set_value(
+            closest_distance,
+            "Shortest visible cell-to-vessel distance.",
+        )
+
+        self._analytics_cell_table.setRowCount(int(len(analysis.cells)))
+        for row, cell in enumerate(analysis.cells):
+            values = [
+                str(row + 1),
+                str(cell.branch_count),
+                f"{cell.soma_volume_um3:,.1f}",
+                self._format_optional_analytics_value(cell.nearest_tip_to_vessel_um),
+                self._format_optional_analytics_value(cell.nearest_cell_to_vessel_um),
+                self._format_optional_analytics_value(cell.soma_to_vessel_um),
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                if col == 0:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self._analytics_cell_table.setItem(row, col, item)
+
+        if analysis.analyzed_cell_count <= 0:
+            self._analytics_microglia_hint.setText(
+                "No visible separated microglia were found for the current thresholds and trim."
+            )
+        else:
+            self._analytics_microglia_hint.setText(
+                "Selecting a row isolates the same microglia in the viewer and keeps the measurements aligned with the current view."
+            )
+        self._analytics_cell_table.resizeColumnsToContents()
+        self._sync_analytics_table_selection()
+
+    def _clear_analytics_microglia_widgets(self, message: str) -> None:
+        if not hasattr(self, "_analytics_microglia_cards"):
+            return
+        for card in self._analytics_microglia_cards.values():
+            card.set_value("--", "Load a dataset to populate.")
+        self._analytics_microglia_hint.setText(message)
+        self._analytics_cell_table.clearSelection()
+        self._analytics_cell_table.setRowCount(0)
+
+    def _format_optional_analytics_value(self, value: float | None) -> str:
+        if value is None:
+            return "--"
+        return f"{float(value):,.2f}"
+
+    def _refresh_microglia_analysis_debug(self) -> None:
+        if self.visual_dataset is None:
+            self.scene.set_microglia_analysis_debug(None)
+            return
+        if not self.controls.microglia_analysis_debug_enabled():
+            self.scene.set_microglia_analysis_debug(None)
+            return
+
+        isolate_enabled, selected_index = self.controls.microglia_view_state()
+        if not isolate_enabled or selected_index <= 0:
+            self.scene.set_microglia_analysis_debug(None)
+            return
+
+        labels, order, _sizes = self._ensure_microglia_components_current()
+        if selected_index > int(len(order)):
+            self.scene.set_microglia_analysis_debug(None)
+            return
+
+        component_id = int(order[selected_index - 1])
+        known_tip_distance = None
+        known_cell_distance = None
+        if self.latest_microglia_analysis is not None:
+            for cell in self.latest_microglia_analysis.cells:
+                if int(cell.component_id) == component_id:
+                    known_tip_distance = cell.nearest_tip_to_vessel_um
+                    known_cell_distance = cell.nearest_cell_to_vessel_um
+                    break
+
+        debug = build_microglia_cell_debug(
+            self.visual_dataset.green.data,
+            self.visual_dataset.red.data,
+            labels,
+            component_id,
+            spacing=self.visual_dataset.green.spacing,
+            render=self.current_render,
+            branch_sensitivity=float(self.controls.current_microglia_branch_sensitivity()),
+            known_tip_distance_um=known_tip_distance,
+            known_cell_distance_um=known_cell_distance,
+        )
+        if debug is None:
+            self.scene.set_microglia_analysis_debug(None)
+            return
+
+        debug_layers = self.controls.microglia_analysis_debug_layers()
+        green_spacing = self._display_spacing(self.visual_dataset.green.spacing)
+        red_spacing = self._display_spacing(self.visual_dataset.red.spacing)
+        green_offset = (
+            float(self.current_render.offset_x_um),
+            float(self.current_render.offset_y_um),
+            float(self.current_render.offset_z_um),
+        )
+        overlay = MicrogliaDebugOverlay(
+            voxel_points_xyz=(
+                self._coords_zyx_to_world_xyz(
+                    debug.voxel_sample_coords_zyx,
+                    spacing=green_spacing,
+                    offset_xyz=green_offset,
+                )
+                if "voxels" in debug_layers
+                else np.empty((0, 3), dtype=np.float32)
+            ),
+            branch_points_xyz=(
+                self._coords_zyx_to_world_xyz(
+                    debug.branch_sample_coords_zyx,
+                    spacing=green_spacing,
+                    offset_xyz=green_offset,
+                )
+                if "branches" in debug_layers
+                else np.empty((0, 3), dtype=np.float32)
+            ),
+            soma_points_xyz=(
+                self._coords_zyx_to_world_xyz(
+                    debug.soma_sample_coords_zyx,
+                    spacing=green_spacing,
+                    offset_xyz=green_offset,
+                )
+                if "soma" in debug_layers
+                else np.empty((0, 3), dtype=np.float32)
+            ),
+            tip_points_xyz=(
+                self._coords_zyx_to_world_xyz(
+                    debug.tip_coords_zyx,
+                    spacing=green_spacing,
+                    offset_xyz=green_offset,
+                )
+                if "tips" in debug_layers
+                else np.empty((0, 3), dtype=np.float32)
+            ),
+            tip_segments_xyz=(
+                self._segment_zyx_to_world_xyz(
+                    debug.nearest_tip_segment_zyx,
+                    source_spacing=green_spacing,
+                    target_spacing=red_spacing,
+                    source_offset_xyz=green_offset,
+                )
+                if "tip_distance" in debug_layers
+                else np.empty((0, 2, 3), dtype=np.float32)
+            ),
+            cell_segments_xyz=(
+                self._segment_zyx_to_world_xyz(
+                    debug.nearest_cell_segment_zyx,
+                    source_spacing=green_spacing,
+                    target_spacing=red_spacing,
+                    source_offset_xyz=green_offset,
+                )
+                if "cell_distance" in debug_layers
+                else np.empty((0, 2, 3), dtype=np.float32)
+            ),
+        )
+        self.scene.set_microglia_analysis_debug(overlay)
+
+    @staticmethod
+    def _coords_zyx_to_world_xyz(
+        coords_zyx: np.ndarray,
+        *,
+        spacing: VoxelSpacing,
+        offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> np.ndarray:
+        coords = np.asarray(coords_zyx, dtype=np.float32)
+        if coords.size <= 0:
+            return np.empty((0, 3), dtype=np.float32)
+        world = np.empty((coords.shape[0], 3), dtype=np.float32)
+        world[:, 0] = (coords[:, 2] + 0.5) * float(spacing.x_um) + float(offset_xyz[0])
+        world[:, 1] = (coords[:, 1] + 0.5) * float(spacing.y_um) + float(offset_xyz[1])
+        world[:, 2] = (coords[:, 0] + 0.5) * float(spacing.z_um) + float(offset_xyz[2])
+        return world
+
+    def _segment_zyx_to_world_xyz(
+        self,
+        segment_zyx: np.ndarray | None,
+        *,
+        source_spacing: VoxelSpacing,
+        target_spacing: VoxelSpacing,
+        source_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> np.ndarray:
+        if segment_zyx is None:
+            return np.empty((0, 2, 3), dtype=np.float32)
+        segment = np.asarray(segment_zyx, dtype=np.float32)
+        if segment.shape != (2, 3):
+            return np.empty((0, 2, 3), dtype=np.float32)
+        source = self._coords_zyx_to_world_xyz(
+            segment[:1],
+            spacing=source_spacing,
+            offset_xyz=source_offset_xyz,
+        )
+        target = self._coords_zyx_to_world_xyz(segment[1:], spacing=target_spacing)
+        return np.asarray([[source[0], target[0]]], dtype=np.float32)
+
+    def _on_analytics_cell_selected(self) -> None:
+        if self._analytics_selection_sync or self.latest_microglia_analysis is None:
+            return
+        row = int(self._analytics_cell_table.currentRow())
+        if row < 0 or row >= int(len(self.latest_microglia_analysis.cells)):
+            return
+
+        selected_index = row + 1
+        self._analytics_selection_sync = True
+        try:
+            self.controls.microglia_isolate.blockSignals(True)
+            self.controls.microglia_index.blockSignals(True)
+            self.controls.microglia_isolate.setChecked(True)
+            self.controls.microglia_index.setValue(selected_index)
+        finally:
+            self.controls.microglia_isolate.blockSignals(False)
+            self.controls.microglia_index.blockSignals(False)
+            self._analytics_selection_sync = False
+
+        self._on_microglia_view_changed()
+
+    def _sync_analytics_table_selection(self) -> None:
+        if not hasattr(self, "_analytics_cell_table") or self.latest_microglia_analysis is None:
+            return
+        isolate_enabled, selected_index = self.controls.microglia_view_state()
+        target_row = int(selected_index) - 1 if isolate_enabled and selected_index > 0 else -1
+        self._analytics_selection_sync = True
+        try:
+            if target_row < 0 or target_row >= int(self._analytics_cell_table.rowCount()):
+                self._analytics_cell_table.clearSelection()
+            else:
+                self._analytics_cell_table.selectRow(target_row)
+        finally:
+            self._analytics_selection_sync = False
+
+    def _mark_microglia_analysis_dirty(self) -> None:
+        self._microglia_analysis_revision += 1
+        self._microglia_analysis_cache_key = None
+        self.latest_microglia_analysis = None
+
+    def _microglia_analysis_cache_key_for_render(
+        self,
+        render: RenderConfig,
+    ) -> tuple[int, tuple[int, int, int], float, float, int, int, float, float, float, float]:
+        if self.visual_dataset is None:
+            raise RuntimeError("No visual dataset loaded.")
+        return (
+            int(self._microglia_analysis_revision),
+            tuple(int(v) for v in self.visual_dataset.green.data.shape),
+            float(render.threshold_green),
+            float(render.threshold_red),
+            int(render.trim_first_slices),
+            int(render.trim_last_slices),
+            float(render.offset_x_um),
+            float(render.offset_y_um),
+            float(render.offset_z_um),
+            float(self.controls.current_microglia_branch_sensitivity()),
+        )
 
     def _nav_to(self, page_idx: int) -> None:
         """Switch the page stack and update nav button checked states."""
@@ -589,6 +992,8 @@ class MainWindow(QMainWindow):
             icon_names = ["home", "layers", "bar-chart", "settings"]
             color = COLOR.accent if i == page_idx else COLOR.text_tertiary
             btn.setIcon(icon(icon_names[i], ICON_MD, color))
+        if page_idx == 2:
+            self._refresh_analytics_metrics()
 
     def _open_about(self) -> None:
         AboutDialog(self).exec()
@@ -689,12 +1094,14 @@ class MainWindow(QMainWindow):
         cache_root = str(self._project_cache_base_dir() / ".nvap_cache")
         plugin_summary = self.controls.plugin_text.toPlainText().strip() or "No plugins discovered"
         auto_apply = bool(self.controls.auto_apply_checkbox.isChecked())
+        has_dataset = bool(self.processed_dataset is not None and self.visual_dataset is not None)
         self._settings_page.set_runtime_details(
             dataset_name=dataset_name,
             auto_apply_enabled=auto_apply,
             plugin_summary=plugin_summary,
             cache_root=cache_root,
         )
+        self.controls.set_microglia_workflow_enabled(has_dataset)
         if self.dataset_root is not None:
             self._home_page.set_preview_summary(
                 "ACTIVE",
@@ -702,6 +1109,36 @@ class MainWindow(QMainWindow):
                 f"{self.dataset_root}\nCache: {cache_root}",
             )
         self._home_page.refresh_projects()
+
+    def _on_run_microglia_segmentation_requested(self) -> None:
+        if self.visual_dataset is None or self.processed_dataset is None:
+            self._show_error("No dataset", "Load and render a dataset before running segmentation.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+
+        self.controls.microglia_isolate.blockSignals(True)
+        try:
+            self.controls.microglia_isolate.setChecked(True)
+        finally:
+            self.controls.microglia_isolate.blockSignals(False)
+        self._microglia_isolate_active = True
+        self._invalidate_microglia_components()
+        self.statusBar().showMessage("Running microglia segmentation...", 3000)
+        self._start_microglia_refresh_task()
+
+    def _on_run_microglia_analysis_requested(self) -> None:
+        if self.visual_dataset is None or self.processed_dataset is None:
+            self._show_error("No dataset", "Load and render a dataset before running analysis.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+
+        self._nav_to(2)
+        self._refresh_metrics()
+        self.statusBar().showMessage("Microglia analysis updated.", 3000)
 
     def _sync_recent_project_pages(self) -> None:
         """Compat shim — kept so any old call sites still work."""
@@ -790,6 +1227,7 @@ class MainWindow(QMainWindow):
         self._metrics_revision += 1
         self._metrics_cache_key = None
         self.latest_metrics = None
+        self._mark_microglia_analysis_dirty()
 
     def _metrics_cache_key_for_render(
         self,
@@ -830,9 +1268,13 @@ class MainWindow(QMainWindow):
         self._green_component_shape = None
         self._green_component_sparse = {}
         self._green_component_coloring_active = False
+        self._mark_microglia_analysis_dirty()
+        self.scene.set_microglia_analysis_debug(None)
         self.scene.set_channel_component_coloring("green", False)
         self.controls.set_microglia_component_summary(0, 0, 0)
-        self.controls.microglia_info.setText("Enable 'View one microglia' to detect components.")
+        self.controls.microglia_info.setText(
+            "Use 'Run Segmentation' or enable 'View one microglia' to detect components."
+        )
 
     def _compute_microglia_components(
         self,
@@ -959,6 +1401,7 @@ class MainWindow(QMainWindow):
         ):
             self._push_scene_channels(green_only=True)
             self.scene.apply_render_config(self.current_render)
+            self._refresh_microglia_analysis_debug()
             return
 
         def _compute_task() -> _MicrogliaComponentsTaskResult:
@@ -999,6 +1442,7 @@ class MainWindow(QMainWindow):
             self._publish_busy_progress(percent=92.0, message="Updating 3D view...")
             self._push_scene_channels(green_only=True)
             self.scene.apply_render_config(self.current_render)
+            self._refresh_microglia_analysis_debug()
             self._publish_busy_progress(percent=100.0, message="Microglia view updated.")
 
         self._start_background_task(
@@ -1063,16 +1507,10 @@ class MainWindow(QMainWindow):
                 selected_index=0,
                 selected_voxels=0,
             )
-            if self._green_component_labels is None:
-                logger.info(
-                    "Microglia all-color view skipped: dense label cache unavailable "
-                    "for shape=%s count=%d. Showing raw green volume instead.",
-                    self._green_component_shape,
-                    count,
-                )
-                return base
-            self._green_component_coloring_active = True
-            return self._green_component_labels
+            # Preserve the enhanced intensity volume in the "All" view.
+            # Rendering label IDs here makes the segmented result look like it
+            # lost thresholding / cleanup even though the underlying data did not.
+            return base
         if selected_index > int(len(self._green_component_order)):
             return base
         component_id = int(self._green_component_order[selected_index - 1])
@@ -1929,6 +2367,7 @@ class MainWindow(QMainWindow):
         self.controls.set_threshold_defaults(result.threshold_green, result.threshold_red)
         self.controls.set_microglia_enhancement_enabled(True)
         self.scene.apply_render_config(self.current_render)
+        self._refresh_microglia_analysis_debug()
         self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Load complete.")
         self._log_info("Dataset load and initial render completed.")
@@ -1953,6 +2392,7 @@ class MainWindow(QMainWindow):
         self._set_busy_message("Refreshing render + metrics...")
         self.controls.set_microglia_enhancement_enabled(True)
         self.scene.apply_render_config(self.current_render)
+        self._refresh_microglia_analysis_debug()
         self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Processing complete.")
         self._log_info("Processing applied and scene refreshed.")
@@ -2206,6 +2646,7 @@ class MainWindow(QMainWindow):
             # channels when done — avoid synchronous watershed here.
             if data_upload_changed:
                 self._push_scene_channels()
+            self.scene.set_microglia_analysis_debug(None)
             self._start_microglia_refresh_task()
             self.scene.apply_render_config(config)
             if metrics_changed:
@@ -2216,6 +2657,7 @@ class MainWindow(QMainWindow):
         if data_upload_changed:
             self._push_scene_channels()
         self.scene.apply_render_config(config)
+        self._refresh_microglia_analysis_debug()
         if metrics_changed:
             self._refresh_metrics()
 
@@ -2226,6 +2668,9 @@ class MainWindow(QMainWindow):
         was_enabled = bool(self._microglia_isolate_active)
         self._microglia_isolate_active = bool(isolate_enabled)
         if isolate_enabled:
+            self._sync_analytics_table_selection()
+            if self._page_stack.currentIndex() == 2 or self.latest_microglia_analysis is not None:
+                self._refresh_analytics_metrics()
             self._start_microglia_refresh_task()
             return
         elif was_enabled:
@@ -2233,8 +2678,16 @@ class MainWindow(QMainWindow):
             self._push_scene_channels(green_only=True)
         else:
             # Ignore slider/index changes while isolate mode is already disabled.
+            self._sync_analytics_table_selection()
+            if self._page_stack.currentIndex() == 2 or self.latest_microglia_analysis is not None:
+                self._refresh_analytics_metrics()
+            self._refresh_microglia_analysis_debug()
             return
         self.scene.apply_render_config(self.current_render)
+        self._refresh_microglia_analysis_debug()
+        if self._page_stack.currentIndex() == 2 or self.latest_microglia_analysis is not None:
+            self._refresh_analytics_metrics()
+        self._sync_analytics_table_selection()
 
     def _on_enhance_microglia_requested(self) -> None:
         if self.processed_dataset is None:
@@ -2296,6 +2749,7 @@ class MainWindow(QMainWindow):
         self.controls.set_threshold_defaults(threshold_green, threshold_red)
         self._publish_busy_progress(percent=98.0, message="Refreshing enhanced render...")
         self.scene.apply_render_config(self.current_render)
+        self._refresh_microglia_analysis_debug()
         self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Microglia enhancement complete.")
         self._log_info(

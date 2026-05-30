@@ -958,21 +958,35 @@ def _segment_soma_markers_from_reduced_threshold(
     if not np.any(marker_labels):
         return np.zeros(seed.shape, dtype=np.int32)
 
+    if int(working.size) >= int(_LARGE_VOLUME_VOXELS):
+        logger.info(
+            "Microglia soma segmentation: skipped watershed for large volume shape=%s markers=%d.",
+            tuple(int(v) for v in working.shape),
+            int(np.max(marker_labels)),
+        )
+        return np.asarray(marker_labels, dtype=np.int32)
+
     soma_elevation = -np.asarray(working, dtype=np.float32)
     if np.any(dist > 0.0):
         max_dist = float(np.max(dist))
         if max_dist > 1.0e-6:
             soma_elevation = soma_elevation - (0.16 * (dist / max_dist).astype(np.float32, copy=False))
 
-    soma_labels = np.asarray(
-        _watershed(
-            soma_elevation,
-            markers=marker_labels,
-            mask=soma_candidate,
-            connectivity=structure,
-        ),
-        dtype=np.int32,
-    )
+    try:
+        soma_labels = np.asarray(
+            _watershed(
+                soma_elevation,
+                markers=marker_labels,
+                mask=soma_candidate,
+                connectivity=structure,
+            ),
+            dtype=np.int32,
+        )
+    except MemoryError:
+        logger.warning(
+            "Microglia soma segmentation: watershed allocation failed; falling back to marker labels.",
+        )
+        return np.asarray(marker_labels, dtype=np.int32)
     if not np.any(soma_labels):
         return np.asarray(marker_labels, dtype=np.int32)
 

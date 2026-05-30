@@ -142,6 +142,8 @@ class ControlPanel(QWidget):
     render_config_changed             = Signal(object)
     psf_config_changed                = Signal(object)
     microglia_view_changed            = Signal()
+    run_microglia_segmentation_requested = Signal()
+    run_microglia_analysis_requested  = Signal()
     enhance_microglia_requested       = Signal()
     export_metrics_requested          = Signal()
     export_snapshot_requested         = Signal()
@@ -445,6 +447,51 @@ class ControlPanel(QWidget):
         )
         form.addRow("Branch sensitivity", self.microglia_branch_sensitivity)
 
+        self.microglia_analysis_debug = QCheckBox("Show analysis debug")
+        self.microglia_analysis_debug.toggled.connect(self._set_microglia_debug_layers_enabled)
+        self.microglia_analysis_debug.toggled.connect(self._on_microglia_setting_changed)
+        form.addRow(self.microglia_analysis_debug)
+
+        debug_layers = QWidget()
+        debug_layers_layout = QVBoxLayout(debug_layers)
+        debug_layers_layout.setContentsMargins(18, 0, 0, 0)
+        debug_layers_layout.setSpacing(4)
+
+        debug_row_one = QHBoxLayout()
+        debug_row_one.setSpacing(6)
+        debug_row_two = QHBoxLayout()
+        debug_row_two.setSpacing(6)
+
+        self.microglia_debug_voxels = QCheckBox("Voxels")
+        self.microglia_debug_branches = QCheckBox("Branches")
+        self.microglia_debug_soma = QCheckBox("Soma")
+        self.microglia_debug_tips = QCheckBox("Tips")
+        self.microglia_debug_tip_distance = QCheckBox("Tip distance")
+        self.microglia_debug_cell_distance = QCheckBox("Cell distance")
+
+        for checkbox in (
+            self.microglia_debug_voxels,
+            self.microglia_debug_branches,
+            self.microglia_debug_soma,
+            self.microglia_debug_tips,
+            self.microglia_debug_tip_distance,
+            self.microglia_debug_cell_distance,
+        ):
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._on_microglia_setting_changed)
+
+        debug_row_one.addWidget(self.microglia_debug_voxels)
+        debug_row_one.addWidget(self.microglia_debug_branches)
+        debug_row_one.addWidget(self.microglia_debug_soma)
+        debug_row_two.addWidget(self.microglia_debug_tips)
+        debug_row_two.addWidget(self.microglia_debug_tip_distance)
+        debug_row_two.addWidget(self.microglia_debug_cell_distance)
+
+        debug_layers_layout.addLayout(debug_row_one)
+        debug_layers_layout.addLayout(debug_row_two)
+        form.addRow("Layers", debug_layers)
+        self._set_microglia_debug_layers_enabled(False)
+
         self.microglia_enhancement_method = QComboBox()
         self.microglia_enhancement_method.addItem(
             "Microglia-preserving combined", "microglia_preserve"
@@ -473,6 +520,31 @@ class ControlPanel(QWidget):
         )
         self.enhance_microglia_btn.clicked.connect(self.enhance_microglia_requested.emit)
         sec.add_widget(self.enhance_microglia_btn)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+
+        self.run_microglia_segmentation_btn = QPushButton("Run Segmentation")
+        self.run_microglia_segmentation_btn.setEnabled(False)
+        self.run_microglia_segmentation_btn.setToolTip(
+            "Separate visible microglia into individual components using the current green threshold."
+        )
+        self.run_microglia_segmentation_btn.clicked.connect(
+            self.run_microglia_segmentation_requested.emit
+        )
+        action_row.addWidget(self.run_microglia_segmentation_btn)
+
+        self.run_microglia_analysis_btn = QPushButton("Run Analysis")
+        self.run_microglia_analysis_btn.setEnabled(False)
+        self.run_microglia_analysis_btn.setToolTip(
+            "Analyze the current visible microglia and vasculature view and open Analytics."
+        )
+        self.run_microglia_analysis_btn.clicked.connect(
+            self.run_microglia_analysis_requested.emit
+        )
+        action_row.addWidget(self.run_microglia_analysis_btn)
+
+        sec.add_layout(action_row)
 
         return sec
 
@@ -705,6 +777,18 @@ class ControlPanel(QWidget):
         self.microglia_next.setEnabled(enabled)
         self.microglia_index.setEnabled(enabled)
 
+    def _set_microglia_debug_layers_enabled(self, enabled: bool) -> None:
+        active = bool(enabled)
+        for checkbox in (
+            self.microglia_debug_voxels,
+            self.microglia_debug_branches,
+            self.microglia_debug_soma,
+            self.microglia_debug_tips,
+            self.microglia_debug_tip_distance,
+            self.microglia_debug_cell_distance,
+        ):
+            checkbox.setEnabled(active)
+
     # ══════════════════════════════════════════════════════════════════════════
     # Advanced / show_advanced compat shim
     # ══════════════════════════════════════════════════════════════════════════
@@ -768,6 +852,25 @@ class ControlPanel(QWidget):
     def current_microglia_branch_sensitivity(self) -> float:
         return float(self.microglia_branch_sensitivity.value())
 
+    def microglia_analysis_debug_enabled(self) -> bool:
+        return bool(self.microglia_analysis_debug.isChecked())
+
+    def microglia_analysis_debug_layers(self) -> set[str]:
+        layers: set[str] = set()
+        if self.microglia_debug_voxels.isChecked():
+            layers.add("voxels")
+        if self.microglia_debug_branches.isChecked():
+            layers.add("branches")
+        if self.microglia_debug_soma.isChecked():
+            layers.add("soma")
+        if self.microglia_debug_tips.isChecked():
+            layers.add("tips")
+        if self.microglia_debug_tip_distance.isChecked():
+            layers.add("tip_distance")
+        if self.microglia_debug_cell_distance.isChecked():
+            layers.add("cell_distance")
+        return layers
+
     # ══════════════════════════════════════════════════════════════════════════
     # Public update API (called from main_window)
     # ══════════════════════════════════════════════════════════════════════════
@@ -798,6 +901,11 @@ class ControlPanel(QWidget):
 
     def set_microglia_enhancement_enabled(self, enabled: bool) -> None:
         self.enhance_microglia_btn.setEnabled(bool(enabled))
+
+    def set_microglia_workflow_enabled(self, enabled: bool) -> None:
+        workflow_enabled = bool(enabled)
+        self.run_microglia_segmentation_btn.setEnabled(workflow_enabled)
+        self.run_microglia_analysis_btn.setEnabled(workflow_enabled)
 
     def set_microglia_component_summary(
         self,

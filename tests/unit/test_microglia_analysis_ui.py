@@ -26,6 +26,33 @@ def _sample_dataset() -> DatasetVolume:
     )
 
 
+def _analytics_dataset() -> DatasetVolume:
+    spacing = VoxelSpacing(x_um=1.0, y_um=1.0, z_um=1.0)
+    green = np.zeros((7, 28, 28), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[2:5, 9:19, 9:19] = 1.0
+    green[3, 14, 19:25] = 1.0
+    red[3, 14, 26] = 1.0
+    return DatasetVolume(
+        green=ChannelVolume("green", green, list(range(green.shape[0])), spacing),
+        red=ChannelVolume("red", red, list(range(red.shape[0])), spacing),
+        shared_z_range=(0, green.shape[0] - 1),
+    )
+
+
+def _multi_component_dataset() -> DatasetVolume:
+    spacing = VoxelSpacing(x_um=1.0, y_um=1.0, z_um=1.0)
+    green = np.zeros((5, 24, 24), dtype=np.float32)
+    red = np.zeros_like(green)
+    green[2, 3:8, 3:8] = 0.95
+    green[2, 15:21, 15:21] = 0.88
+    return DatasetVolume(
+        green=ChannelVolume("green", green, list(range(green.shape[0])), spacing),
+        red=ChannelVolume("red", red, list(range(red.shape[0])), spacing),
+        shared_z_range=(0, green.shape[0] - 1),
+    )
+
+
 def test_render_trim_defaults_and_updates(qtbot) -> None:
     panel = ControlPanel()
     qtbot.addWidget(panel)
@@ -55,6 +82,18 @@ def test_reprocess_button_emits_signal(qtbot) -> None:
     panel.show_advanced.setChecked(True)
     with qtbot.waitSignal(panel.apply_psf_requested):
         qtbot.mouseClick(panel.reprocess_btn, Qt.LeftButton)
+
+
+def test_microglia_workflow_buttons_emit_signals(qtbot) -> None:
+    panel = ControlPanel()
+    qtbot.addWidget(panel)
+    panel.set_microglia_workflow_enabled(True)
+
+    with qtbot.waitSignal(panel.run_microglia_segmentation_requested):
+        qtbot.mouseClick(panel.run_microglia_segmentation_btn, Qt.LeftButton)
+
+    with qtbot.waitSignal(panel.run_microglia_analysis_requested):
+        qtbot.mouseClick(panel.run_microglia_analysis_btn, Qt.LeftButton)
 
 
 def test_main_window_wraps_control_panel_in_scroll_area(qtbot) -> None:
@@ -197,3 +236,184 @@ def test_main_window_trim_change_reuploads_scene_channels(qtbot, monkeypatch) ->
     window._on_render_config_changed(replace(window.current_render, trim_first_slices=1))
 
     assert push_calls == [False]
+
+
+def test_analytics_page_populates_microglia_table_and_syncs_selection(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _analytics_dataset()
+
+    monkeypatch.setattr(window, "_start_microglia_refresh_task", lambda: None)
+
+    window.processed_dataset = dataset
+    window.visual_dataset = dataset
+    window.current_render = replace(
+        window.current_render,
+        threshold_green=0.5,
+        threshold_red=0.5,
+        trim_first_slices=0,
+        trim_last_slices=0,
+    )
+    window._mark_metrics_dirty()
+    window._refresh_metrics()
+    window._nav_to(2)
+
+    assert window.latest_microglia_analysis is not None
+    assert window.latest_microglia_analysis.analyzed_cell_count >= 1
+    assert window._analytics_cell_table.rowCount() >= 1
+
+    window._analytics_cell_table.selectRow(0)
+
+    assert window.controls.microglia_view_state() == (True, 1)
+    assert window._analytics_cell_table.currentRow() == 0
+
+
+def test_run_microglia_segmentation_button_starts_refresh(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _analytics_dataset()
+    window.processed_dataset = dataset
+    window.visual_dataset = dataset
+    window.controls.set_microglia_workflow_enabled(True)
+
+    refresh_calls: list[str] = []
+    monkeypatch.setattr(window, "_start_microglia_refresh_task", lambda: refresh_calls.append("seg"))
+
+    qtbot.mouseClick(window.controls.run_microglia_segmentation_btn, Qt.LeftButton)
+
+    assert refresh_calls == ["seg"]
+    assert window.controls.microglia_isolate.isChecked()
+
+
+def test_run_microglia_analysis_button_opens_analytics(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _analytics_dataset()
+    window.processed_dataset = dataset
+    window.visual_dataset = dataset
+    window.controls.set_microglia_workflow_enabled(True)
+
+    refresh_calls: list[str] = []
+    monkeypatch.setattr(window, "_refresh_metrics", lambda: refresh_calls.append("analysis"))
+
+    qtbot.mouseClick(window.controls.run_microglia_analysis_btn, Qt.LeftButton)
+
+    assert window._page_stack.currentIndex() == 2
+    assert refresh_calls == ["analysis"]
+
+
+def test_microglia_all_view_preserves_enhanced_intensity_volume(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _multi_component_dataset()
+
+    window.processed_dataset = dataset
+    window.visual_dataset = dataset
+    window.current_render = replace(
+        window.current_render,
+        threshold_green=0.5,
+        trim_first_slices=0,
+        trim_last_slices=0,
+    )
+    window.controls.microglia_isolate.setChecked(True)
+    window.controls.microglia_index.setValue(0)
+    window._ensure_microglia_components_current()
+
+    view = window._current_green_volume_for_view()
+
+    assert np.allclose(view, dataset.green.data)
+    assert window._green_component_coloring_active is False
+
+
+def test_microglia_analysis_debug_overlay_builds_for_selected_cell(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _analytics_dataset()
+    window.controls.auto_apply_checkbox.setChecked(False)
+
+    overlays: list[object] = []
+    monkeypatch.setattr(window.scene, "set_microglia_analysis_debug", lambda overlay: overlays.append(overlay))
+
+    window.processed_dataset = dataset
+    window.visual_dataset = dataset
+    window.current_render = replace(
+        window.current_render,
+        threshold_green=0.5,
+        threshold_red=0.5,
+        trim_first_slices=0,
+        trim_last_slices=0,
+    )
+    window._ensure_microglia_components_current()
+    window.controls.microglia_analysis_debug.blockSignals(True)
+    window.controls.microglia_isolate.blockSignals(True)
+    window.controls.microglia_index.blockSignals(True)
+    try:
+        window.controls.microglia_analysis_debug.setChecked(True)
+        window.controls.microglia_isolate.setChecked(True)
+        window.controls.microglia_index.setValue(1)
+    finally:
+        window.controls.microglia_analysis_debug.blockSignals(False)
+        window.controls.microglia_isolate.blockSignals(False)
+        window.controls.microglia_index.blockSignals(False)
+
+    window._refresh_microglia_analysis_debug()
+
+    assert overlays
+    overlay = overlays[-1]
+    assert overlay is not None
+    assert overlay.voxel_points_xyz.shape[0] > 0
+    assert overlay.branch_points_xyz.shape[0] > 0
+    assert overlay.soma_points_xyz.shape[0] > 0
+    assert overlay.tip_points_xyz.shape[0] > 0
+
+
+def test_microglia_analysis_debug_overlay_respects_layer_toggles(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _analytics_dataset()
+    window.controls.auto_apply_checkbox.setChecked(False)
+
+    overlays: list[object] = []
+    monkeypatch.setattr(window.scene, "set_microglia_analysis_debug", lambda overlay: overlays.append(overlay))
+
+    window.processed_dataset = dataset
+    window.visual_dataset = dataset
+    window.current_render = replace(
+        window.current_render,
+        threshold_green=0.5,
+        threshold_red=0.5,
+        trim_first_slices=0,
+        trim_last_slices=0,
+    )
+    window._ensure_microglia_components_current()
+    window.controls.microglia_analysis_debug.blockSignals(True)
+    window.controls.microglia_isolate.blockSignals(True)
+    window.controls.microglia_index.blockSignals(True)
+    window.controls.microglia_debug_voxels.blockSignals(True)
+    window.controls.microglia_debug_tips.blockSignals(True)
+    window.controls.microglia_debug_cell_distance.blockSignals(True)
+    try:
+        window.controls.microglia_analysis_debug.setChecked(True)
+        window.controls.microglia_isolate.setChecked(True)
+        window.controls.microglia_index.setValue(1)
+        window.controls.microglia_debug_voxels.setChecked(False)
+        window.controls.microglia_debug_tips.setChecked(False)
+        window.controls.microglia_debug_cell_distance.setChecked(False)
+    finally:
+        window.controls.microglia_analysis_debug.blockSignals(False)
+        window.controls.microglia_isolate.blockSignals(False)
+        window.controls.microglia_index.blockSignals(False)
+        window.controls.microglia_debug_voxels.blockSignals(False)
+        window.controls.microglia_debug_tips.blockSignals(False)
+        window.controls.microglia_debug_cell_distance.blockSignals(False)
+
+    window._refresh_microglia_analysis_debug()
+
+    assert overlays
+    overlay = overlays[-1]
+    assert overlay is not None
+    assert overlay.voxel_points_xyz.shape[0] == 0
+    assert overlay.tip_points_xyz.shape[0] == 0
+    assert overlay.cell_segments_xyz.shape[0] == 0
+    assert overlay.branch_points_xyz.shape[0] > 0
+    assert overlay.soma_points_xyz.shape[0] > 0
