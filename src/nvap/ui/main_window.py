@@ -31,7 +31,6 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -76,7 +75,7 @@ from nvap.preprocess.enhancement import enhance_microglia_background, preprocess
 from nvap.plugins.registry import discover_plugins
 from nvap.render.vtk_scene import MicrogliaDebugOverlay, VTKScene
 from nvap.ui.control_panel import ControlPanel
-from nvap.ui.design import COLOR, ICON_LG, ICON_MD, ICON_SM, SIDEBAR_WIDTH, SPACE
+from nvap.ui.design import COLOR, ICON_MD, ICON_SM, SIDEBAR_WIDTH
 from nvap.ui.dialogs.about import AboutDialog
 from nvap.ui.home_page import HomePage
 from nvap.ui.icons import icon, icon_pixmap
@@ -2092,7 +2091,7 @@ class MainWindow(QMainWindow):
             "Use a single TIFF/PNG stack file, or a folder of sequenced images."
         )
         file_btn = chooser.addButton("Single Stack File", QMessageBox.ButtonRole.AcceptRole)
-        folder_btn = chooser.addButton("Image Sequence Folder", QMessageBox.ButtonRole.ActionRole)
+        chooser.addButton("Image Sequence Folder", QMessageBox.ButtonRole.ActionRole)
         cancel_btn = chooser.addButton(QMessageBox.StandardButton.Cancel)
         chooser.exec()
 

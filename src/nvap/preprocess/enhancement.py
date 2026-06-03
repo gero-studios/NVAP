@@ -8,14 +8,14 @@ import time
 import numpy as np
 import scipy.ndimage as ndi
 from skimage import exposure
-from skimage.filters import frangi, meijering, sato, threshold_otsu
-from skimage.morphology import binary_closing, binary_dilation, remove_small_holes, remove_small_objects, disk, white_tophat
+from skimage.filters import apply_hysteresis_threshold, frangi, meijering, sato, threshold_otsu
+from skimage.morphology import binary_closing, binary_dilation, binary_opening, remove_small_holes, remove_small_objects, disk, white_tophat
 from skimage.restoration import denoise_bilateral, denoise_nl_means, denoise_wavelet, rolling_ball
 
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig
+from nvap.preprocess._executor import get_executor
 from nvap.preprocess.denoisers import (
     denoise_wavelet_3d,
-    denoise_wavelet_slicewise,
     estimate_noise_sigma,
     run_green_denoiser,
 )
@@ -195,7 +195,7 @@ def stage_intensity_stabilization(volume: np.ndarray, config: PreprocessConfig) 
             workers,
             depth,
         )
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nvap-pre") as pool:
+        with get_executor(workers, "nvap-pre") as pool:
             for z, normalized in pool.map(_normalize_plane, range(depth)):
                 out[z] = normalized
     else:
@@ -782,6 +782,12 @@ def _keep_process_like_components(
     return keep[labels]
 
 
+# Opening radius (px) used to extract the compact soma body. A morphological
+# opening removes bright structures thinner than ~2x this radius (processes,
+# speckles) while preserving the rounder cell body.
+_SOMA_OPEN_RADIUS = 2
+
+
 def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
     """Library-first microscopy cleanup for microglia soma and processes."""
     arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
@@ -840,6 +846,21 @@ def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
         process_mask |= (local_detail >= 0.34) & (branch >= 0.12) & (detail >= 0.08)
         process_mask = binary_closing(process_mask, footprint=closing_fp)
         process_mask = _keep_process_like_components(process_mask, branch, detail)
+
+        # Bridge faint gaps along a process: hysteresis grows the strong ridge
+        # seeds through weaker but still ridge-like pixels, then we keep only the
+        # weak pixels that connect back to a confirmed process. A process whose
+        # middle dims toward background stays continuous, while isolated blobs
+        # (speckles) have no ridge to grow along and are never connected in.
+        if np.any(process_mask):
+            branch_hi = max(branch_cut, float(np.percentile(branch, 97.5)))
+            branch_lo = max(0.04, float(np.percentile(branch, 80.0)))
+            if branch_hi > branch_lo:
+                ridge = apply_hysteresis_threshold(branch, branch_lo, branch_hi)
+                ridge = ridge & ((detail >= 0.012) | (local_detail >= 0.030))
+                bridged = ndi.binary_propagation(process_mask, mask=(process_mask | ridge))
+                process_mask = _keep_process_like_components(bridged, branch, detail)
+
         loose_process = (branch >= 0.075) & (detail >= 0.025) & (local_detail >= 0.045)
         loose_process = binary_closing(loose_process, footprint=closing_fp)
         loose_process = _keep_process_like_components(loose_process, branch, detail)
@@ -849,16 +870,28 @@ def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
             & (detail >= 0.020)
         )
 
+        # Soma = compact bright *body*, not merely the brightest pixels. A
+        # morphological opening strips thin bright streaks (processes/speckles)
+        # that the old top-percentile rule mislabeled as soma and rounds the
+        # boundary; a fallback keeps the body if opening would erase it entirely.
         soma_cut = float(np.percentile(plane, 98.7))
-        soma_mask = (
-            plane >= soma_cut
-            if np.isfinite(soma_cut) and soma_cut > 0.0
-            else np.zeros_like(plane, dtype=bool)
-        )
-        soma_mask = binary_closing(soma_mask, footprint=soma_fp)
-        soma_mask = remove_small_holes(soma_mask, area_threshold=16)
-        soma_mask = remove_small_objects(soma_mask, min_size=18)
-        soma_mask = binary_dilation(soma_mask, footprint=soma_fp)
+        if np.isfinite(soma_cut) and soma_cut > 0.0:
+            soma_body = plane >= soma_cut
+            soma_body = binary_closing(soma_body, footprint=soma_fp)
+            soma_body = remove_small_holes(soma_body, area_threshold=16)
+            soma_body = remove_small_objects(soma_body, min_size=18)
+            soma_opened = binary_opening(soma_body, footprint=disk(_SOMA_OPEN_RADIUS))
+            soma_mask = soma_opened if np.any(soma_opened) else soma_body
+            soma_mask = binary_dilation(soma_mask, footprint=soma_fp)
+        else:
+            soma_mask = np.zeros_like(plane, dtype=bool)
+
+        # Keep soma and branch responses disjoint: pixels claimed by the soma body
+        # should not also be lifted as "process" ridges (which produced a halo of
+        # false branches around the soma rim).
+        if np.any(soma_mask):
+            process_mask = process_mask & (~soma_mask)
+            process_context = process_context & (~soma_mask)
 
         support = process_mask | soma_mask
         support = remove_small_objects(support, min_size=8)
@@ -897,6 +930,77 @@ def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
         out[z] = np.clip(plane_out, 0.0, 1.0)
 
     return out.astype(np.float32, copy=False)
+
+
+def _reconnect_and_denoise_microglia(
+    volume: np.ndarray,
+    *,
+    bridge_radius_px: int = 2,
+    far_voxels: float = 26.0,
+    min_object_voxels: int = 8,
+    cell_min_voxels: int = 256,
+) -> np.ndarray:
+    """Reinforce fragmented microglia and strip far-flung isolated noise.
+
+    Run after the slice-wise microscopy cleanup:
+
+    1. Reinforce - a small per-slice grayscale closing bridges faint in-plane
+       gaps so segments of the same process/cell reconnect.
+    2. Denoise - label the bridged volume in 3D. Substantial components
+       (>= ``cell_min_voxels``) are treated as real cells and always kept,
+       regardless of distance, so a field of several microglia is preserved.
+       Only *small* components are pruned, and only when they sit farther than
+       ``far_voxels`` from any cell (isolated green debris); tiny specks below
+       ``min_object_voxels`` are dropped as noise.
+    """
+    arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
+    if arr.ndim != 3 or arr.size == 0:
+        return arr.copy()
+
+    floor = 0.02
+    mask = arr > floor
+    if not np.any(mask):
+        return arr.copy()
+
+    # 1) Reinforce connections (per-slice grayscale closing bridges small gaps).
+    footprint = disk(int(max(1, bridge_radius_px)))
+    reinforced = np.empty_like(arr)
+    for z in range(int(arr.shape[0])):
+        reinforced[z] = ndi.grey_closing(arr[z], footprint=footprint, mode="nearest")
+    bridged_mask = reinforced > floor
+
+    # 2) Keep every cell-sized mass plus small bits near one; drop far debris.
+    labels, n = ndi.label(bridged_mask, structure=np.ones((3, 3, 3), dtype=np.uint8))
+    if n <= 1:
+        kept = bridged_mask
+    else:
+        comp_ids = np.arange(1, n + 1)
+        sizes = np.bincount(labels.ravel(), minlength=n + 1)[1:]
+        substantial = sizes >= int(cell_min_voxels)
+        # Anchors = real cell bodies. If none reach the cell threshold (faint or
+        # heavily fragmented field), fall back to the single largest component so
+        # we never wipe out all signal.
+        if np.any(substantial):
+            anchor_ids = comp_ids[substantial]
+        else:
+            anchor_ids = comp_ids[[int(np.argmax(sizes))]]
+        anchor_mask = np.isin(labels, anchor_ids)
+        dist_to_anchor = ndi.distance_transform_edt(~anchor_mask)
+        min_dist = np.asarray(ndi.minimum(dist_to_anchor, labels, comp_ids), dtype=np.float64)
+        is_anchor = np.isin(comp_ids, anchor_ids)
+        keep_comp = is_anchor | (
+            (sizes >= int(min_object_voxels)) & (min_dist <= float(far_voxels))
+        )
+        lut = np.zeros(n + 1, dtype=bool)
+        lut[comp_ids[keep_comp]] = True
+        kept = lut[labels]
+
+    # 3) Keep original signal where retained, fill bridged gaps, drop the rest.
+    out = np.where(kept & mask, arr, 0.0).astype(np.float32, copy=False)
+    bridge_fill = kept & bridged_mask & (~mask)
+    if np.any(bridge_fill):
+        out[bridge_fill] = reinforced[bridge_fill]
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
 
 
 MICROGLIA_ENHANCEMENT_METHODS: dict[str, str] = {
@@ -1127,7 +1231,9 @@ def _enhance_microglia_core(
         enhanced = _imagej_rolling_ball_slicewise(arr, radius=5, multiplier=1.5)
         return _refine_imagej_rolling_ball_microglia(arr, enhanced)
     elif method == "microscopy_clean":
-        return _microscopy_clean_background(arr)
+        cleaned = _microscopy_clean_background(arr)
+        # Reinforce fragmented processes, then remove far-flung isolated debris.
+        return _reconnect_and_denoise_microglia(cleaned)
     elif method == "basic":
         enhanced = _basic_style_correction(arr)
     elif method == "cidre":

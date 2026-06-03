@@ -18,8 +18,17 @@ class SystemStatus:
     detail: str = ""
 
 
+_gpu_status_cache: SystemStatus | None = None
+
+
 def gpu_status() -> SystemStatus:
-    """Probe GPU rendering capability via VTK's render window."""
+    """Probe GPU rendering capability via VTK's render window.
+
+    Result is cached after first call — GPU capabilities don't change at runtime.
+    """
+    global _gpu_status_cache
+    if _gpu_status_cache is not None:
+        return _gpu_status_cache
     try:
         import vtk  # noqa: F401  – just verify import works
         from vtk import vtkRenderWindow  # type: ignore
@@ -31,11 +40,14 @@ def gpu_status() -> SystemStatus:
         renderer = rw.ReportCapabilities() or ""
         rw.Finalize()
         if not renderer:
-            return SystemStatus("GPU", "warn", "No capability report")
-        first_line = renderer.splitlines()[0] if renderer else "GPU available"
-        return SystemStatus("GPU", "good", first_line[:120])
+            _gpu_status_cache = SystemStatus("GPU", "warn", "No capability report")
+        else:
+            first_line = renderer.splitlines()[0] if renderer else "GPU available"
+            _gpu_status_cache = SystemStatus("GPU", "good", first_line[:120])
+        return _gpu_status_cache
     except Exception as exc:  # vtk not installed, render fails, etc.
-        return SystemStatus("GPU", "warn", f"Software fallback ({type(exc).__name__})")
+        _gpu_status_cache = SystemStatus("GPU", "warn", f"Software fallback ({type(exc).__name__})")
+        return _gpu_status_cache
 
 
 def memory_status() -> SystemStatus:

@@ -7,11 +7,26 @@ from nvap.config.types import ChannelVolume, PreprocessConfig, VoxelSpacing
 from nvap.preprocess import enhancement as enhancement_module
 from nvap.preprocess.enhancement import (
     _imagej_rolling_ball_slicewise,
+    _reconnect_and_denoise_microglia,
     _rolling_ball_slicewise,
     _restore_soma_interiors_after_imagej_rolling_ball,
     enhance_microglia_background,
     preprocess_channel,
 )
+
+
+def test_reconnect_and_denoise_bridges_near_and_drops_far() -> None:
+    vol = np.zeros((5, 64, 64), dtype=np.float32)
+    vol[1:4, 8:18, 8:18] = 0.8  # main cell mass
+    vol[1:4, 8:18, 21:27] = 0.5  # nearby fragment (2 px gap -> should reconnect)
+    vol[1:4, 48:56, 48:56] = 0.6  # far isolated blob (debris -> should be removed)
+
+    out = _reconnect_and_denoise_microglia(vol, bridge_radius_px=2, far_voxels=26.0)
+
+    assert float(out[1, 8:18, 8:18].mean()) > 0.0  # main kept
+    assert float(out[1, 8:18, 21:27].mean()) > 0.0  # near fragment kept
+    assert float(out[1, 10:16, 19:21].max()) > 0.0  # gap bridged
+    assert float(out[:, 48:56, 48:56].max()) == 0.0  # far debris destroyed
 
 
 def test_preprocess_preserves_thin_branch_signal() -> None:
@@ -261,6 +276,73 @@ def test_microscopy_clean_highlights_soma_branches_and_reduces_speckles() -> Non
     assert branch_signal > background_signal * 15.0
     assert soma_signal > branch_signal
     assert speckle_peak < soma_signal * 0.55
+
+
+def test_microscopy_clean_keeps_soma_body_solid_and_rejects_thin_bar() -> None:
+    yy, xx = np.mgrid[0:96, 0:96]
+    background = (0.09 + 0.02 * np.sin(yy / 10.0)).astype(np.float32)
+
+    # A compact soma blob must survive the morphological opening as a solid body.
+    blob = np.repeat(background[np.newaxis, ...], 3, axis=0).copy()
+    disk_mask = (yy - 48) ** 2 + (xx - 48) ** 2 <= 8**2
+    blob[1, disk_mask] += 0.45
+    blob += 0.004 * np.random.default_rng(1).random(blob.shape, dtype=np.float32)
+    out_blob = enhance_microglia_background(
+        np.clip(blob, 0.0, 1.0), PreprocessConfig(), method="microscopy_clean"
+    )
+    enhanced = out_blob[1] > 0.1
+    coverage = float(np.count_nonzero(enhanced & disk_mask)) / float(np.count_nonzero(disk_mask))
+    assert coverage >= 0.8  # opening must not erode the compact soma away
+
+    # A thin bright bar at the same peak intensity must stay process-like (thin),
+    # not be fabricated into a wide soma-shaped solid.
+    bar = np.repeat(background[np.newaxis, ...], 3, axis=0).copy()
+    line = (np.abs(yy - 48) <= 1) & (xx >= 14) & (xx <= 82)
+    bar[1, line] += 0.45
+    bar += 0.004 * np.random.default_rng(2).random(bar.shape, dtype=np.float32)
+    out_bar = enhance_microglia_background(
+        np.clip(bar, 0.0, 1.0), PreprocessConfig(), method="microscopy_clean"
+    )
+    bar_on = int(np.count_nonzero(out_bar[1] > 0.1))
+    # The bar should not balloon into a blob many times its own footprint.
+    assert bar_on < int(np.count_nonzero(line)) * 4
+
+
+def test_microscopy_clean_bridges_faint_process_gaps_without_adding_speckles() -> None:
+    import scipy.ndimage as ndi
+
+    yy, xx = np.mgrid[0:96, 0:96]
+    background = (0.09 + 0.02 * np.sin(yy / 9.0)).astype(np.float32)
+    stack = np.repeat(background[np.newaxis, ...], 3, axis=0).copy()
+
+    soma = (yy - 20) ** 2 + (xx - 20) ** 2 <= 6**2
+    stack[1, soma] += 0.45
+    line = (np.abs(yy - 20) <= 0) & (xx >= 26) & (xx <= 86)
+    stack[1, line] += 0.16
+    faint = line & (xx >= 46) & (xx <= 66)  # middle segment dims toward background
+    stack[1, faint] -= 0.115
+    speckles = np.zeros_like(background, dtype=bool)
+    speckles[70, 30] = speckles[80, 75] = speckles[60, 55] = True
+    stack[1, speckles] += 0.75
+    stack += 0.004 * np.random.default_rng(7).random(stack.shape, dtype=np.float32)
+
+    out = enhance_microglia_background(
+        np.clip(stack, 0.0, 1.0), PreprocessConfig(), method="microscopy_clean"
+    )[1]
+
+    process_region = (np.abs(yy - 20) <= 1) & (xx >= 26) & (xx <= 86)
+    on = out > 0.05
+    labels, count = ndi.label(on & process_region)
+    largest_frac = 0.0
+    if count > 0:
+        sizes = np.bincount(labels.ravel())[1:]
+        largest_frac = float(sizes.max()) / float(np.count_nonzero(process_region))
+
+    # The dimming middle no longer fragments the process away (was ~0.13 before).
+    assert largest_frac >= 0.4
+    assert float(out[faint].mean()) > 0.05
+    # Isolated speckles are still suppressed (no ridge to grow along).
+    assert float(out[speckles].max()) < float(out[soma].mean()) * 0.55
 
 
 def test_all_microglia_enhancement_methods_preserve_microglia_features() -> None:

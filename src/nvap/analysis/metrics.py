@@ -39,7 +39,7 @@ def _component_stats(mask: np.ndarray) -> tuple[int, int]:
     labels, count = ndi.label(mask, structure=structure)
     if count == 0:
         return 0, 0
-    bincount = np.bincount(labels.ravel())
+    bincount = np.bincount(labels.flat)
     largest = int(bincount[1:].max()) if bincount.size > 1 else 0
     return int(count), largest
 

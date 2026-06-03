@@ -4,11 +4,87 @@ import pytest
 import numpy as np
 
 from nvap.analysis.microglia_analysis import (
+    _gate_and_cluster_tips,
+    _spacing_zyx,
     analyze_microglia_cells,
     build_microglia_cell_debug,
     microglia_analysis_to_csv_rows,
 )
 from nvap.config.types import RenderConfig, VoxelSpacing
+
+
+def test_gate_and_cluster_tips_merges_fans_and_drops_body_endpoints() -> None:
+    spacing = _spacing_zyx((1.0, 1.0, 1.0))
+    dist = np.full((5, 30, 30), 0.5, dtype=np.float32)
+    soma = np.zeros((5, 30, 30), dtype=bool)
+    soma[1:4, 13:18, 13:18] = True
+    dist[soma] = 4.0  # soma radius 4 -> tip thickness limit 1.8 um
+    dist[2, 15, 15] = 3.0  # a thick endpoint sitting inside the cell body
+
+    tips = np.array(
+        [
+            [2, 5, 5],  # \
+            [2, 5, 6],  #  } one lamellar fan: should collapse to a single tip
+            [2, 6, 5],  # /
+            [2, 6, 6],  # /
+            [2, 5, 25],  # a separate distal terminal (kept)
+            [2, 15, 15],  # buried in thick body (gated out by thickness)
+        ],
+        dtype=np.int32,
+    )
+
+    out = _gate_and_cluster_tips(
+        tips,
+        dist_local=dist,
+        soma_local=soma,
+        spacing_zyx=spacing,
+        branch_sensitivity=1.0,
+    )
+
+    assert out.shape[0] == 2
+    assert not any(int(r[1]) == 15 and int(r[2]) == 15 for r in out.tolist())
+
+
+def test_gate_and_cluster_tips_drops_endpoints_below_visibility_floor() -> None:
+    spacing = _spacing_zyx((1.0, 1.0, 1.0))
+    dist = np.full((3, 20, 20), 0.5, dtype=np.float32)
+    soma = np.zeros((3, 20, 20), dtype=bool)
+    soma[1, 1, 1] = True
+    intensity = np.zeros((3, 20, 20), dtype=np.float32)
+    intensity[1, 10, 5] = 0.9  # bright, clearly visible -> kept
+    intensity[1, 10, 15] = 0.2  # faint halo below the visibility floor -> dropped
+    tips = np.array([[1, 10, 5], [1, 10, 15]], dtype=np.int32)
+
+    out = _gate_and_cluster_tips(
+        tips,
+        dist_local=dist,
+        soma_local=soma,
+        spacing_zyx=spacing,
+        branch_sensitivity=1.0,
+        intensity_local=intensity,
+        intensity_floor=0.55,
+    )
+
+    assert out.shape[0] == 1
+    assert int(out[0, 2]) == 5
+
+
+def test_gate_and_cluster_tips_radius_scales_with_sensitivity() -> None:
+    spacing = _spacing_zyx((1.0, 1.0, 1.0))
+    dist = np.full((3, 20, 20), 0.5, dtype=np.float32)
+    soma = np.zeros((3, 20, 20), dtype=bool)
+    soma[1, 1, 1] = True  # negligible soma -> 1.5 um thickness floor keeps thin tips
+    tips = np.array([[1, 10, 5], [1, 10, 8]], dtype=np.int32)  # 3 um apart
+
+    low = _gate_and_cluster_tips(
+        tips, dist_local=dist, soma_local=soma, spacing_zyx=spacing, branch_sensitivity=0.4
+    )
+    high = _gate_and_cluster_tips(
+        tips, dist_local=dist, soma_local=soma, spacing_zyx=spacing, branch_sensitivity=2.0
+    )
+
+    assert low.shape[0] == 1  # large merge radius collapses the pair
+    assert high.shape[0] == 2  # small merge radius keeps them distinct
 
 
 def test_microglia_analysis_counts_branches_and_vessel_distances() -> None:
@@ -49,6 +125,33 @@ def test_microglia_analysis_counts_branches_and_vessel_distances() -> None:
     assert cell.soma_voxel_count < cell.voxel_count
     assert cell.nearest_tip_to_vessel_um == pytest.approx(1.0)
     assert cell.nearest_cell_to_vessel_um == pytest.approx(1.0)
+
+
+def test_microglia_analysis_counts_component_owned_low_threshold_voxels() -> None:
+    green = np.zeros((5, 24, 24), dtype=np.float32)
+    green[2, 11:14, 11:14] = 0.8
+    green[2, 12, 14:21] = 0.16
+
+    labels = np.zeros_like(green, dtype=np.int32)
+    labels[green > 0.0] = 1
+    red = np.zeros_like(green)
+
+    result = analyze_microglia_cells(
+        green,
+        red,
+        labels,
+        np.asarray([1], dtype=np.int32),
+        spacing=VoxelSpacing(x_um=1.0, y_um=1.0, z_um=1.0),
+        render=RenderConfig(
+            threshold_green=0.5,
+            threshold_red=0.5,
+            trim_first_slices=0,
+            trim_last_slices=0,
+        ),
+    )
+
+    assert result.analyzed_cell_count == 1
+    assert result.cells[0].voxel_count == int(np.count_nonzero(labels))
 
 
 def test_microglia_analysis_reports_branch_points_length_and_sholl() -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 import logging
 import os
 import threading
@@ -18,6 +18,7 @@ from nvap.preprocess.enhancement import (
 )
 from nvap.preprocess.missing_slices import fill_channel_missing_slices
 from nvap.preprocess.psf import deconvolve_volume
+from nvap.preprocess._executor import get_executor
 from nvap.preprocess.resample import prepare_mesh_dataset
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ def apply_psf_to_dataset(
     else:
         logger.info("PSF channel execution: parallel workers=%d", channel_workers)
         outputs: dict[str, np.ndarray] = {}
-        with ThreadPoolExecutor(max_workers=channel_workers, thread_name_prefix="nvap-psf") as pool:
+        with get_executor(channel_workers, "nvap-psf") as pool:
             futures = [
                 pool.submit(_run_channel, "green", dataset.green),
                 pool.submit(_run_channel, "red", dataset.red),

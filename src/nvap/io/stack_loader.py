@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import re
@@ -26,9 +27,9 @@ CHANNEL_ID = {"green": "c1", "red": "c2"}
 CHANNEL_RGB_INDEX = {"green": 1, "red": 0}
 CHANNEL_STACK_INDEX = {"green": 1, "red": 0}
 _COMBINED_RG_CACHE_MAX = 8
-_combined_rg_cache: dict[tuple[str, tuple[int, int, str, str]], list[tuple[int, Path]]] = {}
+_combined_rg_cache = OrderedDict()
 _COMBINED_RG_PRESENT_CACHE_MAX = 16
-_combined_rg_present_cache: dict[tuple[str, tuple[int, int, str, str]], bool] = {}
+_combined_rg_present_cache = OrderedDict()
 
 
 @dataclass(frozen=True)
@@ -226,11 +227,11 @@ def _list_combined_rg_files(channel_source: Path) -> list[tuple[int, Path]]:
         pairs.append((z_index, file_path))
     pairs.sort(key=lambda item: item[0])
 
-    if len(_combined_rg_cache) >= _COMBINED_RG_CACHE_MAX:
-        _combined_rg_cache.clear()
+    while len(_combined_rg_cache) >= _COMBINED_RG_CACHE_MAX:
+        _combined_rg_cache.popitem(last=False)
     _combined_rg_cache[cache_key] = list(pairs)
-    if len(_combined_rg_present_cache) >= _COMBINED_RG_PRESENT_CACHE_MAX:
-        _combined_rg_present_cache.clear()
+    while len(_combined_rg_present_cache) >= _COMBINED_RG_PRESENT_CACHE_MAX:
+        _combined_rg_present_cache.popitem(last=False)
     _combined_rg_present_cache[cache_key] = bool(pairs)
 
     return pairs
@@ -261,8 +262,8 @@ def _has_combined_rg_files(channel_source: Path) -> bool:
             has_valid = True
             break
 
-    if len(_combined_rg_present_cache) >= _COMBINED_RG_PRESENT_CACHE_MAX:
-        _combined_rg_present_cache.clear()
+    while len(_combined_rg_present_cache) >= _COMBINED_RG_PRESENT_CACHE_MAX:
+        _combined_rg_present_cache.popitem(last=False)
     _combined_rg_present_cache[cache_key] = has_valid
     return has_valid
 

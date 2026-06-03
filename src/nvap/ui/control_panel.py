@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from nvap.config.types import MeshExportConfig, PSFConfig, PreprocessConfig, RenderConfig
-from nvap.ui.design import COLOR, ICON_MD, ICON_SM, SPACE
+from nvap.ui.design import COLOR, ICON_MD, ICON_SM
 from nvap.ui.icons import icon, icon_pixmap
 
 
@@ -508,6 +508,9 @@ class ControlPanel(QWidget):
             "scikit-image white top-hat", "white_tophat"
         )
         self.microglia_enhancement_method.addItem("scikit-image CLAHE", "clahe")
+        _clean_idx = self.microglia_enhancement_method.findData("microscopy_clean")
+        if _clean_idx >= 0:
+            self.microglia_enhancement_method.setCurrentIndex(_clean_idx)
         form.addRow("Enhancement", self.microglia_enhancement_method)
 
         sec.add_layout(form)

@@ -8,7 +8,7 @@ Key strategies:
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 import logging
 import os
 from pathlib import Path
@@ -20,6 +20,7 @@ import scipy.ndimage as ndi
 from skimage.restoration import denoise_nl_means, denoise_wavelet
 
 from nvap.config.types import PreprocessConfig
+from nvap.preprocess._executor import get_executor
 
 logger = logging.getLogger(__name__)
 _CHUNK_NLM_VOXEL_THRESHOLD = 64 * 1024 * 1024
@@ -139,7 +140,7 @@ def denoise_wavelet_slicewise(
 
     depth = arr.shape[0]
     if workers > 1 and depth > 1:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nvap-wav") as pool:
+        with get_executor(workers, "nvap-wav") as pool:
             for z, result in pool.map(_denoise_slice, range(depth)):
                 out[z] = result
     else:
@@ -215,7 +216,7 @@ def run_in_chunks(
             den = np.asarray(fn(arr[start:end]), dtype=np.float32)
             return piece, den, time.perf_counter() - t0
 
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nvap-denoise") as pool:
+        with get_executor(workers, "nvap-denoise") as pool:
             futures = [pool.submit(_run_piece, piece) for piece in pieces]
             done = 0
             for future in as_completed(futures):

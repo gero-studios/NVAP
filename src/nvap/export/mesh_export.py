@@ -7,11 +7,13 @@ Poisson surface reconstruction for watertight manifold meshes.
 from __future__ import annotations
 
 import logging
+import struct
 import time
 from pathlib import Path
 
 import numpy as np
 import scipy.ndimage as ndi
+from scipy import sparse as sp_sparse
 from skimage.measure import marching_cubes
 
 from nvap.config.types import (
@@ -75,45 +77,57 @@ def laplacian_smooth(
 ) -> np.ndarray:
     """Laplacian mesh smoothing — reduces staircase artifacts.
 
-    For each vertex, moves it toward the centroid of its neighbors.
-    Uses Taubin λ/μ scheme for volume-preserving smoothing.
+    Uses sparse-matrix Laplacian for O(V) performance per iteration
+    instead of pure-Python neighbor iteration.
+    Implements the Taubin λ/μ scheme for volume-preserving smoothing.
     """
     verts = np.array(vertices, dtype=np.float64, copy=True)
     n_verts = len(verts)
-    if n_verts == 0 or len(faces) == 0:
+    n_faces = len(faces)
+    if n_verts == 0 or n_faces == 0:
         return verts
-
-    # Build adjacency (neighbor list)
-    neighbors: list[set[int]] = [set() for _ in range(n_verts)]
-    for f in faces:
-        for i in range(len(f)):
-            for j in range(i + 1, len(f)):
-                neighbors[f[i]].add(f[j])
-                neighbors[f[j]].add(f[i])
 
     lam = float(relaxation)
     mu = -lam / 0.9  # Taubin shrinkage compensation
 
-    for it in range(iterations):
-        # Forward pass (λ)
-        new_verts = np.copy(verts)
-        for vi in range(n_verts):
-            nbrs = neighbors[vi]
-            if not nbrs:
-                continue
-            centroid = np.mean(verts[list(nbrs)], axis=0)
-            new_verts[vi] += lam * (centroid - verts[vi])
-        verts = new_verts
+    # Build sparse Laplacian L = I - D⁻¹A via CSR from COO edges.
+    face_arr = np.asarray(faces, dtype=np.int64)
+    n_edges = 6 * n_faces
+    rows = np.empty(n_edges, dtype=np.int64)
+    cols = np.empty(n_edges, dtype=np.int64)
+    idx = 0
+    for v0, v1, v2 in face_arr:
+        rows[idx] = v0; cols[idx] = v1; idx += 1
+        rows[idx] = v1; cols[idx] = v0; idx += 1
+        rows[idx] = v1; cols[idx] = v2; idx += 1
+        rows[idx] = v2; cols[idx] = v1; idx += 1
+        rows[idx] = v2; cols[idx] = v0; idx += 1
+        rows[idx] = v0; cols[idx] = v2; idx += 1
 
-        # Backward pass (μ) — prevents shrinkage
-        new_verts = np.copy(verts)
-        for vi in range(n_verts):
-            nbrs = neighbors[vi]
-            if not nbrs:
-                continue
-            centroid = np.mean(verts[list(nbrs)], axis=0)
-            new_verts[vi] += mu * (centroid - verts[vi])
-        verts = new_verts
+    adj = sp_sparse.coo_matrix(
+        (np.ones(idx, dtype=np.float64), (rows[:idx], cols[:idx])),
+        shape=(n_verts, n_verts),
+    ).tocsr()
+    adj.sum_duplicates()
+
+    deg = np.asarray(adj.sum(axis=1)).ravel()
+    deg[deg == 0] = 1.0
+    inv_deg = 1.0 / deg
+
+    lap = sp_sparse.coo_matrix(
+        (inv_deg[rows[:idx]], (rows[:idx], cols[:idx])),
+        shape=(n_verts, n_verts),
+    ).tocsr()
+    lap.setdiag(1.0)
+    lap.eliminate_zeros()
+
+    I = sp_sparse.eye(n_verts, format="csr", dtype=np.float64)
+    op_fwd = I + lam * (lap - I)
+    op_bwd = I + mu * (lap - I)
+
+    for it in range(iterations):
+        verts = op_fwd.dot(verts)
+        verts = op_bwd.dot(verts)
 
     logger.info("Laplacian smoothing: %d iterations, λ=%.3f, μ=%.3f", iterations, lam, mu)
     return verts
@@ -177,13 +191,13 @@ def _recompute_vertex_normals(
 
 
 def _write_ply(path: Path, vertices: np.ndarray, faces: np.ndarray, normals: np.ndarray | None, color: tuple[int, int, int]) -> None:
-    """Write ASCII PLY mesh file."""
+    """Write binary PLY mesh file (little-endian) for 10-50× faster I/O."""
     n_verts = len(vertices)
     n_faces = len(faces)
 
     header = (
         "ply\n"
-        "format ascii 1.0\n"
+        "format binary_little_endian 1.0\n"
         f"element vertex {n_verts}\n"
         "property float x\n"
         "property float y\n"
@@ -197,35 +211,34 @@ def _write_ply(path: Path, vertices: np.ndarray, faces: np.ndarray, normals: np.
         f"element face {n_faces}\n"
         "property list uchar int vertex_indices\n"
         "end_header\n"
-    )
+    ).encode("ascii")
 
-    with open(path, "w") as f:
+    with open(path, "wb") as f:
         f.write(header)
+        r, g, b = color
         for i in range(n_verts):
             v = vertices[i]
             n = normals[i] if normals is not None and i < len(normals) else (0, 0, 1)
-            f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {n[0]:.6f} {n[1]:.6f} {n[2]:.6f} {color[0]} {color[1]} {color[2]}\n")
+            f.write(struct.pack("<3f3f3B", v[0], v[1], v[2], n[0], n[1], n[2], r, g, b))
         for face in faces:
-            f.write(f"3 {face[0]} {face[1]} {face[2]}\n")
+            f.write(struct.pack("<B3i", 3, face[0], face[1], face[2]))
 
 
 def _write_obj(path: Path, vertices: np.ndarray, faces: np.ndarray, normals: np.ndarray | None) -> None:
     """Write OBJ mesh file."""
     with open(path, "w") as f:
         f.write("# NVAP mesh export\n")
-        for v in vertices:
-            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        f.write("\n".join(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}" for v in vertices))
+        f.write("\n")
         if normals is not None:
-            for n in normals:
-                f.write(f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
+            f.write("\n".join(f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}" for n in normals))
+            f.write("\n")
         for face in faces:
-            # OBJ faces are 1-indexed
             f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
 
 
 def _write_stl(path: Path, vertices: np.ndarray, faces: np.ndarray, normals: np.ndarray | None) -> None:
     """Write binary STL mesh file."""
-    import struct
     n_faces = len(faces)
 
     with open(path, "wb") as f:
@@ -379,9 +392,6 @@ def reconstruct_combined_mesh(
             red_f_offset = red_f + len(green_v)
             all_verts = np.vstack([green_v, red_v])
             all_faces = np.vstack([green_f, red_f_offset])
-            # Build per-vertex colors
-            green_colors = np.full((len(green_v), 3), [25, 255, 50], dtype=np.uint8)
-            red_colors = np.full((len(red_v), 3), [255, 50, 50], dtype=np.uint8)
             all_normals = None
             if green_n is not None and red_n is not None:
                 gn = green_n[:len(green_v)] if len(green_n) >= len(green_v) else green_n
@@ -398,12 +408,12 @@ def reconstruct_combined_mesh(
         path = Path(output_path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write combined PLY with per-vertex colors
+        # Write combined binary PLY with per-vertex colors
         n_verts = len(all_verts)
         n_faces = len(all_faces)
         header = (
             "ply\n"
-            "format ascii 1.0\n"
+            "format binary_little_endian 1.0\n"
             f"element vertex {n_verts}\n"
             "property float x\n"
             "property float y\n"
@@ -414,18 +424,17 @@ def reconstruct_combined_mesh(
             f"element face {n_faces}\n"
             "property list uchar int vertex_indices\n"
             "end_header\n"
-        )
-        with open(path, "w") as f:
+        ).encode("ascii")
+        with open(path, "wb") as f:
             f.write(header)
+            green_buf = np.empty(len(all_verts), dtype=[("v", "3f4"), ("c", "3u1")])
+            green_buf["v"] = all_verts[:, :3]
             for i in range(n_verts):
-                v = all_verts[i]
-                if i < len(green_v):
-                    c = (25, 255, 50)
-                else:
-                    c = (255, 50, 50)
-                f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {c[0]} {c[1]} {c[2]}\n")
+                r, g, b = (25, 255, 50) if i < len(green_v) else (255, 50, 50)
+                green_buf["c"][i] = (r, g, b)
+            f.write(green_buf.tobytes())
             for face in all_faces:
-                f.write(f"3 {face[0]} {face[1]} {face[2]}\n")
+                f.write(struct.pack("<B3i", 3, face[0], face[1], face[2]))
 
         logger.info("Combined mesh exported: %s (verts=%d, faces=%d)", path, n_verts, n_faces)
         return path

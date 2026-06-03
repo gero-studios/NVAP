@@ -7,6 +7,7 @@ Description-Content-Type: text/markdown
 Requires-Dist: numpy>=1.26
 Requires-Dist: scipy>=1.11
 Requires-Dist: scikit-image>=0.22
+Requires-Dist: skan>=0.11
 Requires-Dist: pandas>=2.1
 Requires-Dist: imageio>=2.33
 Requires-Dist: PySide6>=6.6
@@ -233,6 +234,16 @@ This builds a one-folder executable in `dist/NVAP/`.
   - connected component count
   - largest component size
   - red-green overlap in shared z-range
+  - Global metrics honor the active `Trim first/last Z` setting, so the cards
+    match the trimmed volume shown in the 3D view and the per-cell analytics.
+- Per-cell microglia morphometry (Analytics panel / CSV), computed in 3D with
+  anisotropy-aware spacing via [`skan`](https://skeleton-analysis.org/):
+  - branch count (distinct process segments) and terminal tip count
+  - branch-point (junction) count
+  - total and mean process length (geodesic, in um)
+  - soma volume
+  - Sholl ramification: peak intersections, critical radius, enclosing radius
+  - nearest tip / cell distance to vasculature
 - Export:
   - metrics CSV
   - snapshot PNG

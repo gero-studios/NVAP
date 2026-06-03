@@ -13,10 +13,12 @@ src/nvap.egg-info/top_level.txt
 src/nvap/analysis/__init__.py
 src/nvap/analysis/green_benchmark.py
 src/nvap/analysis/metrics.py
+src/nvap/analysis/microglia_analysis.py
 src/nvap/analysis/microglia_components.py
 src/nvap/cache/__init__.py
 src/nvap/cache/processed_cache.py
 src/nvap/config/__init__.py
+src/nvap/config/headless_settings.py
 src/nvap/config/types.py
 src/nvap/export/__init__.py
 src/nvap/export/exporters.py
@@ -27,8 +29,10 @@ src/nvap/plugins/__init__.py
 src/nvap/plugins/contracts.py
 src/nvap/plugins/registry.py
 src/nvap/preprocess/__init__.py
+src/nvap/preprocess/_executor.py
 src/nvap/preprocess/denoisers.py
 src/nvap/preprocess/enhancement.py
+src/nvap/preprocess/fused_volume.py
 src/nvap/preprocess/microglia_masking.py
 src/nvap/preprocess/missing_slices.py
 src/nvap/preprocess/psf.py
@@ -36,6 +40,7 @@ src/nvap/preprocess/resample.py
 src/nvap/render/__init__.py
 src/nvap/render/vtk_scene.py
 src/nvap/ui/__init__.py
+src/nvap/ui/charts.py
 src/nvap/ui/control_panel.py
 src/nvap/ui/design.py
 src/nvap/ui/home_page.py

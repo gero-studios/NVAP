@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 import logging
 
 import numpy as np
@@ -11,6 +12,15 @@ from skimage.morphology import remove_small_holes, skeletonize
 from nvap.config.types import RenderConfig, VoxelSpacing
 
 logger = logging.getLogger(__name__)
+
+# skimage renamed remove_small_holes' size kwarg (area_threshold -> max_size) in
+# 0.26; pick whichever the installed version exposes so we stay warning-free and
+# compatible across the supported range.
+_REMOVE_SMALL_HOLES_KW = (
+    "max_size"
+    if "max_size" in inspect.signature(remove_small_holes).parameters
+    else "area_threshold"
+)
 
 # Default terminal-branch length below which a skeleton branch is treated as a
 # spurious spur (microns). Microglia primary/secondary processes comfortably
@@ -25,6 +35,20 @@ _SPUR_LENGTH_CAP_UM = 6.0
 # Interior holes smaller than this (in voxels) are filled before skeletonising
 # so they do not create spurious skeleton loops / branches.
 _FILL_HOLE_VOXELS = 64
+# Endpoints within this physical radius collapse to a single process terminal.
+# Microglia terminals are flat lamellar "fans" whose skeletons fragment into
+# many endpoints; clustering converts those clusters back into one tip each.
+_DEFAULT_TIP_MERGE_RADIUS_UM = 5.0
+# A real process tip is thin: drop endpoints sitting in voxels thicker than this
+# (they lie inside the soma / cell body, not at a process end). Expressed as a
+# fraction of the soma radius with an absolute floor.
+_TIP_THICKNESS_SOMA_FRACTION = 0.45
+_TIP_THICKNESS_FLOOR_UM = 1.5
+# Intensity margin above the display threshold at which the volume render
+# becomes visible (matches vtk_scene's green opacity ramp ~ threshold + knee*2.8).
+# Tips are only kept on signal at least this far above threshold, so they land on
+# structure the user can actually see rather than on the near-invisible halo.
+_TIP_VISIBILITY_MARGIN = 0.05
 
 try:  # skan provides robust, junction-aware skeleton topology (3D, anisotropy-aware).
     from skan import Skeleton as _SkanSkeleton, summarize as _skan_summarize
@@ -146,11 +170,6 @@ def analyze_microglia_cells(
     spacing_zyx = _spacing_zyx(spacing)
     voxel_volume_um3 = float(np.prod(spacing_zyx))
 
-    visible_green = _apply_render_trim(
-        green >= float(render.threshold_green),
-        int(render.trim_first_slices),
-        int(render.trim_last_slices),
-    )
     trimmed_labels = _apply_render_trim(
         lbl,
         int(render.trim_first_slices),
@@ -183,41 +202,64 @@ def analyze_microglia_cells(
             float(render.threshold_red),
         )
 
+    full_shape = green.shape
+    shift = np.asarray([dz, dy, dx], dtype=np.int64).reshape(1, 3)
+    tip_intensity_floor = float(render.threshold_green) + _TIP_VISIBILITY_MARGIN
+    # Per-component bounding boxes in a single pass, so each cell is processed
+    # only within its own box instead of rescanning the whole volume per label.
+    objects = ndi.find_objects(trimmed_labels)
+    n_objects = len(objects)
+
     cells: list[MicrogliaCellAnalysis] = []
     for component_id in ordered.tolist():
-        component_mask = np.asarray(
-            (trimmed_labels == int(component_id)) & visible_green,
+        cid = int(component_id)
+        if cid <= 0 or cid > n_objects:
+            continue
+        bbox = objects[cid - 1]
+        if bbox is None:
+            continue
+        local_mask = np.asarray(
+            trimmed_labels[bbox] == cid,
             dtype=bool,
         )
-        if not np.any(component_mask):
+        if not np.any(local_mask):
             continue
+        bbox_start = np.asarray(
+            [bbox[0].start or 0, bbox[1].start or 0, bbox[2].start or 0],
+            dtype=np.int64,
+        )
 
         shape_debug = _describe_component_shape(
-            component_mask,
+            local_mask,
             spacing_zyx,
             min_branch_length_um=float(min_branch_length_um),
             branch_sensitivity=float(branch_sensitivity),
+            intensity=green[bbox],
+            tip_intensity_floor=tip_intensity_floor,
         )
-        soma_mask = shape_debug.soma_mask
-        tip_coords = shape_debug.tip_coords
-        shifted_component_mask = _shift_mask_integer(component_mask, dz=dz, dy=dy, dx=dx)
-        nearest_cell_to_vessel = _sample_shortest_distance(vessel_dist, shifted_component_mask)
+        soma_mask = shape_debug.soma_mask  # bbox-local frame
+        tip_coords = shape_debug.tip_coords  # bbox-local frame
+
+        comp_coords = np.argwhere(local_mask).astype(np.int64) + bbox_start
+        nearest_cell_to_vessel = _min_distance_at_coords(
+            vessel_dist, comp_coords, shift, full_shape
+        )
 
         if np.any(soma_mask):
-            shifted_soma_mask = _shift_mask_integer(soma_mask, dz=dz, dy=dy, dx=dx)
-            soma_to_vessel = _sample_shortest_distance(vessel_dist, shifted_soma_mask)
+            soma_coords = np.argwhere(soma_mask).astype(np.int64) + bbox_start
+            soma_to_vessel = _min_distance_at_coords(vessel_dist, soma_coords, shift, full_shape)
         else:
             soma_to_vessel = None
 
         if tip_coords.size > 0:
-            tip_mask = np.zeros(component_mask.shape, dtype=bool)
-            tip_mask[tuple(tip_coords.T)] = True
-            shifted_tip_mask = _shift_mask_integer(tip_mask, dz=dz, dy=dy, dx=dx)
-            nearest_tip_to_vessel = _sample_shortest_distance(vessel_dist, shifted_tip_mask)
+            tip_coords_global = tip_coords.astype(np.int64) + bbox_start
+            nearest_tip_to_vessel = _min_distance_at_coords(
+                vessel_dist, tip_coords_global, shift, full_shape
+            )
         else:
             nearest_tip_to_vessel = None
 
-        voxel_count = int(np.count_nonzero(component_mask))
+        voxel_count = int(np.count_nonzero(local_mask))
         soma_voxel_count = int(np.count_nonzero(soma_mask))
         tip_count = int(tip_coords.shape[0])
         cells.append(
@@ -334,11 +376,6 @@ def build_microglia_cell_debug(
         return None
 
     spacing_zyx = _spacing_zyx(spacing)
-    visible_green = _apply_render_trim(
-        green >= float(render.threshold_green),
-        int(render.trim_first_slices),
-        int(render.trim_last_slices),
-    )
     trimmed_labels = _apply_render_trim(
         lbl,
         int(render.trim_first_slices),
@@ -350,7 +387,7 @@ def build_microglia_cell_debug(
         int(render.trim_last_slices),
     )
     component_mask = np.asarray(
-        (trimmed_labels == component) & visible_green,
+        trimmed_labels == component,
         dtype=bool,
     )
     if not np.any(component_mask):
@@ -361,6 +398,8 @@ def build_microglia_cell_debug(
         spacing_zyx,
         min_branch_length_um=float(min_branch_length_um),
         branch_sensitivity=float(branch_sensitivity),
+        intensity=green,
+        tip_intensity_floor=float(render.threshold_green) + _TIP_VISIBILITY_MARGIN,
     )
     soma_sample_coords = _sample_mask_coords(
         shape_debug.soma_mask,
@@ -407,23 +446,38 @@ def _describe_component_shape(
     *,
     min_branch_length_um: float,
     branch_sensitivity: float,
+    intensity: np.ndarray | None = None,
+    tip_intensity_floor: float = 0.0,
 ) -> _ComponentShapeDebug:
     bounds = _mask_bounds(component_mask)
     if bounds is None:
         return _empty_shape_debug(component_mask)
 
     local_mask = np.asarray(component_mask[bounds], dtype=bool)
+    local_intensity = (
+        np.asarray(intensity[bounds], dtype=np.float32) if intensity is not None else None
+    )
     # Fill small interior cavities so the skeleton does not grow loops/spurs
     # around them. This only adds enclosed background voxels (safe for thin
     # processes) and is used for soma/skeleton shape only, not voxel counts.
     if local_mask.size > 0:
         local_mask = np.asarray(
-            remove_small_holes(local_mask, area_threshold=int(_FILL_HOLE_VOXELS)),
+            remove_small_holes(local_mask, **{_REMOVE_SMALL_HOLES_KW: int(_FILL_HOLE_VOXELS)}),
             dtype=bool,
         )
     dist = ndi.distance_transform_edt(local_mask, sampling=tuple(float(v) for v in spacing_zyx))
     soma_local = _segment_soma_body(local_mask, dist, spacing_zyx)
-    skeleton = np.asarray(skeletonize(local_mask), dtype=bool)
+    # Skeletonise only the *visible* signal (intensity at/above the render's
+    # visibility floor) so processes/tips track what the user can actually see.
+    # Faint halo above the raw threshold but below visibility is excluded, which
+    # naturally places endpoints where the visible structure ends instead of out
+    # in the near-invisible fringe. Soma/volume stay on the full thresholded mask.
+    skeleton_source = local_mask
+    if local_intensity is not None and float(tip_intensity_floor) > 0.0:
+        visible = local_mask & (local_intensity >= float(tip_intensity_floor))
+        if np.any(visible):
+            skeleton_source = visible
+    skeleton = np.asarray(skeletonize(skeleton_source), dtype=bool)
     offset = np.asarray([s.start or 0 for s in bounds], dtype=np.int32)
 
     if not np.any(skeleton):
@@ -459,9 +513,19 @@ def _describe_component_shape(
     soma_centroid = _mask_centroid(soma_local)
     sholl = _sholl_metrics(topology.branch_mask, soma_centroid, spacing_zyx)
 
-    tip_coords = (
-        topology.tip_coords + offset if topology.tip_coords.size > 0 else topology.tip_coords
+    # Convert raw skeleton endpoints into biological process terminals: drop
+    # endpoints buried in the thick cell body, then collapse the endpoint
+    # cluster of each lamellar "fan" into a single representative tip.
+    gated_tips = _gate_and_cluster_tips(
+        topology.tip_coords,
+        dist_local=dist,
+        soma_local=soma_local,
+        spacing_zyx=spacing_zyx,
+        branch_sensitivity=branch_sensitivity,
+        intensity_local=local_intensity,
+        intensity_floor=float(tip_intensity_floor),
     )
+    tip_coords = gated_tips + offset if gated_tips.size > 0 else gated_tips
     return _ComponentShapeDebug(
         soma_mask=_embed_local_mask(component_mask.shape, bounds, soma_local),
         branch_mask=_embed_local_mask(component_mask.shape, bounds, topology.branch_mask),
@@ -702,13 +766,14 @@ def _branch_topology_fallback(
     endpoint_coords = np.argwhere(endpoint_mask).astype(np.int32, copy=False)
     tip_coords = _filter_non_contact_coords(endpoint_coords, soma_contact)
 
-    branch_count = int(ndi.label(skeleton, structure=_FULL_STRUCTURE)[1])
     junction_coords = np.argwhere(skeleton & (degree >= 3)).astype(np.int32, copy=False)
     branch_point_count = _connected_node_count(junction_coords, skeleton.shape)
+    branch_count, total_length = _fallback_branch_segments(
+        skeleton,
+        degree=degree,
+        spacing_zyx=spacing_zyx,
+    )
 
-    # Rough geodesic estimate: voxel count weighted by mean spacing.
-    voxel_count = int(np.count_nonzero(skeleton))
-    total_length = float(voxel_count * float(np.mean(spacing_zyx)))
     mean_length = float(total_length / branch_count) if branch_count > 0 else 0.0
 
     return _BranchTopology(
@@ -730,6 +795,93 @@ def _empty_topology(skeleton: np.ndarray) -> _BranchTopology:
         total_length_um=0.0,
         mean_length_um=0.0,
     )
+
+
+def _fallback_branch_segments(
+    skeleton: np.ndarray,
+    *,
+    degree: np.ndarray,
+    spacing_zyx: np.ndarray,
+) -> tuple[int, float]:
+    """Count endpoint/junction paths when skan is unavailable."""
+    skel = np.asarray(skeleton, dtype=bool)
+    coords = np.argwhere(skel).astype(np.int32, copy=False)
+    if coords.size == 0:
+        return 0, 0.0
+
+    node_mask = skel & (degree != 2)
+    node_coords = np.argwhere(node_mask).astype(np.int32, copy=False)
+    if node_coords.size == 0:
+        # Closed loop: one branch, approximate length from skeleton voxels.
+        return 1, float(coords.shape[0] * float(np.mean(spacing_zyx)))
+
+    node_labels, _ = ndi.label(node_mask, structure=_FULL_STRUCTURE)
+    coord_to_node = {
+        tuple(int(v) for v in row): int(node_labels[int(row[0]), int(row[1]), int(row[2])])
+        for row in node_coords.tolist()
+    }
+    skel_set = {tuple(int(v) for v in row) for row in coords.tolist()}
+    visited_edges: set[frozenset[tuple[int, int, int]]] = set()
+    spacing = np.asarray(spacing_zyx, dtype=np.float64)
+    branch_count = 0
+    total_length = 0.0
+
+    for node, start_node_id in coord_to_node.items():
+        for neighbor in _skeleton_neighbors(node, skel_set):
+            neighbor_node_id = coord_to_node.get(neighbor, 0)
+            if neighbor_node_id == start_node_id:
+                continue
+            edge = frozenset((node, neighbor))
+            if edge in visited_edges:
+                continue
+            visited_edges.add(edge)
+            prev = node
+            current = neighbor
+            length = _neighbor_step_length(prev, current, spacing)
+            while current not in coord_to_node:
+                next_neighbors = [
+                    n for n in _skeleton_neighbors(current, skel_set) if n != prev
+                ]
+                if not next_neighbors:
+                    break
+                nxt = next_neighbors[0]
+                visited_edges.add(frozenset((current, nxt)))
+                length += _neighbor_step_length(current, nxt, spacing)
+                prev, current = current, nxt
+            branch_count += 1
+            total_length += float(length)
+
+    if branch_count <= 0:
+        _, components = ndi.label(skel, structure=_FULL_STRUCTURE)
+        branch_count = int(components)
+        total_length = float(coords.shape[0] * float(np.mean(spacing_zyx)))
+    return branch_count, float(total_length)
+
+
+def _skeleton_neighbors(
+    coord: tuple[int, int, int],
+    skel_set: set[tuple[int, int, int]],
+) -> list[tuple[int, int, int]]:
+    z, y, x = coord
+    out: list[tuple[int, int, int]] = []
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dz == 0 and dy == 0 and dx == 0:
+                    continue
+                n = (z + dz, y + dy, x + dx)
+                if n in skel_set:
+                    out.append(n)
+    return out
+
+
+def _neighbor_step_length(
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+    spacing_zyx: np.ndarray,
+) -> float:
+    delta = np.asarray(right, dtype=np.float64) - np.asarray(left, dtype=np.float64)
+    return float(np.linalg.norm(delta * spacing_zyx))
 
 
 def _sholl_metrics(
@@ -789,6 +941,79 @@ def _filter_non_contact_coords(coords: np.ndarray, contact_mask: np.ndarray) -> 
     if filtered.size == 0:
         return np.empty((0, 3), dtype=np.int32)
     return np.asarray(filtered, dtype=np.int32)
+
+
+def _gate_and_cluster_tips(
+    tips_local: np.ndarray,
+    *,
+    dist_local: np.ndarray,
+    soma_local: np.ndarray,
+    spacing_zyx: np.ndarray,
+    branch_sensitivity: float,
+    intensity_local: np.ndarray | None = None,
+    intensity_floor: float = 0.0,
+) -> np.ndarray:
+    """Turn raw skeleton endpoints into biological process terminals.
+
+    Three corrections:
+
+    * Visibility gate - the volume render ramps opacity from zero at the display
+      threshold and only becomes visible somewhat above it, so endpoints sitting
+      on signal below ``intensity_floor`` look like they float in empty space.
+      They are dropped so tips land only on structure the user can actually see.
+    * Thickness gate - a genuine process tip is thin, so endpoints sitting in
+      voxels thicker than a soma-relative limit (i.e. inside the cell body) are
+      discarded rather than counted as tips.
+    * Terminal clustering - microglia processes end in flat lamellar "fans"
+      whose skeletons fragment into many adjacent endpoints. Endpoints within a
+      merge radius collapse to the single most distal representative, so one fan
+      counts as one tip. The radius scales inversely with branch sensitivity.
+    """
+    pts = np.asarray(tips_local, dtype=np.int32)
+    if pts.shape[0] == 0:
+        return np.empty((0, 3), dtype=np.int32)
+
+    shape = np.asarray(dist_local.shape, dtype=np.int64).reshape(1, 3)
+    pts = pts[np.all((pts >= 0) & (pts < shape), axis=1)]
+    if pts.shape[0] == 0:
+        return np.empty((0, 3), dtype=np.int32)
+
+    if intensity_local is not None and float(intensity_floor) > 0.0:
+        values = np.asarray(intensity_local, dtype=np.float32)[pts[:, 0], pts[:, 1], pts[:, 2]]
+        pts = pts[values >= float(intensity_floor)]
+        if pts.shape[0] == 0:
+            return np.empty((0, 3), dtype=np.int32)
+
+    soma_mask = np.asarray(soma_local, dtype=bool)
+    soma_radius = float(dist_local[soma_mask].max()) if np.any(soma_mask) else 0.0
+    max_thickness = float(max(_TIP_THICKNESS_FLOOR_UM, _TIP_THICKNESS_SOMA_FRACTION * soma_radius))
+    radii = np.asarray(dist_local[pts[:, 0], pts[:, 1], pts[:, 2]], dtype=np.float64)
+    pts = pts[radii <= max_thickness]
+    if pts.shape[0] <= 1:
+        return np.asarray(pts, dtype=np.int32)
+
+    sensitivity = float(np.clip(branch_sensitivity, 0.4, 2.0))
+    merge_radius = float(np.clip(_DEFAULT_TIP_MERGE_RADIUS_UM / sensitivity, 1.5, 12.0))
+    spacing = np.asarray(spacing_zyx, dtype=np.float64).reshape(1, 3)
+    pts_um = pts.astype(np.float64) * spacing
+
+    centroid = _mask_centroid(soma_mask)
+    if centroid is not None:
+        soma_um = np.asarray(centroid, dtype=np.float64).reshape(1, 3) * spacing
+        order = np.argsort(np.linalg.norm(pts_um - soma_um, axis=1))[::-1]
+    else:
+        order = np.arange(pts.shape[0])
+
+    merge_sq = merge_radius * merge_radius
+    kept_idx: list[int] = []
+    kept_um: list[np.ndarray] = []
+    for i in order.tolist():
+        candidate = pts_um[i]
+        if any(float(np.dot(candidate - k, candidate - k)) < merge_sq for k in kept_um):
+            continue
+        kept_idx.append(int(i))
+        kept_um.append(candidate)
+    return np.asarray(pts[kept_idx], dtype=np.int32)
 
 
 def _connected_node_count(coords: np.ndarray, shape: tuple[int, int, int]) -> int:
@@ -915,16 +1140,30 @@ def _distance_to_vessel(vessel_mask: np.ndarray, spacing_zyx: np.ndarray) -> np.
     return np.asarray(dt, dtype=np.float32)
 
 
-def _sample_shortest_distance(
+def _min_distance_at_coords(
     vessel_distance: np.ndarray | None,
-    sample_mask: np.ndarray,
+    coords_zyx: np.ndarray,
+    shift_zyx: np.ndarray,
+    shape: tuple[int, int, int],
 ) -> float | None:
+    """Shortest vessel distance over a set of (optionally shifted) voxel coords.
+
+    Equivalent to shifting a mask and sampling ``vessel_distance`` at the in-bounds
+    voxels, but works directly on a coordinate list so no full-volume mask has to
+    be allocated per component.
+    """
     if vessel_distance is None:
         return None
-    mask = np.asarray(sample_mask, dtype=bool)
-    if not np.any(mask):
+    coords = np.asarray(coords_zyx, dtype=np.int64)
+    if coords.shape[0] == 0:
         return None
-    return float(np.min(vessel_distance[mask]))
+    shifted = coords + np.asarray(shift_zyx, dtype=np.int64).reshape(1, 3)
+    bounds = np.asarray(shape, dtype=np.int64).reshape(1, 3)
+    in_bounds = np.all((shifted >= 0) & (shifted < bounds), axis=1)
+    if not np.any(in_bounds):
+        return None
+    s = shifted[in_bounds]
+    return float(np.min(vessel_distance[s[:, 0], s[:, 1], s[:, 2]]))
 
 
 def _apply_render_trim(volume: np.ndarray, trim_first_slices: int, trim_last_slices: int) -> np.ndarray:
@@ -943,39 +1182,6 @@ def _apply_render_trim(volume: np.ndarray, trim_first_slices: int, trim_last_sli
     if trim_last > 0:
         out[-trim_last:] = 0
     return out
-
-
-def _shift_mask_integer(mask: np.ndarray, *, dz: int, dy: int, dx: int) -> np.ndarray:
-    shifted = np.zeros_like(mask, dtype=bool)
-    src_z0 = max(0, -dz)
-    src_z1 = min(mask.shape[0], mask.shape[0] - dz)
-    dst_z0 = max(0, dz)
-    dst_z1 = min(mask.shape[0], mask.shape[0] + dz)
-
-    src_y0 = max(0, -dy)
-    src_y1 = min(mask.shape[1], mask.shape[1] - dy)
-    dst_y0 = max(0, dy)
-    dst_y1 = min(mask.shape[1], mask.shape[1] + dy)
-
-    src_x0 = max(0, -dx)
-    src_x1 = min(mask.shape[2], mask.shape[2] - dx)
-    dst_x0 = max(0, dx)
-    dst_x1 = min(mask.shape[2], mask.shape[2] + dx)
-
-    if (
-        src_z0 < src_z1
-        and src_y0 < src_y1
-        and src_x0 < src_x1
-        and dst_z0 < dst_z1
-        and dst_y0 < dst_y1
-        and dst_x0 < dst_x1
-    ):
-        shifted[dst_z0:dst_z1, dst_y0:dst_y1, dst_x0:dst_x1] = mask[
-            src_z0:src_z1,
-            src_y0:src_y1,
-            src_x0:src_x1,
-        ]
-    return shifted
 
 
 def _offset_shift_zyx(render: RenderConfig, spacing_zyx: np.ndarray) -> tuple[int, int, int]:
