@@ -208,6 +208,18 @@ This builds a one-folder executable in `dist/NVAP/`.
   - red-green overlap in shared z-range
   - Global metrics honor the active `Trim first/last Z` setting, so the cards
     match the trimmed volume shown in the 3D view and the per-cell analytics.
+- Quantitative vascular morphometry (red channel), anisotropy-aware and
+  physically calibrated (see `metrics_vascular.csv` on export):
+  - vascular volume fraction
+  - total centreline length and length density (mm vessel / mm^3 tissue)
+  - vessel radius / diameter distribution (medial-axis EDT)
+  - junction (branch-point) count + density, free-end count, segment count
+  - mean segment length and mean tortuosity (geodesic / Euclidean)
+  - surface area and surface-to-volume ratio
+- Neurovascular association patterns (`metrics_neurovascular.csv` on export):
+  - perivascular microglia fraction within 5/10/20/50 um shells
+  - mean/median cell-, soma-, and process-tip-to-vessel distances
+  - tip-leading fraction (processes reaching vessels ahead of the cell body)
 - Per-cell microglia morphometry (Analytics panel / CSV), computed in 3D with
   anisotropy-aware spacing via [`skan`](https://skeleton-analysis.org/):
   - branch count (distinct process segments) and terminal tip count

@@ -38,6 +38,14 @@ from PySide6.QtWidgets import (
 from nvap.analysis.microglia_analysis import MicrogliaAnalysisResult, analyze_microglia_cells
 from nvap.analysis.microglia_analysis import build_microglia_cell_debug
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
+from nvap.analysis.vascular_analysis import (
+    analyze_vasculature,
+    vascular_analysis_to_csv_rows,
+)
+from nvap.analysis.neurovascular import (
+    neurovascular_association_to_csv_rows,
+    summarize_neurovascular_association,
+)
 from nvap.cache.processed_cache import (
     build_dataset_signature,
     build_processed_cache_key,
@@ -276,6 +284,7 @@ class MainWindow(QMainWindow):
         self._metrics_revision = 0
         self._microglia_analysis_revision = 0
         self._metrics_cache_key: tuple[int, float, float, float, float, float] | None = None
+        self._vascular_summary_cache: tuple[float, str | None] | None = None
         self._microglia_analysis_cache_key: tuple[int, tuple[int, int, int], float, float, int, int, float, float, float, float] | None = None
         self.dataset_root: Path | None = None
         self._dataset_signature: str | None = None
@@ -1226,6 +1235,7 @@ class MainWindow(QMainWindow):
         self._metrics_revision += 1
         self._metrics_cache_key = None
         self.latest_metrics = None
+        self._vascular_summary_cache = None
         self._mark_microglia_analysis_dirty()
 
     def _metrics_cache_key_for_render(
@@ -1256,7 +1266,42 @@ class MainWindow(QMainWindow):
             f"overlap: voxels={metrics.overlap_voxel_count}, "
             f"volume_um3={metrics.overlap_volume_um3:.3f}"
         )
+        vascular_line = self._vascular_summary_line()
+        if vascular_line:
+            lines.append(vascular_line)
         self.controls.set_metrics_text("\n".join(lines))
+
+    def _vascular_summary_line(self) -> str | None:
+        """Compact vascular morphometry line for the metrics panel (best-effort)."""
+        dataset = self.processed_dataset
+        if dataset is None:
+            return None
+        threshold_red = float(self.current_render.threshold_red)
+        if (
+            self._vascular_summary_cache is not None
+            and np.isclose(self._vascular_summary_cache[0], threshold_red, atol=1.0e-6)
+        ):
+            return self._vascular_summary_cache[1]
+        try:
+            vascular = analyze_vasculature(
+                dataset.red.data,
+                threshold=threshold_red,
+                spacing=dataset.red.spacing,
+                render=self.current_render,
+            )
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            self._log_debug(f"Vascular summary skipped: {exc}")
+            self._vascular_summary_cache = (threshold_red, None)
+            return None
+        result = (
+            f"vasculature: vol_fraction={vascular.vessel_volume_fraction:.4f}, "
+            f"length_density={vascular.length_density_mm_per_mm3:.2f} mm/mm3, "
+            f"mean_diameter_um={vascular.mean_diameter_um:.2f}, "
+            f"junctions={vascular.junction_count}, "
+            f"tortuosity={vascular.mean_tortuosity:.3f}"
+        )
+        self._vascular_summary_cache = (threshold_red, result)
+        return result
 
     def _invalidate_microglia_components(self) -> None:
         self._green_component_labels = None
@@ -2363,11 +2408,10 @@ class MainWindow(QMainWindow):
         self._push_scene_channels()
         self._publish_busy_progress(percent=97.0, message="Applying initial thresholds + metrics...")
         self._set_busy_message("Applying initial thresholds and computing metrics...")
+        # set_threshold_defaults emits render_config_changed → _on_render_config_changed which
+        # already calls apply_render_config + _refresh_metrics.  Do not repeat them here.
         self.controls.set_threshold_defaults(result.threshold_green, result.threshold_red)
         self.controls.set_microglia_enhancement_enabled(True)
-        self.scene.apply_render_config(self.current_render)
-        self._refresh_microglia_analysis_debug()
-        self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Load complete.")
         self._log_info("Dataset load and initial render completed.")
         # Navigate to workspace and record in recent projects
@@ -2785,14 +2829,54 @@ class MainWindow(QMainWindow):
             with self._busy("Export Metrics", "Writing CSV..."):
                 self._publish_busy_progress(percent=10.0, message="Collecting metrics rows...")
                 rows = metrics_to_csv_rows(self.latest_metrics)
-                self._publish_busy_progress(percent=60.0, message="Writing CSV file...")
+                self._publish_busy_progress(percent=50.0, message="Writing CSV file...")
                 out = export_metrics_csv(rows, file_path)
+                self._publish_busy_progress(percent=70.0, message="Computing vascular morphometry...")
+                companions = self._export_extended_analytics(out)
                 self._publish_busy_progress(percent=100.0, message="Metrics export complete.")
-            self.statusBar().showMessage(f"Metrics exported to {out}", 5000)
-            self._log_info(f"Metrics exported: {out}")
+            extra = f" (+{len(companions)} analytics files)" if companions else ""
+            self.statusBar().showMessage(f"Metrics exported to {out}{extra}", 5000)
+            self._log_info(f"Metrics exported: {out}{extra}")
         except Exception as exc:
             self._log_info(f"Metrics export failed: {exc}")
             self._show_error("Export failed", str(exc))
+
+    def _export_extended_analytics(self, base_path: Path) -> list[Path]:
+        """Write vascular + neurovascular companion CSVs next to ``metrics.csv``.
+
+        These carry the quantitative vasculature morphometry and the population
+        neurovascular-association patterns that don't fit the per-channel metrics
+        schema. Failures are logged but never block the primary metrics export.
+        """
+        written: list[Path] = []
+        base = Path(base_path)
+        stem = base.stem
+
+        dataset = self.processed_dataset
+        if dataset is not None:
+            try:
+                vascular = analyze_vasculature(
+                    dataset.red.data,
+                    threshold=float(self.current_render.threshold_red),
+                    spacing=dataset.red.spacing,
+                    render=self.current_render,
+                )
+                vpath = base.with_name(f"{stem}_vascular.csv")
+                export_metrics_csv(vascular_analysis_to_csv_rows(vascular), vpath)
+                written.append(vpath)
+            except Exception as exc:  # pragma: no cover - defensive UI path
+                self._log_info(f"Vascular metrics export skipped: {exc}")
+
+        if self.latest_microglia_analysis is not None:
+            try:
+                assoc = summarize_neurovascular_association(self.latest_microglia_analysis)
+                npath = base.with_name(f"{stem}_neurovascular.csv")
+                export_metrics_csv(neurovascular_association_to_csv_rows(assoc), npath)
+                written.append(npath)
+            except Exception as exc:  # pragma: no cover - defensive UI path
+                self._log_info(f"Neurovascular metrics export skipped: {exc}")
+
+        return written
 
     def _on_export_snapshot_requested(self) -> None:
         start = str((self.dataset_root or Path.cwd()) / "snapshot.png")

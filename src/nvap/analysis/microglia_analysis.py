@@ -34,7 +34,7 @@ _SPUR_RADIUS_FACTOR = 1.25
 _SPUR_LENGTH_CAP_UM = 6.0
 # Interior holes smaller than this (in voxels) are filled before skeletonising
 # so they do not create spurious skeleton loops / branches.
-_FILL_HOLE_VOXELS = 64
+_FILL_HOLE_VOXELS = 128
 # Endpoints within this physical radius collapse to a single process terminal.
 # Microglia terminals are flat lamellar "fans" whose skeletons fragment into
 # many endpoints; clustering converts those clusters back into one tip each.
@@ -737,11 +737,25 @@ def _branch_topology_skan(
     branch_point_count = _connected_node_count(junction_coords, skeleton.shape)
 
     try:
-        total_length = float(np.sum(skel.path_lengths()))
+        all_lengths = np.asarray(skel.path_lengths(), dtype=np.float64)
+        total_length = float(np.sum(all_lengths))
+        final_summary = _skan_summarize(skel, separator="-")
+        final_types = np.asarray(final_summary["branch-type"].to_numpy(), dtype=np.int64)
+        if all_lengths.shape == final_types.shape:
+            terminal_mask = np.isin(final_types, _TERMINAL_BRANCH_TYPES)
+            branch_count = int(np.sum(terminal_mask))
+            terminal_lengths = all_lengths[terminal_mask]
+            mean_length = float(np.mean(terminal_lengths)) if terminal_lengths.size > 0 else 0.0
+            if branch_count == 0:
+                branch_count = int(skel.n_paths)
+                mean_length = float(total_length / branch_count) if branch_count > 0 else 0.0
+        else:
+            branch_count = int(skel.n_paths)
+            mean_length = float(total_length / branch_count) if branch_count > 0 else 0.0
     except Exception:
         total_length = 0.0
-    branch_count = int(skel.n_paths)
-    mean_length = float(total_length / branch_count) if branch_count > 0 else 0.0
+        branch_count = int(skel.n_paths)
+        mean_length = 0.0
 
     return _BranchTopology(
         tip_coords=tip_coords,
@@ -906,7 +920,7 @@ def _sholl_metrics(
     if enclosing <= 0.0:
         return _ShollMetrics(0, 0.0, enclosing)
 
-    step = float(max(float(np.min(spacing)) * 2.0, 1.0))
+    step = float(max(float(np.min(spacing)), 0.5))
     n_shells = int(np.ceil(enclosing / step))
     int_coords = np.rint(coords).astype(np.int32)
 
@@ -1163,7 +1177,14 @@ def _min_distance_at_coords(
     if not np.any(in_bounds):
         return None
     s = shifted[in_bounds]
-    return float(np.min(vessel_distance[s[:, 0], s[:, 1], s[:, 2]]))
+    dist_vals = vessel_distance[s[:, 0], s[:, 1], s[:, 2]]
+    # Exclude voxels that sit inside the vessel (EDT = 0) — those positions are
+    # at-or-inside the vessel surface and would collapse the minimum to 0 whenever
+    # there is any voxel-level overlap between channels (e.g. spectral bleedthrough).
+    # The biologically meaningful distance is from the nearest non-overlapping cell
+    # voxel to the vessel; only return 0 when the cell is entirely within the mask.
+    outside = dist_vals[dist_vals > 0.0]
+    return float(np.min(outside)) if outside.size > 0 else 0.0
 
 
 def _apply_render_trim(volume: np.ndarray, trim_first_slices: int, trim_last_slices: int) -> np.ndarray:

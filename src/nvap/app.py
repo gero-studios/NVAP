@@ -4,7 +4,8 @@ import argparse
 import logging
 from pathlib import Path
 
-from nvap.analysis.metrics import compute_metrics
+from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
+from nvap.analysis.vascular_analysis import analyze_vasculature, vascular_analysis_to_csv_rows
 from nvap.analysis.green_benchmark import run_green_denoise_benchmark
 from nvap.cache.processed_cache import clear_processed_cache
 from nvap.config.types import DEFAULT_SPACING, MeshExportConfig, PSFConfig, PreprocessConfig, RenderConfig
@@ -58,6 +59,22 @@ def run_headless_smoke(input_path: str | Path) -> int:
     print(
         f"overlap: voxels={metrics.overlap_voxel_count}, "
         f"volume_um3={metrics.overlap_volume_um3:.3f}"
+    )
+
+    vascular = analyze_vasculature(
+        processed.red.data,
+        threshold=float(render.threshold_red),
+        spacing=processed.red.spacing,
+        render=render,
+    )
+    print(
+        "vasculature: "
+        f"vol_fraction={vascular.vessel_volume_fraction:.4f}, "
+        f"length_um={vascular.total_length_um:.1f}, "
+        f"length_density_mm_per_mm3={vascular.length_density_mm_per_mm3:.2f}, "
+        f"mean_diameter_um={vascular.mean_diameter_um:.2f}, "
+        f"junctions={vascular.junction_count}, segments={vascular.segment_count}, "
+        f"tortuosity={vascular.mean_tortuosity:.3f}"
     )
     logger.info("Headless smoke complete.")
     return 0
