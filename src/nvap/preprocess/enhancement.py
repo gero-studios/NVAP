@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
 import time
+from typing import Callable
 
 import numpy as np
 import scipy.ndimage as ndi
@@ -792,7 +793,11 @@ def _keep_process_like_components(
 _SOMA_OPEN_RADIUS = 2
 
 
-def _microscopy_clean_background(volume: np.ndarray, workers: int = 1) -> np.ndarray:
+def _microscopy_clean_background(
+    volume: np.ndarray,
+    workers: int = 1,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> np.ndarray:
     """Library-first microscopy cleanup for microglia soma and processes.
 
     Each z-slice is processed independently (rolling-ball background subtraction
@@ -955,11 +960,15 @@ def _microscopy_clean_background(volume: np.ndarray, workers: int = 1) -> np.nda
                 completed += 1
                 if completed == 1 or completed == depth or (completed % progress_every) == 0:
                     logger.info("microscopy_clean progress: slices=%d/%d", completed, depth)
+                    if progress_callback is not None:
+                        progress_callback(completed, depth)
     else:
         for z in range(depth):
             _, plane_out = _run_slice(z)
             if plane_out is not None:
                 out[z] = plane_out
+            if progress_callback is not None:
+                progress_callback(z + 1, depth)
 
     return out.astype(np.float32, copy=False)
 
@@ -1271,6 +1280,7 @@ def _enhance_microglia_core(
     arr: np.ndarray,
     cfg: PreprocessConfig,
     method: str,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> np.ndarray:
     """Remove fluorescence background while preserving microglia somas and branches."""
     sigma_xy = float(max(18.0, cfg.flatfield_sigma_xy))
@@ -1279,7 +1289,9 @@ def _enhance_microglia_core(
         enhanced = _imagej_rolling_ball_slicewise(arr, radius=5, multiplier=1.5)
         return _refine_imagej_rolling_ball_microglia(arr, enhanced)
     elif method == "microscopy_clean":
-        cleaned = _microscopy_clean_background(arr, workers=_resolve_worker_threads(cfg))
+        cleaned = _microscopy_clean_background(
+            arr, workers=_resolve_worker_threads(cfg), progress_callback=progress_callback
+        )
         # Reinforce fragmented processes, then remove far-flung isolated debris.
         return _reconnect_and_denoise_microglia(cleaned)
     elif method == "basic":
@@ -1334,6 +1346,7 @@ def enhance_microglia_background(
     volume: np.ndarray,
     config: PreprocessConfig | None = None,
     method: str = "microglia_preserve",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> np.ndarray:
     cfg = config or PreprocessConfig()
     arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
@@ -1341,7 +1354,7 @@ def enhance_microglia_background(
         raise ValueError(f"Microglia volume must be 3D (z, y, x), got {arr.shape}")
     if arr.size == 0:
         return arr.copy()
-    return _enhance_microglia_core(arr, cfg, method)
+    return _enhance_microglia_core(arr, cfg, method, progress_callback=progress_callback)
 
 
 def wipe_small_specks(

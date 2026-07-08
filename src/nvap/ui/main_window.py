@@ -2885,12 +2885,39 @@ class MainWindow(QMainWindow):
             f"speck<{max_voxels} vox)."
         )
 
+        def _report_auto_enhance_progress(completed: int, total: int) -> None:
+            if total <= 0:
+                return
+            fraction = min(1.0, completed / total)
+            self._publish_busy_progress(
+                percent=10.0 + (fraction * 50.0),
+                message=f"Enhancing microglia ({completed}/{total} slices)...",
+            )
+
         def _auto_task() -> DatasetVolume:
             green = np.asarray(dataset.green.data, dtype=np.float32)
             red = np.asarray(dataset.red.data, dtype=np.float32)
             if want_enhance:
                 self._publish_busy_progress(percent=10.0, message="Enhancing microglia (clean)...")
-                green = enhance_microglia_background(green, preprocess_cfg, method=method)
+                green = enhance_microglia_background(
+                    green,
+                    preprocess_cfg,
+                    method=method,
+                    progress_callback=_report_auto_enhance_progress,
+                )
+                # Persist so the next time this project opens, the restore path in
+                # _background_load_dataset finds a real cache file instead of
+                # silently missing and re-running the enhancement from scratch.
+                if self._last_processed_cache_key:
+                    try:
+                        save_enhanced_dataset(
+                            self._last_processed_cache_key,
+                            method,
+                            green,
+                            base_dir=self._project_cache_base_dir(),
+                        )
+                    except OSError as exc:
+                        self._log_info(f"Enhanced cache save failed: {exc}")
             if want_wipe:
                 self._publish_busy_progress(percent=60.0, message="Wiping microglia specks...")
                 green = wipe_small_specks(green, threshold=threshold_green, min_voxels=max_voxels)
@@ -3133,6 +3160,15 @@ class MainWindow(QMainWindow):
             float(config.threshold_green),
             atol=1.0e-6,
         )
+        red_threshold_changed = not np.isclose(
+            float(previous.threshold_red),
+            float(config.threshold_red),
+            atol=1.0e-6,
+        )
+        should_auto_wipe = (
+            (green_threshold_changed or red_threshold_changed)
+            and self.controls.auto_wipe_specks_on_threshold_edit_enabled()
+        )
         if green_threshold_changed:
             self._invalidate_microglia_components()
         isolate_enabled, _ = self.controls.microglia_view_state()
@@ -3146,6 +3182,8 @@ class MainWindow(QMainWindow):
             self.scene.apply_render_config(config)
             if metrics_changed:
                 self._refresh_metrics()
+            if should_auto_wipe:
+                self._on_wipe_specks_requested()
             return
         if isolate_enabled:
             self._refresh_microglia_components_if_needed()
@@ -3155,6 +3193,8 @@ class MainWindow(QMainWindow):
         self._refresh_microglia_analysis_debug()
         if metrics_changed:
             self._refresh_metrics()
+        if should_auto_wipe:
+            self._on_wipe_specks_requested()
 
     def _on_microglia_view_changed(self) -> None:
         if self.visual_dataset is None or self.processed_dataset is None:
@@ -3200,12 +3240,22 @@ class MainWindow(QMainWindow):
             float(self.controls.current_microglia_branch_sensitivity()),
         )
 
+        def _report_enhance_progress(completed: int, total: int) -> None:
+            if total <= 0:
+                return
+            fraction = min(1.0, completed / total)
+            self._publish_busy_progress(
+                percent=8.0 + (fraction * 78.0),
+                message=f"Enhancing microglia ({completed}/{total} slices)...",
+            )
+
         def _enhance_task() -> DatasetVolume:
             self._publish_busy_progress(percent=8.0, message="Estimating green background...")
             enhanced_green = enhance_microglia_background(
                 dataset.green.data,
                 preprocess_cfg,
                 method=enhancement_method,
+                progress_callback=_report_enhance_progress,
             )
             self._publish_busy_progress(percent=86.0, message="Updating enhanced dataset...")
             return DatasetVolume(
@@ -3570,10 +3620,18 @@ class MainWindow(QMainWindow):
             red = np.asarray(processed.red.data, dtype=np.float32)
             if config.apply_enhancement:
                 stage(0.52, "enhancing microglia...")
+
+                def _report_enhance_progress(completed: int, total_slices: int) -> None:
+                    if total_slices <= 0:
+                        return
+                    fraction = 0.52 + (min(1.0, completed / total_slices) * 0.10)
+                    stage(fraction, f"enhancing microglia ({completed}/{total_slices} slices)...")
+
                 green = enhance_microglia_background(
                     green,
                     config.preprocess,
                     method=config.enhancement_method,
+                    progress_callback=_report_enhance_progress,
                 )
             if config.apply_wipe:
                 stage(0.62, "wiping specks...")
@@ -4044,6 +4102,9 @@ class MainWindow(QMainWindow):
             "microglia_enhancement_method": self._current_microglia_enhancement_method or "",
             "wipe_specks_on_load": bool(self.controls.auto_wipe_specks_on_load_enabled()),
             "enhance_microglia_on_load": bool(self.controls.auto_enhance_microglia_on_load_enabled()),
+            "wipe_specks_on_threshold_edit": bool(
+                self.controls.auto_wipe_specks_on_threshold_edit_enabled()
+            ),
             "speck_max_voxels": int(self.controls.current_wipe_speck_max_voxels()),
         }
         if spacing is not None:

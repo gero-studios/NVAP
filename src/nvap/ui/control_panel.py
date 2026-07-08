@@ -576,6 +576,26 @@ class ControlPanel(QWidget):
         )
         action_panel_layout.addWidget(self.auto_wipe_on_load)
 
+        # "Automatic on edit" toggle — read every time the green/red threshold
+        # sliders settle on a new value (debounced), independent of the
+        # on-load toggles above.
+        auto_edit_header = QLabel("Automatic on edit")
+        auto_edit_header.setObjectName("sectionSubheading")
+        auto_edit_header.setToolTip(
+            "Steps run automatically in response to edits you make while working\n"
+            "with an already-loaded dataset."
+        )
+        action_panel_layout.addWidget(auto_edit_header)
+
+        self.auto_wipe_on_threshold_edit = QCheckBox("Wipe specks when threshold changes")
+        self.auto_wipe_on_threshold_edit.setChecked(False)
+        self.auto_wipe_on_threshold_edit.setToolTip(
+            "Automatically re-run the speck wipe (using the size above) on both\n"
+            "channels whenever you change the green or red threshold. Off by\n"
+            "default since it re-wipes on every threshold edit, not just on load."
+        )
+        action_panel_layout.addWidget(self.auto_wipe_on_threshold_edit)
+
         self.wipe_specks_btn = QPushButton("  Wipe Specks")
         self.wipe_specks_btn.setObjectName("workbenchSecondaryAction")
         self.wipe_specks_btn.setIcon(icon("trash", ICON_SM, COLOR.accent))
@@ -993,6 +1013,9 @@ class ControlPanel(QWidget):
 
     def auto_enhance_microglia_on_load_enabled(self) -> bool:
         return bool(self.auto_enhance_on_load.isChecked())
+
+    def auto_wipe_specks_on_threshold_edit_enabled(self) -> bool:
+        return bool(self.auto_wipe_on_threshold_edit.isChecked())
 
     def set_microglia_workflow_enabled(self, enabled: bool) -> None:
         workflow_enabled = bool(enabled)
