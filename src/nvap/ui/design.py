@@ -17,49 +17,49 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Color:
     # Surfaces – ascending depth
-    bg_base: str       = "#080A0D"   # outermost (window chrome, status bar)
-    bg_canvas: str     = "#101216"   # main canvas (workspace, panels)
-    bg_surface: str    = "#151922"   # raised (group boxes, cards)
-    bg_surface_2: str  = "#1B202A"   # higher (buttons, hover bg)
-    bg_surface_3: str  = "#222936"   # highest (active state)
-    bg_overlay: str    = "#080A0DCC" # modal scrim
+    bg_base: str       = "#07090c"   # outermost (window chrome, status bar)
+    bg_canvas: str     = "#0b0e12"   # main canvas (workspace, panels)
+    bg_surface: str    = "#10141a"   # raised (group boxes, cards)
+    bg_surface_2: str  = "#151a21"   # higher (buttons, hover bg)
+    bg_surface_3: str  = "#1b222b"   # highest (active state)
+    bg_overlay: str    = "#07090ccc" # modal scrim
 
     # Borders – subtle to prominent
-    border_subtle: str = "#202633"
-    border_default: str= "#272E3B"
-    border_strong: str = "#313947"
-    border_focus: str  = "#d8bd78"
+    border_subtle: str = "#1a2028"
+    border_default: str= "#242b35"
+    border_strong: str = "#343d49"
+    border_focus: str  = "#9fb7c8"
 
     # Text – warm near-white on dark
-    text_primary: str  = "#eef2f6"
-    text_secondary: str= "#d9dee7"
-    text_tertiary: str = "#9aa4b2"
-    text_disabled: str = "#56606f"
-    text_inverse: str  = "#111318"
+    text_primary: str  = "#edf2f7"
+    text_secondary: str= "#cfd7df"
+    text_tertiary: str = "#8d98a5"
+    text_disabled: str = "#4e5966"
+    text_inverse: str  = "#07090c"
 
     # Brand accent – muted brass / gold
-    accent: str        = "#d8bd78"
-    accent_hover: str  = "#f0d98d"
-    accent_pressed: str= "#b89c5b"
-    accent_subtle: str = "#2a2418"   # tinted bg for selected/active
+    accent: str        = "#9fb7c8"
+    accent_hover: str  = "#c5d7e3"
+    accent_pressed: str= "#7792a6"
+    accent_subtle: str = "#14202a"   # tinted bg for selected/active
 
     # Channel colors (microscopy domain)
-    channel_red: str       = "#e56f78"
-    channel_red_strong: str= "#d04a55"
-    channel_red_subtle: str= "#3f1c20"
-    channel_green: str     = "#69d9a3"
-    channel_green_strong: str = "#3fbf83"
-    channel_green_subtle: str = "#1a3a2a"
+    channel_red: str       = "#dd6872"
+    channel_red_strong: str= "#c94d58"
+    channel_red_subtle: str= "#2b1418"
+    channel_green: str     = "#6fd6a0"
+    channel_green_strong: str = "#48bf82"
+    channel_green_subtle: str = "#13281f"
 
     # Semantic state
-    success: str       = "#69d9a3"
-    warning: str       = "#d2a94d"
-    danger: str        = "#e56f78"
-    info: str          = "#d8bd78"
+    success: str       = "#6fd6a0"
+    warning: str       = "#caa65a"
+    danger: str        = "#dd6872"
+    info: str          = "#9fb7c8"
 
     # Selection
-    selection_bg: str  = "#d8bd78"
-    selection_fg: str  = "#111318"
+    selection_bg: str  = "#9fb7c8"
+    selection_fg: str  = "#07090c"
 
 
 COLOR = Color()
@@ -86,11 +86,11 @@ SPACE = Spacing()
 # ─── RADIUS ────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Radius:
-    sm: int  = 4
-    md: int  = 6
-    lg: int  = 8
-    xl: int  = 12
-    pill: int= 999
+    sm: int  = 1
+    md: int  = 2
+    lg: int  = 3
+    xl: int  = 4
+    pill: int= 4
 
 
 RADIUS = Radius()

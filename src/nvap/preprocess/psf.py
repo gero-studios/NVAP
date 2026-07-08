@@ -14,6 +14,7 @@ from scipy import fft as sp_fft
 from scipy.signal import fftconvolve
 
 from nvap.config.types import PSFConfig, VoxelSpacing
+from nvap.runtime_optimization import configured_cpu_workers
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ def _resolve_fft_workers() -> int:
                 return value
         except ValueError:
             logger.warning("Invalid NVAP_PSF_FFT_WORKERS=%r. Falling back to auto.", raw)
-    cpus = os.cpu_count() or 1
+    cpus = configured_cpu_workers(os.cpu_count() or 1)
     # Leave headroom for channel-level parallelism.
     return max(1, min(8, cpus // 2 if cpus >= 4 else cpus))
 

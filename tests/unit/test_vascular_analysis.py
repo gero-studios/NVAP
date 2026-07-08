@@ -82,6 +82,19 @@ def test_branching_phantom_reports_junction():
     assert result.endpoint_count >= 3
 
 
+def test_stacked_centerline_columns_report_decussation_candidates():
+    vol = np.zeros((7, 15, 15), dtype=np.float32)
+    vol[1, 7, 3:12] = 1.0
+    vol[5, 3:12, 7] = 1.0
+
+    result = analyze_vasculature(vol, threshold=0.5, spacing=VoxelSpacing(1.0, 1.0, 1.0))
+
+    assert result.decussation_candidate_count >= 1
+    assert result.mean_decussation_z_separation_um >= 4.0
+    rows = vascular_analysis_to_csv_rows(result)
+    assert any(row["metric"] == "decussation_candidate_count" for row in rows)
+
+
 def test_empty_volume_is_safe():
     vol = np.zeros((10, 10, 10), dtype=np.float32)
     result = analyze_vasculature(vol, threshold=0.5, spacing=VoxelSpacing(1.0, 1.0, 1.0))
@@ -103,3 +116,26 @@ def test_render_trim_is_honoured():
     )
     # Trimming removes vessel voxels in the cut slices.
     assert trimmed.vessel_voxel_count < full.vessel_voxel_count
+
+
+def test_trim_excludes_trimmed_slices_from_tissue_volume():
+    # Cylinder along z is uniform in z, so trimming removes vessel *and* tissue in
+    # equal proportion. Tissue volume must count only the retained slices; if the
+    # trimmed slices leaked into the denominator the fraction would drop.
+    shape = (60, 24, 24)
+    voxel_volume = 1.0
+    vol = _make_cylinder(shape=shape, radius_vox=4.0, axis=0)
+    render = RenderConfig(trim_first_slices=5, trim_last_slices=5)
+    spacing = VoxelSpacing(1.0, 1.0, 1.0)
+
+    full = analyze_vasculature(vol, threshold=0.5, spacing=spacing)
+    trimmed = analyze_vasculature(vol, threshold=0.5, spacing=spacing, render=render)
+
+    retained_slices = shape[0] - 10
+    expected_tissue = retained_slices * shape[1] * shape[2] * voxel_volume
+    assert trimmed.tissue_volume_um3 == pytest.approx(expected_tissue)
+    # A z-uniform vessel keeps the same volume fraction after trimming z-ends;
+    # this only holds when the trimmed slices leave the denominator too.
+    assert trimmed.vessel_volume_fraction == pytest.approx(
+        full.vessel_volume_fraction, rel=1e-6
+    )

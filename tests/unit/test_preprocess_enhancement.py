@@ -12,7 +12,38 @@ from nvap.preprocess.enhancement import (
     _restore_soma_interiors_after_imagej_rolling_ball,
     enhance_microglia_background,
     preprocess_channel,
+    wipe_small_specks,
 )
+
+
+def test_wipe_small_specks_removes_specks_keeps_large_structures() -> None:
+    vol = np.zeros((6, 40, 40), dtype=np.float32)
+    # Large structure (e.g. a vessel/soma) — must survive.
+    vol[1:5, 5:25, 5:9] = 0.9
+    # A handful of tiny isolated specks — must be wiped.
+    vol[0, 1, 1] = 0.95
+    vol[3, 30, 32] = 0.8
+    vol[4, 35, 10:12] = 0.7  # 2-voxel speck
+
+    out = wipe_small_specks(vol, threshold=0.5, min_voxels=16)
+
+    # Large structure left bit-for-bit untouched.
+    assert np.array_equal(out[1:5, 5:25, 5:9], vol[1:5, 5:25, 5:9])
+    assert float(out[0, 1, 1]) == 0.0
+    assert float(out[3, 30, 32]) == 0.0
+    assert float(out[4, 35, 10:12].max()) == 0.0
+    # Below-threshold voxels are never considered specks and stay put.
+    faint = np.zeros((3, 8, 8), dtype=np.float32)
+    faint[1, 4, 4] = 0.2
+    kept = wipe_small_specks(faint, threshold=0.5, min_voxels=16)
+    assert float(kept[1, 4, 4]) == pytest.approx(0.2)
+
+
+def test_wipe_small_specks_noop_when_nothing_small() -> None:
+    vol = np.zeros((4, 20, 20), dtype=np.float32)
+    vol[1:3, 4:16, 4:16] = 0.8  # one big blob, no specks
+    out = wipe_small_specks(vol, threshold=0.5, min_voxels=8)
+    assert np.array_equal(out, vol)
 
 
 def test_reconnect_and_denoise_bridges_near_and_drops_far() -> None:
@@ -317,7 +348,10 @@ def test_microscopy_clean_bridges_faint_process_gaps_without_adding_speckles() -
 
     soma = (yy - 20) ** 2 + (xx - 20) ** 2 <= 6**2
     stack[1, soma] += 0.45
-    line = (np.abs(yy - 20) <= 0) & (xx >= 26) & (xx <= 86)
+    # Realistic process width (~3 px ≈ 1 µm). The grain de-speckle pass uses a
+    # radius-1 opening that intentionally drops sub-resolution 1-px features
+    # (noise grains), so the process is modeled at its true ~3-px width.
+    line = (np.abs(yy - 20) <= 1) & (xx >= 26) & (xx <= 86)
     stack[1, line] += 0.16
     faint = line & (xx >= 46) & (xx <= 66)  # middle segment dims toward background
     stack[1, faint] -= 0.115

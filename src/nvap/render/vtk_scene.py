@@ -12,7 +12,7 @@ from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkImageData, vtkPiecewiseFunction, vtkPolyData
-from vtkmodules.vtkFiltersCore import vtkMarchingCubes
+from vtkmodules.vtkFiltersCore import vtkMarchingCubes, vtkTubeFilter
 from vtkmodules.vtkFiltersSources import vtkSphereSource
 from vtkmodules.vtkImagingCore import vtkImageResample
 from vtkmodules.vtkIOImage import vtkPNGWriter
@@ -44,6 +44,7 @@ _RENDER_CUBIC_MAX_OUTPUT_VOXELS = 240_000_000
 _RENDER_SAMPLE_RATIO_DEFAULT = 0.18
 _RENDER_SAMPLE_RATIO_ANISO = 0.16
 _RENDER_SAMPLE_RATIO_LABELS = 0.14
+_RENDER_UPLOAD_MAX_VOXELS = 72_000_000
 _SURFACE_PIPELINE_MAX_VOXELS = 96_000_000
 
 
@@ -130,6 +131,17 @@ def _cubic_render_spacing(
     )
 
 
+def _snap_offset_to_voxel(offset_um: float, spacing_um: float) -> float:
+    """Round a physical offset to the nearest whole voxel at this spacing.
+
+    Mirrors the rounding the analysis pipeline applies before shifting masks
+    (``round(offset_um / spacing_um)``), so the rendered translation always
+    lands on the exact voxel-quantised position the reported metrics used.
+    """
+    spacing = float(max(spacing_um, 1.0e-6))
+    return float(round(float(offset_um) / spacing)) * spacing
+
+
 def _same_spacing(left: VoxelSpacing, right: VoxelSpacing) -> bool:
     return bool(
         np.isclose(left.x_um, right.x_um)
@@ -159,6 +171,71 @@ def _recommended_sample_distance(
     return float(max(0.01, ratio * min_sp))
 
 
+def _render_downsample_factors(
+    shape: tuple[int, int, int],
+    max_voxels: int = _RENDER_UPLOAD_MAX_VOXELS,
+) -> tuple[int, int, int]:
+    if len(shape) != 3:
+        return (1, 1, 1)
+    z, y, x = (max(1, int(v)) for v in shape)
+    max_voxels = max(1, int(max_voxels))
+    voxels = int(z * y * x)
+    if voxels <= max_voxels:
+        return (1, 1, 1)
+
+    xy_factor = max(2, int(np.ceil(np.sqrt(float(voxels) / float(max_voxels)))))
+    factors = [1, xy_factor, xy_factor]
+    reduced = int(np.ceil(z / factors[0]) * np.ceil(y / factors[1]) * np.ceil(x / factors[2]))
+    if reduced > max_voxels:
+        factors[0] = max(1, int(np.ceil(float(reduced) / float(max_voxels))))
+    return (int(factors[0]), int(factors[1]), int(factors[2]))
+
+
+def _block_reduce_max(volume: np.ndarray, factors: tuple[int, int, int]) -> np.ndarray:
+    fz, fy, fx = (max(1, int(v)) for v in factors)
+    arr = np.asarray(volume)
+    if (fz, fy, fx) == (1, 1, 1):
+        return np.ascontiguousarray(arr)
+
+    pad = (
+        (0, (-arr.shape[0]) % fz),
+        (0, (-arr.shape[1]) % fy),
+        (0, (-arr.shape[2]) % fx),
+    )
+    if any(after for _before, after in pad):
+        arr = np.pad(arr, pad, mode="constant", constant_values=0)
+    z, y, x = arr.shape
+    reduced = arr.reshape(z // fz, fz, y // fy, fy, x // fx, fx).max(axis=(1, 3, 5))
+    return np.ascontiguousarray(reduced)
+
+
+def _downsample_volume_for_render(
+    volume: np.ndarray,
+    spacing: VoxelSpacing,
+    *,
+    label_mode: bool = False,
+    max_voxels: int = _RENDER_UPLOAD_MAX_VOXELS,
+) -> tuple[np.ndarray, VoxelSpacing, tuple[int, int, int]]:
+    factors = _render_downsample_factors(tuple(int(v) for v in volume.shape), max_voxels=max_voxels)
+    if factors == (1, 1, 1):
+        return volume, spacing, factors
+
+    fz, fy, fx = factors
+    if label_mode:
+        reduced = np.ascontiguousarray(volume[::fz, ::fy, ::fx])
+    else:
+        reduced = _block_reduce_max(volume, factors)
+    return (
+        reduced,
+        VoxelSpacing(
+            x_um=float(spacing.x_um) * float(fx),
+            y_um=float(spacing.y_um) * float(fy),
+            z_um=float(spacing.z_um) * float(fz),
+        ),
+        factors,
+    )
+
+
 @dataclass
 class _ChannelActors:
     image: vtkImageData
@@ -178,6 +255,7 @@ class MicrogliaDebugOverlay:
     soma_points_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
     tip_points_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
     tip_segments_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 2, 3), dtype=np.float32))
+    soma_segments_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 2, 3), dtype=np.float32))
     cell_segments_xyz: np.ndarray = field(default_factory=lambda: np.empty((0, 2, 3), dtype=np.float32))
 
 
@@ -186,7 +264,14 @@ class VTKScene:
         self._widget = QVTKRenderWindowInteractor(parent)
         self._render_window: vtkRenderWindow = self._widget.GetRenderWindow()
         self._renderer = vtkRenderer()
+        self._overlay_renderer = vtkRenderer()
+        self._render_window.SetNumberOfLayers(2)
         self._render_window.AddRenderer(self._renderer)
+        self._render_window.AddRenderer(self._overlay_renderer)
+        self._overlay_renderer.SetLayer(1)
+        self._overlay_renderer.SetInteractive(0)
+        self._overlay_renderer.SetBackgroundAlpha(0.0)
+        self._overlay_renderer.SetPreserveDepthBuffer(False)
         self._renderer.SetBackground(0.025, 0.030, 0.042)
         self._renderer.SetBackground2(0.075, 0.082, 0.110)
         self._renderer.SetGradientBackground(True)
@@ -217,6 +302,7 @@ class VTKScene:
         self._scale_actor.GetBottomAxis().GetTitleTextProperty().SetColor(0.86, 0.74, 0.45)
         self._renderer.AddViewProp(self._fps_actor)
         self._renderer.AddActor(self._scale_actor)
+        self._sync_overlay_camera()
         self._configure_lighting()
 
         self._interactor.Initialize()
@@ -237,9 +323,13 @@ class VTKScene:
 
     def reset_camera(self) -> None:
         self._renderer.ResetCamera()
+        self._sync_overlay_camera()
         self.render()
         self.activate_interaction()
         logger.debug("VTK camera reset.")
+
+    def _sync_overlay_camera(self) -> None:
+        self._overlay_renderer.SetActiveCamera(self._renderer.GetActiveCamera())
 
     def _configure_lighting(self) -> None:
         self._renderer.RemoveAllLights()
@@ -325,7 +415,7 @@ class VTKScene:
 
     def set_microglia_analysis_debug(self, overlay: MicrogliaDebugOverlay | None) -> None:
         for actor in self._microglia_debug_actors:
-            self._renderer.RemoveActor(actor)
+            self._overlay_renderer.RemoveActor(actor)
         self._microglia_debug_actors.clear()
 
         if overlay is None:
@@ -337,6 +427,7 @@ class VTKScene:
         soma_points = np.asarray(overlay.soma_points_xyz, dtype=np.float32)
         tip_points = np.asarray(overlay.tip_points_xyz, dtype=np.float32)
         tip_segments = np.asarray(overlay.tip_segments_xyz, dtype=np.float32)
+        soma_segments = np.asarray(overlay.soma_segments_xyz, dtype=np.float32)
         cell_segments = np.asarray(overlay.cell_segments_xyz, dtype=np.float32)
 
         # Markers live in physical (micron) world coordinates, so their radius has
@@ -345,53 +436,94 @@ class VTKScene:
         marker = self._overlay_marker_unit(
             [voxel_points, branch_points, soma_points, tip_points],
             tip_segments,
+            soma_segments,
             cell_segments,
         )
 
         if voxel_points.size > 0:
-            actor = self._build_debug_point_actor(
-                voxel_points,
-                color=(0.30, 0.80, 0.42),
-                radius=marker * 0.45,
-                opacity=0.36,
+            self._add_debug_actor(
+                self._build_debug_point_actor(
+                    voxel_points,
+                    color=(0.30, 0.80, 0.42),
+                    radius=marker * 0.45,
+                    opacity=0.36,
+                )
             )
-            self._renderer.AddActor(actor)
-            self._microglia_debug_actors.append(actor)
         if branch_points.size > 0:
-            actor = self._build_debug_point_actor(
-                branch_points,
-                color=(0.18, 0.92, 0.78),
-                radius=marker * 0.6,
-                opacity=0.82,
+            self._add_debug_actor(
+                self._build_debug_point_actor(
+                    branch_points,
+                    color=(0.18, 0.92, 0.78),
+                    radius=marker * 0.6,
+                    opacity=0.82,
+                )
             )
-            self._renderer.AddActor(actor)
-            self._microglia_debug_actors.append(actor)
         if soma_points.size > 0:
-            actor = self._build_debug_point_actor(
-                soma_points,
-                color=(1.0, 0.82, 0.34),
-                radius=marker * 0.9,
+            self._add_debug_actor(
+                self._build_debug_point_actor(
+                    soma_points,
+                    color=(1.0, 0.82, 0.34),
+                    radius=marker * 0.9,
+                )
             )
-            self._renderer.AddActor(actor)
-            self._microglia_debug_actors.append(actor)
         if tip_points.size > 0:
-            actor = self._build_debug_point_actor(
-                tip_points,
-                color=(0.28, 0.88, 1.0),
-                radius=marker * 0.7,
+            self._add_debug_actor(
+                self._build_debug_point_actor(
+                    tip_points,
+                    color=(0.28, 0.88, 1.0),
+                    radius=marker * 0.7,
+                )
             )
-            self._renderer.AddActor(actor)
-            self._microglia_debug_actors.append(actor)
         if tip_segments.size > 0:
-            actor = self._build_debug_line_actor(tip_segments, color=(0.92, 0.34, 1.0), width=4.0)
-            self._renderer.AddActor(actor)
-            self._microglia_debug_actors.append(actor)
+            self._add_distance_debug_actor(
+                tip_segments,
+                color=(0.98, 0.20, 1.0),
+                radius=max(0.35, marker * 0.30),
+            )
+        if soma_segments.size > 0:
+            self._add_distance_debug_actor(
+                soma_segments,
+                color=(1.0, 0.92, 0.18),
+                radius=max(0.32, marker * 0.28),
+            )
         if cell_segments.size > 0:
-            actor = self._build_debug_line_actor(cell_segments, color=(1.0, 0.55, 0.22), width=3.0)
-            self._renderer.AddActor(actor)
-            self._microglia_debug_actors.append(actor)
+            self._add_distance_debug_actor(
+                cell_segments,
+                color=(1.0, 0.58, 0.12),
+                radius=max(0.30, marker * 0.26),
+            )
 
         self.render()
+
+    def _add_debug_actor(self, actor: vtkActor) -> None:
+        actor.SetPickable(False)
+        self._overlay_renderer.AddActor(actor)
+        self._microglia_debug_actors.append(actor)
+
+    def _add_distance_debug_actor(
+        self,
+        segments_xyz: np.ndarray,
+        *,
+        color: tuple[float, float, float],
+        radius: float,
+    ) -> None:
+        segments = np.asarray(segments_xyz, dtype=np.float32).reshape(-1, 2, 3)
+        lengths = np.linalg.norm(segments[:, 1, :] - segments[:, 0, :], axis=1)
+        nonzero = segments[lengths > 1.0e-4]
+        contact = segments[lengths <= 1.0e-4]
+        if nonzero.size > 0:
+            self._add_debug_actor(
+                self._build_debug_line_actor(nonzero, color=color, radius=radius)
+            )
+        if contact.size > 0:
+            self._add_debug_actor(
+                self._build_debug_point_actor(
+                    contact[:, 0, :],
+                    color=color,
+                    radius=max(radius * 1.35, 0.45),
+                    opacity=0.98,
+                )
+            )
 
     @staticmethod
     def _overlay_marker_unit(
@@ -444,6 +576,7 @@ class VTKScene:
         actor.SetMapper(mapper)
         prop = actor.GetProperty()
         prop.SetColor(*color)
+        prop.LightingOff()
         prop.SetAmbient(1.0)
         prop.SetDiffuse(0.0)
         prop.SetSpecular(0.0)
@@ -455,7 +588,7 @@ class VTKScene:
         segments_xyz: np.ndarray,
         *,
         color: tuple[float, float, float],
-        width: float,
+        radius: float,
     ) -> vtkActor:
         vtk_points = vtkPoints()
         vtk_lines = vtkCellArray()
@@ -478,20 +611,25 @@ class VTKScene:
         poly.SetPoints(vtk_points)
         poly.SetLines(vtk_lines)
 
+        tube = vtkTubeFilter()
+        tube.SetInputData(poly)
+        tube.SetRadius(float(max(0.01, radius)))
+        tube.SetNumberOfSides(14)
+        tube.CappingOn()
+        tube.Update()
+
         mapper = vtkPolyDataMapper()
-        mapper.SetInputData(poly)
+        mapper.SetInputConnection(tube.GetOutputPort())
 
         actor = vtkActor()
         actor.SetMapper(mapper)
         prop = actor.GetProperty()
         prop.SetColor(*color)
+        prop.LightingOff()
         prop.SetAmbient(1.0)
         prop.SetDiffuse(0.0)
         prop.SetSpecular(0.0)
         prop.SetOpacity(0.96)
-        prop.SetLineWidth(float(max(1.0, width)))
-        if hasattr(prop, "SetRenderLinesAsTubes"):
-            prop.SetRenderLinesAsTubes(True)
         return actor
 
     def set_channel_data(self, channel: str, volume: np.ndarray, spacing: VoxelSpacing) -> None:
@@ -500,6 +638,25 @@ class VTKScene:
             raise ValueError("channel must be 'green' or 'red'.")
         if volume.ndim != 3:
             raise ValueError("volume must have shape (z, y, x).")
+        input_shape = tuple(int(axis) for axis in volume.shape)
+        label_mode = channel in self._component_coloring
+        volume, spacing, downsample_factors = _downsample_volume_for_render(
+            volume,
+            spacing,
+            label_mode=label_mode,
+        )
+        if downsample_factors != (1, 1, 1):
+            logger.warning(
+                "VTK render upload downsampled: channel=%s input_shape=%s output_shape=%s "
+                "factors_zyx=%s adjusted_spacing=(%.4f, %.4f, %.4f)",
+                channel,
+                input_shape,
+                tuple(int(axis) for axis in volume.shape),
+                downsample_factors,
+                float(spacing.x_um),
+                float(spacing.y_um),
+                float(spacing.z_um),
+            )
         voxel_count = int(np.prod(np.asarray(volume.shape, dtype=np.int64)))
         surface_allowed = voxel_count <= _SURFACE_PIPELINE_MAX_VOXELS
         render_spacing = _cubic_render_spacing(volume.shape, spacing)
@@ -743,6 +900,8 @@ class VTKScene:
         return mapper
 
     def _surface_input(self, actor: _ChannelActors):
+        # Build the isosurface at full resolution so fine structures (e.g.
+        # microglia branches) stay sharp.
         if actor.resample is not None:
             return actor.resample.GetOutputPort()
         return actor.image
@@ -764,6 +923,7 @@ class VTKScene:
 
             iso_mapper = vtkPolyDataMapper()
             iso_mapper.SetInputConnection(marching.GetOutputPort())
+            iso_mapper.ScalarVisibilityOff()
             actor.iso_actor.SetMapper(iso_mapper)
             actor.marching = marching
             logger.info("VTK isosurface pipeline created: channel=%s", channel)
@@ -787,7 +947,22 @@ class VTKScene:
             self._apply_channel_properties(channel, config)
 
         if "green" in self._actors:
-            green_shift = (config.offset_x_um, config.offset_y_um, config.offset_z_um)
+            # Snap the visual translation to the same whole-voxel shift the
+            # analysis pipeline applies (see microglia_analysis._offset_shift_zyx /
+            # metrics._shifted_overlap_voxels), which round offset_*_um / spacing_um
+            # to the nearest integer voxel before shifting the mask. Without this,
+            # a sub-voxel offset renders as a smooth continuous translation while
+            # the reported overlap metrics jump to the nearest voxel, so the
+            # rendered overlap position would not match the measured one.
+            spacing_um = self._actors["green"].image.GetSpacing()
+            green_shift = tuple(
+                _snap_offset_to_voxel(offset, spacing)
+                for offset, spacing in zip(
+                    (config.offset_x_um, config.offset_y_um, config.offset_z_um),
+                    spacing_um,
+                    strict=True,
+                )
+            )
             self._actors["green"].volume_actor.SetPosition(*green_shift)
             self._actors["green"].iso_actor.SetPosition(*green_shift)
 
@@ -798,25 +973,35 @@ class VTKScene:
         if channel == "green":
             threshold = float(config.threshold_green)
             opacity = float(config.opacity_green)
-            iso = float(config.iso_green)
             visible = bool(config.show_green)
             show_iso = bool(config.show_iso_green)
             rgb = (0.1, 1.0, 0.2)
             knee = 0.022
             low_opacity_scale = 0.07
+            mid_opacity_scale = 0.55
+            grad_floor = 0.05
+            grad_mid = 0.55
         else:
             threshold = float(config.threshold_red)
             opacity = float(config.opacity_red)
-            iso = float(config.iso_red)
             visible = bool(config.show_red)
             show_iso = bool(config.show_iso_red)
-            rgb = (1.0, 0.2, 0.2)
+            # Vasculature must read as solid red. The previous low-opacity ramp
+            # left vessel interiors nearly transparent (the gradient-opacity
+            # function zeroes flat regions), so the dark blue-grey background
+            # showed through and the whole channel looked blue. Keep a saturated
+            # red and raise the opacity / gradient floor so vessels render opaque
+            # instead of tinting toward the background.
+            rgb = (1.0, 0.14, 0.14)
             knee = 0.018
-            low_opacity_scale = 0.15
+            low_opacity_scale = 0.42
+            mid_opacity_scale = 0.82
+            grad_floor = 0.55
+            grad_mid = 0.85
 
         threshold = float(np.clip(threshold, 0.0, 1.0))
         opacity = float(np.clip(opacity, 0.0, 1.0))
-        iso = float(np.clip(iso, 0.0, 1.0))
+        actor.iso_actor.GetProperty().SetColor(*rgb)
 
         label_count = int(self._component_coloring.get(channel, 0))
         if label_count > 0:
@@ -846,8 +1031,7 @@ class VTKScene:
 
         color_tf = vtkColorTransferFunction()
         color_tf.AddRGBPoint(0.0, 0.0, 0.0, 0.0)
-        color_tf.AddRGBPoint(max(0.0, threshold - knee), 0.0, 0.0, 0.0)
-        color_tf.AddRGBPoint(min(1.0, threshold + knee), rgb[0], rgb[1], rgb[2])
+        color_tf.AddRGBPoint(1.0e-6, rgb[0], rgb[1], rgb[2])
         color_tf.AddRGBPoint(1.0, rgb[0], rgb[1], rgb[2])
 
         scalar_opacity = actor.volume_property.GetScalarOpacity()
@@ -857,21 +1041,26 @@ class VTKScene:
         scalar_opacity.AddPoint(0.0, 0.0)
         scalar_opacity.AddPoint(max(0.0, threshold - knee), 0.0)
         scalar_opacity.AddPoint(min(1.0, threshold + knee), opacity * low_opacity_scale)
-        scalar_opacity.AddPoint(min(1.0, threshold + (knee * 2.8)), opacity * 0.55)
+        scalar_opacity.AddPoint(min(1.0, threshold + (knee * 2.8)), opacity * mid_opacity_scale)
         scalar_opacity.AddPoint(1.0, opacity)
 
         gradient_opacity = vtkPiecewiseFunction()
         gradient_opacity.AddPoint(0.0, 0.0)
-        gradient_opacity.AddPoint(max(0.01, threshold * 0.3), 0.05)
-        gradient_opacity.AddPoint(min(1.0, threshold + 0.06), 0.55)
+        gradient_opacity.AddPoint(max(0.01, threshold * 0.3), grad_floor)
+        gradient_opacity.AddPoint(min(1.0, threshold + 0.06), grad_mid)
         gradient_opacity.AddPoint(1.0, 1.0)
 
         actor.volume_property.SetInterpolationTypeToLinear()
         actor.volume_property.SetColor(color_tf)
         actor.volume_property.SetScalarOpacity(scalar_opacity)
         actor.volume_property.SetGradientOpacity(0, gradient_opacity)
-        # Prefer a clean isosurface shell when surface mode is enabled.
-        surface_visible = bool(visible and show_iso and self._ensure_surface_pipeline(channel, actor, iso))
+        # Threshold drives the isosurface level, so the rendered 3D object is the
+        # boundary of exactly the voxels the metrics / microglia / vascular
+        # analysis count (which also key off `threshold`). This makes the view
+        # and the measurements consistent, and means the Threshold slider always
+        # changes what you see (the old separate "iso level" control is retired).
+        surface_level = float(np.clip(threshold, 1.0e-3, 1.0))
+        surface_visible = bool(visible and show_iso and self._ensure_surface_pipeline(channel, actor, surface_level))
         actor.volume_actor.SetVisibility(1 if (visible and not surface_visible) else 0)
         actor.iso_actor.SetVisibility(1 if surface_visible else 0)
 
@@ -910,12 +1099,13 @@ class VTKScene:
         return path
 
     def render(self) -> None:
+        self._sync_overlay_camera()
         self._render_window.Render()
 
     def cleanup(self) -> None:
         """Release VTK resources to avoid GPU/memory leaks on window close."""
         for actor in self._microglia_debug_actors:
-            self._renderer.RemoveActor(actor)
+            self._overlay_renderer.RemoveActor(actor)
         self._microglia_debug_actors.clear()
         for actor in self._actors.values():
             self._renderer.RemoveVolume(actor.volume_actor)

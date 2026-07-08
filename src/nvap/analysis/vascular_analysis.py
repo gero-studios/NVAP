@@ -80,6 +80,8 @@ class VascularAnalysisResult:
 
     surface_area_um2: float
     surface_to_volume_ratio_per_um: float
+    decussation_candidate_count: int
+    mean_decussation_z_separation_um: float
 
 
 def _spacing_zyx(spacing: VoxelSpacing | tuple[float, float, float]) -> np.ndarray:
@@ -131,6 +133,8 @@ def _empty_result(tissue_volume_um3: float) -> VascularAnalysisResult:
         mean_tortuosity=0.0,
         surface_area_um2=0.0,
         surface_to_volume_ratio_per_um=0.0,
+        decussation_candidate_count=0,
+        mean_decussation_z_separation_um=0.0,
     )
 
 
@@ -164,15 +168,24 @@ def analyze_vasculature(
     voxel_volume = float(np.prod(spacing_zyx))
 
     if render is not None:
-        mask = _apply_render_trim(
-            red >= float(threshold),
-            int(render.trim_first_slices),
-            int(render.trim_last_slices),
-        )
+        trim_first = max(0, int(render.trim_first_slices))
+        trim_last = max(0, int(render.trim_last_slices))
+        mask = _apply_render_trim(red >= float(threshold), trim_first, trim_last)
     else:
+        trim_first = 0
+        trim_last = 0
         mask = np.asarray(red >= float(threshold), dtype=bool)
 
-    tissue_volume_um3 = float(mask.size) * voxel_volume
+    # Tissue volume is the *retained* field of view. Trimmed slices are zeroed in
+    # the mask (so they never contribute vessel voxels); counting them in the
+    # denominator too would bias volume fraction / length density / junction
+    # density low in proportion to the trim.
+    if mask.ndim == 3:
+        retained_slices = max(0, int(mask.shape[0]) - trim_first - trim_last)
+        tissue_voxels = int(retained_slices * mask.shape[1] * mask.shape[2])
+    else:
+        tissue_voxels = int(mask.size)
+    tissue_volume_um3 = float(tissue_voxels) * voxel_volume
     vessel_voxels = int(np.count_nonzero(mask))
     if vessel_voxels == 0:
         logger.info("Vascular analysis: no vasculature above threshold=%.4f", float(threshold))
@@ -186,31 +199,42 @@ def analyze_vasculature(
     # Radius field: distance from each vessel voxel to the nearest background,
     # in physical units. Sampled along the medial axis it gives vessel radius.
     dist_um = ndi.distance_transform_edt(mask, sampling=tuple(spacing_zyx))
+    # skeletonize's centreline does not always land exactly on the EDT ridge, so
+    # sampling the raw EDT there under-reads the radius. Take the local maximum in
+    # a 1-voxel neighbourhood so each skeleton voxel picks up the true ridge value.
+    ridge_um = ndi.maximum_filter(dist_um, size=3, mode="nearest")
 
     skeleton = np.asarray(skeletonize(mask), dtype=bool)
     skel_coords = np.argwhere(skeleton)
     if skel_coords.shape[0] == 0:
         # Blob too small / flat to skeletonise: report density + radius only.
-        radii = dist_um[mask]
+        radii = _correct_edt_radius(ridge_um[mask], spacing_zyx)
         return _radius_only_result(
             mask=mask,
             radii=radii,
             spacing_zyx=spacing_zyx,
             voxel_volume=voxel_volume,
             tissue_volume_um3=tissue_volume_um3,
+            tissue_voxels=tissue_voxels,
             component_count=component_count,
         )
 
-    radii = np.asarray(dist_um[tuple(skel_coords.T)], dtype=np.float64)
+    radii = _correct_edt_radius(
+        np.asarray(ridge_um[tuple(skel_coords.T)], dtype=np.float64), spacing_zyx
+    )
     radii = radii[radii > 0.0]
     if radii.size == 0:
         radii = np.asarray([float(np.mean(spacing_zyx))], dtype=np.float64)
 
     topo = _skeleton_topology(skeleton, spacing_zyx)
+    decussation_count, decussation_z_sep = _decussation_candidates(
+        skeleton,
+        spacing_zyx,
+    )
 
     vessel_volume_um3 = float(vessel_voxels) * voxel_volume
     vessel_volume_fraction = (
-        float(vessel_voxels) / float(mask.size) if mask.size else 0.0
+        float(vessel_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
     )
     # Length density expressed as mm of centreline per mm^3 of tissue.
     tissue_volume_mm3 = tissue_volume_um3 / 1.0e9
@@ -245,6 +269,8 @@ def analyze_vasculature(
         mean_tortuosity=float(topo.mean_tortuosity),
         surface_area_um2=float(surface_area),
         surface_to_volume_ratio_per_um=float(s2v),
+        decussation_candidate_count=int(decussation_count),
+        mean_decussation_z_separation_um=float(decussation_z_sep),
     )
     logger.info(
         "Vascular analysis: vol_frac=%.4f length=%.1fum density=%.2f mm/mm3 "
@@ -373,6 +399,23 @@ def _skeleton_topology_fallback(
     )
 
 
+def _correct_edt_radius(radii: np.ndarray, spacing_zyx: np.ndarray) -> np.ndarray:
+    """Correct the systematic half-voxel underestimate of the Euclidean EDT.
+
+    The EDT measures voxel-centre to nearest background *voxel centre*, so the true
+    vessel surface sits ~half a voxel beyond the last foreground centre. Add half
+    the mean in-plane spacing so reported radii/diameters are physically calibrated
+    rather than biased low by the discretisation.
+    """
+    arr = np.asarray(radii, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    # In-plane (y, x) spacing governs the boundary offset for the typical vessel
+    # cross-section; averaging the two keeps it robust to mild anisotropy.
+    half_voxel = 0.5 * float(np.mean(np.asarray(spacing_zyx, dtype=np.float64)[1:]))
+    return arr + half_voxel
+
+
 def _radius_only_result(
     *,
     mask: np.ndarray,
@@ -380,6 +423,7 @@ def _radius_only_result(
     spacing_zyx: np.ndarray,
     voxel_volume: float,
     tissue_volume_um3: float,
+    tissue_voxels: int,
     component_count: int,
 ) -> VascularAnalysisResult:
     radii = np.asarray(radii, dtype=np.float64)
@@ -395,7 +439,7 @@ def _radius_only_result(
         vessel_volume_um3=vessel_volume_um3,
         tissue_volume_um3=tissue_volume_um3,
         vessel_volume_fraction=(
-            float(vessel_voxels) / float(mask.size) if mask.size else 0.0
+            float(vessel_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
         ),
         component_count=int(component_count),
         total_length_um=0.0,
@@ -412,6 +456,8 @@ def _radius_only_result(
         mean_tortuosity=0.0,
         surface_area_um2=float(surface_area),
         surface_to_volume_ratio_per_um=float(s2v),
+        decussation_candidate_count=0,
+        mean_decussation_z_separation_um=0.0,
     )
 
 
@@ -445,9 +491,11 @@ def _fill_small_cavities(mask: np.ndarray, max_voxels: int) -> np.ndarray:
 def _surface_area_um2(mask: np.ndarray, spacing_zyx: np.ndarray) -> float:
     """Estimate vessel surface area from exposed voxel faces.
 
-    Each vessel voxel face adjacent to background contributes the area of that
-    face (the product of the two in-plane spacings). This is a fast, bias-aware
-    estimate suitable for surface-to-volume ratios.
+    Each internal vessel↔background face contributes the area of that face (the
+    product of the two in-plane spacings). Faces lying on the volume boundary are
+    *not* counted: a vessel clipped by the field of view is cut by the imaging
+    limit, not bounded by a real tissue surface, so including those faces would
+    inflate the surface area and the surface-to-volume ratio.
     """
     binary = np.asarray(mask, dtype=bool)
     if not np.any(binary):
@@ -456,15 +504,52 @@ def _surface_area_um2(mask: np.ndarray, spacing_zyx: np.ndarray) -> float:
     face_area = {0: sy * sx, 1: sz * sx, 2: sz * sy}
     total = 0.0
     for axis in (0, 1, 2):
-        # Count vessel/background transitions along this axis (both directions).
+        # Count internal vessel/background transitions along this axis (both
+        # directions). Boundary faces are intentionally excluded.
         diff = np.diff(binary.astype(np.int8), axis=axis)
         exposed = int(np.count_nonzero(diff == 1)) + int(np.count_nonzero(diff == -1))
-        # Faces on the volume border for vessel voxels are also exposed.
-        first = np.take(binary, 0, axis=axis)
-        last = np.take(binary, binary.shape[axis] - 1, axis=axis)
-        exposed += int(np.count_nonzero(first)) + int(np.count_nonzero(last))
         total += exposed * face_area[axis]
     return float(total)
+
+
+def _decussation_candidates(skeleton: np.ndarray, spacing_zyx: np.ndarray) -> tuple[int, float]:
+    """Detect stacked vessel centerline columns that may indicate crossings.
+
+    A single binary vessel channel cannot identify which anatomical segment
+    passes over which with certainty. This conservative candidate metric counts
+    (y, x) centerline columns containing two or more separated z-runs, which is
+    the measurable signature of over/under vessel crossings in the current data.
+    """
+    skel = np.asarray(skeleton, dtype=bool)
+    coords = np.argwhere(skel)
+    if coords.shape[0] == 0 or skel.shape[0] <= 1:
+        return 0, 0.0
+
+    z_spacing = float(np.asarray(spacing_zyx, dtype=np.float64)[0])
+    by_yx: dict[tuple[int, int], list[int]] = {}
+    for z, y, x in coords.tolist():
+        by_yx.setdefault((int(y), int(x)), []).append(int(z))
+
+    separations: list[float] = []
+    for z_values in by_yx.values():
+        unique_z = sorted(set(z_values))
+        if len(unique_z) < 2:
+            continue
+        groups: list[list[int]] = [[unique_z[0]]]
+        for z in unique_z[1:]:
+            if z <= groups[-1][-1] + 1:
+                groups[-1].append(z)
+            else:
+                groups.append([z])
+        if len(groups) < 2:
+            continue
+        centers = [0.5 * (g[0] + g[-1]) for g in groups]
+        gaps = [abs(b - a) * z_spacing for a, b in zip(centers, centers[1:], strict=False)]
+        separations.append(float(max(gaps)))
+
+    if not separations:
+        return 0, 0.0
+    return int(len(separations)), float(np.mean(separations))
 
 
 def vascular_analysis_to_csv_rows(

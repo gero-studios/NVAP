@@ -13,13 +13,13 @@ from skimage.filters import threshold_otsu
 from nvap.config.types import ChannelVolume, DatasetVolume, PSFConfig, PreprocessConfig
 from nvap.preprocess.enhancement import (
     postprocess_green_after_deconvolution,
-    preprocess_dataset,
     suggest_green_threshold,
 )
 from nvap.preprocess.missing_slices import fill_channel_missing_slices
 from nvap.preprocess.psf import deconvolve_volume
 from nvap.preprocess._executor import get_executor
 from nvap.preprocess.resample import prepare_mesh_dataset
+from nvap.runtime_optimization import configured_cpu_workers
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def _resolve_psf_channel_workers() -> int:
                 return value
         except ValueError:
             logger.warning("Invalid NVAP_PSF_CHANNEL_WORKERS=%r. Falling back to auto.", raw)
-    cpus = os.cpu_count() or 1
+    cpus = configured_cpu_workers(os.cpu_count() or 1)
     # Two channels at most; keep default conservative.
     return 2 if cpus >= 2 else 1
 
@@ -191,17 +191,6 @@ def apply_psf_to_dataset(
     logger.info("PSF pipeline complete total_dt=%.2fs", time.perf_counter() - t0)
     return out
 
-
-def preprocess_for_deconvolution(
-    dataset: DatasetVolume,
-    preprocess_config: PreprocessConfig,
-) -> DatasetVolume:
-    """Apply preprocessing (denoising, branch preservation) before deconvolution."""
-    if not preprocess_config.enabled:
-        logger.info("Preprocessing disabled: using raw synchronized channels.")
-        return dataset
-    logger.info("Preprocessing for deconvolution: strategy=%s", preprocess_config.green_denoise_strategy)
-    return preprocess_dataset(dataset, preprocess_config)
 
 
 def prepare_dataset_for_mesh(

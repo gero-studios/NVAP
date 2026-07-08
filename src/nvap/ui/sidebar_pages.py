@@ -55,7 +55,7 @@ class _ScrollableSectionPage(QWidget):
         content = QWidget()
         content.setObjectName("sectionContent")
         self._content_layout = QVBoxLayout(content)
-        self._content_layout.setContentsMargins(56, 48, 56, 48)
+        self._content_layout.setContentsMargins(40, 36, 40, 40)
         self._content_layout.setSpacing(0)
 
         eyebrow_label = QLabel(eyebrow)
@@ -97,7 +97,7 @@ class SettingsPage(_ScrollableSectionPage):
         )
 
         action_row = QHBoxLayout()
-        action_row.setSpacing(12)
+        action_row.setSpacing(8)
 
         workspace_btn = QPushButton("Open Workspace")
         workspace_btn.setObjectName("primaryActionHome")
@@ -111,11 +111,11 @@ class SettingsPage(_ScrollableSectionPage):
 
         action_row.addStretch(1)
         self._content_layout.addLayout(action_row)
-        self._content_layout.addSpacing(24)
+        self._content_layout.addSpacing(20)
 
         stats_layout = QGridLayout()
-        stats_layout.setHorizontalSpacing(16)
-        stats_layout.setVerticalSpacing(16)
+        stats_layout.setHorizontalSpacing(12)
+        stats_layout.setVerticalSpacing(12)
         self._dataset_card = _StatCard("Active dataset", "No dataset loaded")
         self._auto_apply_card = _StatCard("Auto apply", "On")
         self._plugins_card = _StatCard("Plugins", "No plugins discovered")

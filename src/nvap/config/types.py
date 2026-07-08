@@ -96,13 +96,13 @@ class PreprocessConfig:
 
 @dataclass(frozen=True)
 class RenderConfig:
-    threshold_green: float = 0.15
-    threshold_red: float = 0.15
-    opacity_green: float = 0.35
-    opacity_red: float = 0.35
+    threshold_green: float = 0.80
+    threshold_red: float = 0.60
+    opacity_green: float = 0.40
+    opacity_red: float = 0.80
     iso_green: float = 0.25
     iso_red: float = 0.25
-    display_z_scale: float = 0.5
+    display_z_scale: float = 0.70
     trim_first_slices: int = 20
     trim_last_slices: int = 20
     offset_x_um: float = 0.0

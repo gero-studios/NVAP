@@ -3,10 +3,53 @@ from __future__ import annotations
 from functools import lru_cache
 import logging
 import math
+import os
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+_VALID_BACKENDS = {"auto", "cpu", "cuda", "rocm", "directml", "mps"}
+
+
+def _normalize_backend(value: str | None, default: str = "auto") -> str:
+    backend = str(value or default).strip().lower()
+    return backend if backend in _VALID_BACKENDS else default
+
+
+def _backend_candidates(preferred_backend: str) -> tuple[str, ...]:
+    preferred = _normalize_backend(preferred_backend)
+    if preferred == "cpu":
+        return ()
+    if preferred != "auto":
+        return (preferred,)
+    # CUDA covers NVIDIA CUDA and AMD ROCm builds of PyTorch. DirectML is the
+    # practical automatic Windows path for many AMD/Intel GPUs. MPS is Apple.
+    return ("cuda", "rocm", "directml", "mps")
+
+
+def _runtime_supports_filters(torch, F, device, backend: str) -> bool:
+    """Probe the torch ops NVAP uses before selecting a GPU backend."""
+    try:
+        with torch.inference_mode():
+            x2 = torch.ones((1, 1, 4, 4), device=device, dtype=torch.float32)
+            k2 = torch.ones((1, 1, 1, 1), device=device, dtype=torch.float32)
+            y2 = F.conv2d(F.pad(x2, (1, 1, 1, 1), mode="replicate"), k2)
+            _ = float(y2.detach().to("cpu").sum())
+
+            if backend == "directml":
+                x3 = torch.ones((3, 3, 3), device=device, dtype=torch.float32)
+                y3 = _gaussian_filter_3d_via_conv2d(torch, F, x3, (1.0, 1.0, 1.0), device)
+                _ = float(y3.detach().to("cpu").sum())
+                return True
+
+            x3 = torch.ones((1, 1, 3, 3, 3), device=device, dtype=torch.float32)
+            k3 = torch.ones((1, 1, 1, 1, 1), device=device, dtype=torch.float32)
+            y3 = F.conv3d(F.pad(x3, (1, 1, 1, 1, 1, 1), mode="replicate"), k3)
+            _ = float(y3.detach().to("cpu").sum())
+        return True
+    except Exception as exc:
+        logger.info("Ignoring GPU backend %s: required filter probe failed (%s).", backend, exc)
+        return False
 
 
 @lru_cache(maxsize=4)
@@ -17,21 +60,49 @@ def _torch_runtime(preferred_backend: str = "auto"):
     except ImportError:
         return None
 
-    preferred = str(preferred_backend or "auto").strip().lower()
-    if preferred not in {"auto", "cpu", "cuda", "rocm"}:
-        preferred = "auto"
-    if preferred == "cpu":
-        return None
-    if not torch.cuda.is_available():
-        return None
+    for candidate in _backend_candidates(preferred_backend):
+        if candidate in {"cuda", "rocm"}:
+            if not torch.cuda.is_available():
+                continue
+            backend = "rocm" if getattr(torch.version, "hip", None) else "cuda"
+            if candidate != backend:
+                continue
+            device = torch.device("cuda")
+        elif candidate == "directml":
+            try:
+                import torch_directml  # type: ignore
 
-    backend = "rocm" if getattr(torch.version, "hip", None) else "cuda"
-    if preferred != "auto" and preferred != backend:
-        return None
-    return torch, F, torch.device("cuda"), backend
+                device = torch_directml.device()
+                backend = "directml"
+            except Exception as exc:
+                logger.debug("Torch DirectML runtime unavailable: %s", exc)
+                continue
+        elif candidate == "mps":
+            try:
+                mps = getattr(getattr(torch, "backends", None), "mps", None)
+                if mps is None or not mps.is_available():
+                    continue
+                device = torch.device("mps")
+                backend = "mps"
+            except Exception:
+                continue
+        else:
+            continue
+
+        if _runtime_supports_filters(torch, F, device, backend):
+            logger.info("Selected GPU compute backend: %s", backend)
+            return torch, F, device, backend
+
+    return None
+
+
+def preferred_acceleration_backend(default: str = "auto") -> str:
+    return _normalize_backend(os.environ.get("NVAP_GPU_BACKEND"), default=default)
 
 
 def detect_torch_gpu_backend(preferred_backend: str = "auto") -> str | None:
+    if preferred_backend == "auto":
+        preferred_backend = preferred_acceleration_backend("auto")
     runtime = _torch_runtime(preferred_backend)
     if runtime is None:
         return None
@@ -43,6 +114,8 @@ def torch_gaussian_filter(
     sigma: tuple[float, ...],
     preferred_backend: str = "auto",
 ) -> np.ndarray | None:
+    if preferred_backend == "auto":
+        preferred_backend = preferred_acceleration_backend("auto")
     runtime = _torch_runtime(preferred_backend)
     if runtime is None:
         return None
@@ -50,7 +123,7 @@ def torch_gaussian_filter(
     if arr.ndim not in {2, 3}:
         return None
 
-    torch, F, device, _backend = runtime
+    torch, F, device, backend = runtime
     sigma_vals = tuple(float(max(s, 0.0)) for s in sigma)
     try:
         if arr.ndim == 2:
@@ -68,6 +141,11 @@ def torch_gaussian_filter(
                     pad = (radius, radius, 0, 0)
                 tensor = F.conv2d(F.pad(tensor, pad, mode="replicate"), weight)
             return np.asarray(tensor[0, 0].detach().to("cpu").numpy(), dtype=np.float32)
+
+        if backend == "directml":
+            tensor = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
+            tensor = _gaussian_filter_3d_via_conv2d(torch, F, tensor, sigma_vals, device)
+            return np.asarray(tensor.detach().to("cpu").numpy(), dtype=np.float32)
 
         tensor = torch.from_numpy(arr).to(device=device, dtype=torch.float32)[None, None]
         for axis, sigma_val in enumerate(sigma_vals):
@@ -91,121 +169,7 @@ def torch_gaussian_filter(
         return None
 
 
-def torch_uniform_filter(
-    volume: np.ndarray,
-    size: tuple[int, ...],
-    preferred_backend: str = "auto",
-) -> np.ndarray | None:
-    runtime = _torch_runtime(preferred_backend)
-    if runtime is None:
-        return None
-    arr = np.asarray(volume, dtype=np.float32)
-    if arr.ndim not in {2, 3}:
-        return None
 
-    torch, F, device, _backend = runtime
-    kernel_size = tuple(max(1, int(v)) for v in size)
-    try:
-        if arr.ndim == 2:
-            tensor = torch.from_numpy(arr).to(device=device, dtype=torch.float32)[None, None]
-            pad = (
-                kernel_size[1] // 2,
-                kernel_size[1] // 2,
-                kernel_size[0] // 2,
-                kernel_size[0] // 2,
-            )
-            out = F.avg_pool2d(F.pad(tensor, pad, mode="replicate"), kernel_size=kernel_size, stride=1)
-            return np.asarray(out[0, 0].detach().to("cpu").numpy(), dtype=np.float32)
-
-        tensor = torch.from_numpy(arr).to(device=device, dtype=torch.float32)[None, None]
-        pad = (
-            kernel_size[2] // 2,
-            kernel_size[2] // 2,
-            kernel_size[1] // 2,
-            kernel_size[1] // 2,
-            kernel_size[0] // 2,
-            kernel_size[0] // 2,
-        )
-        out = F.avg_pool3d(F.pad(tensor, pad, mode="replicate"), kernel_size=kernel_size, stride=1)
-        return np.asarray(out[0, 0].detach().to("cpu").numpy(), dtype=np.float32)
-    except Exception as exc:
-        logger.debug("Torch uniform filter fallback to CPU: %s", exc)
-        return None
-
-
-def torch_maximum_filter(
-    volume: np.ndarray,
-    size: tuple[int, ...],
-    preferred_backend: str = "auto",
-) -> np.ndarray | None:
-    runtime = _torch_runtime(preferred_backend)
-    if runtime is None:
-        return None
-    arr = np.asarray(volume, dtype=np.float32)
-    if arr.ndim not in {2, 3}:
-        return None
-
-    torch, F, device, _backend = runtime
-    kernel_size = tuple(max(1, int(v)) for v in size)
-    try:
-        if arr.ndim == 2:
-            tensor = torch.from_numpy(arr).to(device=device, dtype=torch.float32)[None, None]
-            pad = (
-                kernel_size[1] // 2,
-                kernel_size[1] // 2,
-                kernel_size[0] // 2,
-                kernel_size[0] // 2,
-            )
-            out = F.max_pool2d(F.pad(tensor, pad, mode="replicate"), kernel_size=kernel_size, stride=1)
-            return np.asarray(out[0, 0].detach().to("cpu").numpy(), dtype=np.float32)
-
-        tensor = torch.from_numpy(arr).to(device=device, dtype=torch.float32)[None, None]
-        pad = (
-            kernel_size[2] // 2,
-            kernel_size[2] // 2,
-            kernel_size[1] // 2,
-            kernel_size[1] // 2,
-            kernel_size[0] // 2,
-            kernel_size[0] // 2,
-        )
-        out = F.max_pool3d(F.pad(tensor, pad, mode="replicate"), kernel_size=kernel_size, stride=1)
-        return np.asarray(out[0, 0].detach().to("cpu").numpy(), dtype=np.float32)
-    except Exception as exc:
-        logger.debug("Torch maximum filter fallback to CPU: %s", exc)
-        return None
-
-
-def torch_tubeness_slicewise(
-    volume: np.ndarray,
-    sigmas: list[float],
-    preferred_backend: str = "auto",
-    batch_slices: int = 12,
-) -> np.ndarray | None:
-    runtime = _torch_runtime(preferred_backend)
-    if runtime is None:
-        return None
-    arr = np.asarray(volume, dtype=np.float32)
-    if arr.ndim != 3 or arr.size == 0:
-        return None
-
-    torch, F, device, backend = runtime
-    logger.info("Torch tubeness backend=%s slices=%d sigmas=%s", backend, int(arr.shape[0]), sigmas)
-    try:
-        out = np.zeros_like(arr, dtype=np.float32)
-        for start in range(0, int(arr.shape[0]), max(1, int(batch_slices))):
-            end = min(int(arr.shape[0]), start + max(1, int(batch_slices)))
-            batch = torch.from_numpy(arr[start:end]).to(device=device, dtype=torch.float32)[:, None]
-            best = torch.zeros_like(batch)
-            for sigma_val in sigmas:
-                sigma_float = float(max(sigma_val, 0.25))
-                blurred = _gaussian_blur_2d_batch(torch, F, batch, sigma_float)
-                vesselness = _frangi_like_response(torch, F, blurred, sigma_float)
-                best = torch.maximum(best, vesselness)
-            out[start:end] = np.asarray(best[:, 0].detach().to("cpu").numpy(), dtype=np.float32)
-        return out
-    except Exception as exc:
-        logger.debug("Torch tubeness fallback to CPU: %s", exc)
-        return None
 
 
 def _gaussian_kernel1d(torch, sigma: float, device, dtype):
@@ -216,47 +180,34 @@ def _gaussian_kernel1d(torch, sigma: float, device, dtype):
     return kernel
 
 
-def _gaussian_blur_2d_batch(torch, F, batch, sigma: float):
-    kernel = _gaussian_kernel1d(torch, sigma, batch.device, batch.dtype)
-    radius = kernel.numel() // 2
-    out = F.conv2d(
-        F.pad(batch, (radius, radius, 0, 0), mode="replicate"),
-        kernel.view(1, 1, 1, -1),
-    )
-    out = F.conv2d(
-        F.pad(out, (0, 0, radius, radius), mode="replicate"),
-        kernel.view(1, 1, -1, 1),
-    )
+def _gaussian_filter_3d_via_conv2d(torch, F, tensor, sigma_vals: tuple[float, ...], device):
+    """Exact separable 3D Gaussian using DirectML-supported 2D convolutions."""
+    out = tensor
+    for axis, sigma_val in enumerate(sigma_vals[:3]):
+        if sigma_val <= 1.0e-6:
+            continue
+        kernel = _gaussian_kernel1d(torch, sigma_val, device, out.dtype)
+        radius = kernel.numel() // 2
+        if axis == 0:
+            z, y, x = out.shape
+            columns = out.reshape(1, 1, z, y * x)
+            out = F.conv2d(
+                F.pad(columns, (0, 0, radius, radius), mode="replicate"),
+                kernel.view(1, 1, -1, 1),
+            ).reshape(z, y, x)
+        elif axis == 1:
+            slices = out[:, None]
+            out = F.conv2d(
+                F.pad(slices, (0, 0, radius, radius), mode="replicate"),
+                kernel.view(1, 1, -1, 1),
+            )[:, 0]
+        else:
+            slices = out[:, None]
+            out = F.conv2d(
+                F.pad(slices, (radius, radius, 0, 0), mode="replicate"),
+                kernel.view(1, 1, 1, -1),
+            )[:, 0]
     return out
 
 
-def _frangi_like_response(torch, F, batch, sigma: float):
-    kernel_xx = torch.tensor([[1.0, -2.0, 1.0]], device=batch.device, dtype=batch.dtype).view(1, 1, 1, 3)
-    kernel_yy = torch.tensor([[1.0], [-2.0], [1.0]], device=batch.device, dtype=batch.dtype).view(1, 1, 3, 1)
-    kernel_xy = torch.tensor(
-        [[1.0, 0.0, -1.0], [0.0, 0.0, 0.0], [-1.0, 0.0, 1.0]],
-        device=batch.device,
-        dtype=batch.dtype,
-    ).view(1, 1, 3, 3) * 0.25
 
-    ixx = F.conv2d(F.pad(batch, (1, 1, 0, 0), mode="replicate"), kernel_xx) * (sigma ** 2)
-    iyy = F.conv2d(F.pad(batch, (0, 0, 1, 1), mode="replicate"), kernel_yy) * (sigma ** 2)
-    ixy = F.conv2d(F.pad(batch, (1, 1, 1, 1), mode="replicate"), kernel_xy) * (sigma ** 2)
-
-    trace = ixx + iyy
-    delta = torch.sqrt(torch.clamp((ixx - iyy) ** 2 + (4.0 * (ixy ** 2)), min=1.0e-12))
-    l1 = 0.5 * (trace + delta)
-    l2 = 0.5 * (trace - delta)
-
-    swap = torch.abs(l1) > torch.abs(l2)
-    small = torch.where(swap, l2, l1)
-    large = torch.where(swap, l1, l2)
-
-    beta = 0.5
-    eps = torch.tensor(1.0e-6, device=batch.device, dtype=batch.dtype)
-    rb = torch.abs(small) / torch.clamp(torch.abs(large), min=float(eps))
-    s2 = (small ** 2) + (large ** 2)
-    scale = torch.clamp(torch.amax(torch.sqrt(s2)), min=1.0e-3)
-    vesselness = torch.exp(-(rb ** 2) / (2.0 * (beta ** 2))) * (1.0 - torch.exp(-s2 / (2.0 * (scale ** 2))))
-    vesselness = vesselness * (large < 0.0).to(batch.dtype)
-    return vesselness

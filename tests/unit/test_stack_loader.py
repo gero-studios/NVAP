@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from nvap.config.types import VoxelSpacing
-from nvap.io.stack_loader import inspect_dataset_stats, load_dataset
+from nvap.io.stack_loader import discover_dataset_projects, inspect_dataset_stats, load_dataset
 
 
 def _write_rgb(path: Path, r: int, g: int, b: int) -> None:
@@ -86,6 +86,20 @@ def test_load_dataset_sorts_z_and_extracts_channels(tmp_path: Path) -> None:
     assert dataset.red.data.shape == (2, 8, 8)
     assert float(dataset.green.data[0, 0, 0]) < float(dataset.green.data[1, 0, 0])
     assert float(dataset.red.data[0, 0, 0]) < float(dataset.red.data[1, 0, 0])
+
+
+def test_discover_dataset_projects_finds_multiple_child_series(tmp_path: Path) -> None:
+    for name, green, red in [("sample_a", 30, 60), ("sample_b", 80, 120)]:
+        child = tmp_path / name
+        child.mkdir()
+        _write_mixed_rg(child / "series_z001.png", red=red, green=green)
+        _write_mixed_rg(child / "series_z002.png", red=red + 1, green=green + 1)
+
+    entries = discover_dataset_projects(tmp_path)
+
+    assert [entry.name for entry in entries] == ["sample_a", "sample_b"]
+    assert all(entry.root.parent == tmp_path for entry in entries)
+    assert all(set(entry.channel_dirs) == {"green", "red"} for entry in entries)
 
 
 def test_load_dataset_from_wrapped_sequence_folder_ignores_exports(tmp_path: Path) -> None:

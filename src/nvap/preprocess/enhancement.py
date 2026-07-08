@@ -12,6 +12,7 @@ from skimage.filters import apply_hysteresis_threshold, frangi, meijering, sato,
 from skimage.morphology import binary_closing, binary_dilation, binary_opening, remove_small_holes, remove_small_objects, disk, white_tophat
 from skimage.restoration import denoise_bilateral, denoise_nl_means, denoise_wavelet, rolling_ball
 
+from nvap.accelerate import torch_gaussian_filter
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig
 from nvap.preprocess._executor import get_executor
 from nvap.preprocess.denoisers import (
@@ -19,18 +20,37 @@ from nvap.preprocess.denoisers import (
     estimate_noise_sigma,
     run_green_denoiser,
 )
+from nvap.runtime_optimization import configured_cpu_workers
 
 logger = logging.getLogger(__name__)
 _BRANCH_MAP_CHUNK_THRESHOLD = 64 * 1024 * 1024
 _FAST_BG_VOXEL_THRESHOLD = 64 * 1024 * 1024
+_GPU_FILTER_MIN_VOXELS = 4 * 1024 * 1024
+
+
+def _gaussian_filter_fast(
+    volume: np.ndarray,
+    sigma: tuple[float, ...] | float,
+    *,
+    mode: str = "nearest",
+) -> np.ndarray:
+    arr = np.asarray(volume, dtype=np.float32)
+    if isinstance(sigma, tuple):
+        sigma_tuple = tuple(float(v) for v in sigma)
+    else:
+        sigma_tuple = tuple(float(sigma) for _ in range(arr.ndim))
+    if mode == "nearest" and arr.size >= _GPU_FILTER_MIN_VOXELS:
+        accelerated = torch_gaussian_filter(arr, sigma=sigma_tuple)
+        if accelerated is not None:
+            return np.asarray(accelerated, dtype=np.float32)
+    return np.asarray(ndi.gaussian_filter(arr, sigma=sigma, mode=mode), dtype=np.float32)
 
 
 def _resolve_worker_threads(config: PreprocessConfig) -> int:
     requested = int(config.cpu_worker_threads)
     if requested > 0:
         return max(1, requested)
-    cpus = os.cpu_count() or 1
-    return max(1, min(8, cpus))
+    return max(1, min(32, configured_cpu_workers(os.cpu_count() or 1)))
 
 
 def _fmt_stage_stats(arr: np.ndarray) -> str:
@@ -62,7 +82,7 @@ def _normalize_branch_map(branch_map: np.ndarray) -> np.ndarray:
     else:
         norm = (arr - lo) / (hi - lo)
     norm = np.clip(norm, 0.0, 1.0)
-    norm = ndi.gaussian_filter(norm, sigma=(0.0, 0.75, 0.75), mode="nearest")
+    norm = _gaussian_filter_fast(norm, sigma=(0.0, 0.75, 0.75), mode="nearest")
     return np.clip(norm, 0.0, 1.0).astype(np.float32, copy=False)
 
 
@@ -145,7 +165,7 @@ def stage_illumination_correction(volume: np.ndarray, config: PreprocessConfig) 
             ds,
         )
         reduced = arr[:, ::ds, ::ds]
-        bg_small = ndi.gaussian_filter(
+        bg_small = _gaussian_filter_fast(
             reduced,
             sigma=(0.0, sigma_xy / ds, sigma_xy / ds),
             mode="nearest",
@@ -163,7 +183,7 @@ def stage_illumination_correction(volume: np.ndarray, config: PreprocessConfig) 
         else:
             background = background[:, : arr.shape[1], : arr.shape[2]]
     else:
-        background = ndi.gaussian_filter(
+        background = _gaussian_filter_fast(
             arr,
             sigma=(0.0, sigma_xy, sigma_xy),
             mode="nearest",
@@ -499,22 +519,6 @@ def stage_speckle_control(
     return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
 
 
-def stage_legacy_light_speckle_control(volume: np.ndarray) -> np.ndarray:
-    arr = np.asarray(volume, dtype=np.float32)
-    if arr.size == 0:
-        return arr
-    local_mean = ndi.uniform_filter(arr, size=(1, 3, 3), mode="nearest")
-    delta = np.maximum(arr - local_mean, 0.0)
-    cut = float(np.quantile(delta, 0.996))
-    if not np.isfinite(cut) or cut <= 0.0:
-        return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
-    spike_mask = delta >= cut
-    if not np.any(spike_mask):
-        return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
-    out = arr.copy()
-    out[spike_mask] = local_mean[spike_mask] + (0.25 * delta[spike_mask])
-    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
-
 
 def stage_restore_branches_near_bright_pixels(
     reference: np.ndarray,
@@ -788,8 +792,14 @@ def _keep_process_like_components(
 _SOMA_OPEN_RADIUS = 2
 
 
-def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
-    """Library-first microscopy cleanup for microglia soma and processes."""
+def _microscopy_clean_background(volume: np.ndarray, workers: int = 1) -> np.ndarray:
+    """Library-first microscopy cleanup for microglia soma and processes.
+
+    Each z-slice is processed independently (rolling-ball background subtraction
+    + multi-scale vesselness), so the loop is parallelized across CPU workers.
+    These are CPU skimage/scipy ops with no GPU/DirectML path; threads give real
+    speedup because the heavy kernels release the GIL.
+    """
     arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
     if arr.size == 0:
         return arr.copy()
@@ -798,11 +808,12 @@ def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
     raw_norm = _normalize_positive_detail(arr)
     closing_fp = disk(1)
     soma_fp = disk(2)
+    depth = int(arr.shape[0])
 
-    for z in range(int(arr.shape[0])):
+    def _run_slice(z: int):
         plane = np.asarray(arr[z], dtype=np.float32)
         if plane.size == 0:
-            continue
+            return z, None
         plane_smooth = ndi.gaussian_filter(plane, sigma=0.65, mode="nearest")
 
         try:
@@ -927,7 +938,28 @@ def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
         plane_out = ndi.gaussian_filter(plane_out, sigma=0.35, mode="nearest")
         plane_out[~binary_dilation(visible, footprint=closing_fp)] = 0.0
         plane_out[plane_out < 0.018] = 0.0
-        out[z] = np.clip(plane_out, 0.0, 1.0)
+        return z, np.clip(plane_out, 0.0, 1.0)
+
+    if workers > 1 and depth > 1:
+        logger.info("microscopy_clean: parallel workers=%d slices=%d", workers, depth)
+        progress_every = max(1, depth // 8)
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nvap-mclean") as pool:
+            for future in as_completed([pool.submit(_run_slice, z) for z in range(depth)]):
+                try:
+                    z, plane_out = future.result()
+                    if plane_out is not None:
+                        out[z] = plane_out
+                except Exception as exc:  # pragma: no cover - defensive per-slice path
+                    logger.debug("microscopy_clean slice failed: %s", exc)
+                completed += 1
+                if completed == 1 or completed == depth or (completed % progress_every) == 0:
+                    logger.info("microscopy_clean progress: slices=%d/%d", completed, depth)
+    else:
+        for z in range(depth):
+            _, plane_out = _run_slice(z)
+            if plane_out is not None:
+                out[z] = plane_out
 
     return out.astype(np.float32, copy=False)
 
@@ -935,29 +967,45 @@ def _microscopy_clean_background(volume: np.ndarray) -> np.ndarray:
 def _reconnect_and_denoise_microglia(
     volume: np.ndarray,
     *,
+    grain_open_radius: int = 1,
     bridge_radius_px: int = 2,
-    far_voxels: float = 26.0,
-    min_object_voxels: int = 8,
+    far_voxels: float = 12.0,
+    min_object_voxels: int = 16,
     cell_min_voxels: int = 256,
 ) -> np.ndarray:
-    """Reinforce fragmented microglia and strip far-flung isolated noise.
+    """Strip tiny loose noise grains, then reinforce/denoise microglia.
 
     Run after the slice-wise microscopy cleanup:
 
+    0. De-speckle - a per-slice grayscale opening removes bright specks thinner
+       than ``grain_open_radius`` (the diffuse background "grain" the cleanup
+       leaves behind) while keeping soma bodies and branches, which are wider
+       than the element. This is the main grain remover.
     1. Reinforce - a small per-slice grayscale closing bridges faint in-plane
-       gaps so segments of the same process/cell reconnect.
+       gaps so segments of the same process/cell reconnect. Genuine branches
+       rejoin their soma and become part of one large 3D component (an
+       "anchor"); isolated bits stay separate.
     2. Denoise - label the bridged volume in 3D. Substantial components
-       (>= ``cell_min_voxels``) are treated as real cells and always kept,
-       regardless of distance, so a field of several microglia is preserved.
-       Only *small* components are pruned, and only when they sit farther than
-       ``far_voxels`` from any cell (isolated green debris); tiny specks below
-       ``min_object_voxels`` are dropped as noise.
+       (>= ``cell_min_voxels``) are real cells and always kept (a field of many
+       microglia is preserved). A *small, separate* component is only kept when
+       it is big enough (>= ``min_object_voxels``) AND hugging a cell (within
+       ``far_voxels``); everything else - tiny specks and far-flung debris - is
+       dropped.
     """
     arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
     if arr.ndim != 3 or arr.size == 0:
         return arr.copy()
 
-    floor = 0.02
+    # 0) De-speckle: grayscale opening kills fine grain (bright specks thinner
+    # than the structuring element) without eroding wider soma/branch signal.
+    if grain_open_radius and grain_open_radius > 0:
+        open_fp = disk(int(grain_open_radius))
+        opened = np.empty_like(arr)
+        for z in range(int(arr.shape[0])):
+            opened[z] = ndi.grey_opening(arr[z], footprint=open_fp, mode="nearest")
+        arr = opened
+
+    floor = 0.03
     mask = arr > floor
     if not np.any(mask):
         return arr.copy()
@@ -1231,7 +1279,7 @@ def _enhance_microglia_core(
         enhanced = _imagej_rolling_ball_slicewise(arr, radius=5, multiplier=1.5)
         return _refine_imagej_rolling_ball_microglia(arr, enhanced)
     elif method == "microscopy_clean":
-        cleaned = _microscopy_clean_background(arr)
+        cleaned = _microscopy_clean_background(arr, workers=_resolve_worker_threads(cfg))
         # Reinforce fragmented processes, then remove far-flung isolated debris.
         return _reconnect_and_denoise_microglia(cleaned)
     elif method == "basic":
@@ -1294,6 +1342,59 @@ def enhance_microglia_background(
     if arr.size == 0:
         return arr.copy()
     return _enhance_microglia_core(arr, cfg, method)
+
+
+def wipe_small_specks(
+    volume: np.ndarray,
+    *,
+    threshold: float,
+    min_voxels: int,
+    connectivity: int = 3,
+) -> np.ndarray:
+    """Remove small isolated specks from a 3D channel volume.
+
+    Voxels at or above ``threshold`` are grouped into connected components
+    (26-connectivity by default). Any component with fewer than ``min_voxels``
+    voxels is treated as a speck and zeroed out, while larger structures
+    (vessels, microglia somas and branches) are left untouched. This backs the
+    "Wipe Specks" action and is applied independently to the green (microglia)
+    and red (vasculature) channels.
+    """
+    arr = np.asarray(volume, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Speck-wipe volume must be 3D (z, y, x), got {arr.shape}")
+    if arr.size == 0:
+        return arr.copy()
+
+    t = float(np.clip(threshold, 0.0, 1.0))
+    min_voxels = max(1, int(min_voxels))
+    mask = arr >= t
+    if not np.any(mask):
+        return arr.copy()
+
+    structure = ndi.generate_binary_structure(3, int(np.clip(connectivity, 1, 3)))
+    labels, count = ndi.label(mask, structure=structure)
+    if count <= 0:
+        return arr.copy()
+
+    sizes = np.bincount(labels.ravel())
+    small_labels = np.where((sizes > 0) & (sizes < min_voxels))[0]
+    small_labels = small_labels[small_labels != 0]
+    if small_labels.size == 0:
+        return arr.copy()
+
+    speck_mask = np.isin(labels, small_labels)
+    out = arr.copy()
+    out[speck_mask] = 0.0
+    logger.info(
+        "Wiped %d specks (<%d voxels) of %d components at threshold %.3f (%d voxels cleared)",
+        int(small_labels.size),
+        min_voxels,
+        int(count),
+        t,
+        int(np.count_nonzero(speck_mask)),
+    )
+    return out
 
 
 def preprocess_channel(channel: ChannelVolume, config: PreprocessConfig) -> ChannelVolume:

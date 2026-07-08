@@ -2,37 +2,50 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
-
-from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
-from nvap.analysis.vascular_analysis import analyze_vasculature, vascular_analysis_to_csv_rows
-from nvap.analysis.green_benchmark import run_green_denoise_benchmark
-from nvap.cache.processed_cache import clear_processed_cache
-from nvap.config.types import DEFAULT_SPACING, MeshExportConfig, PSFConfig, PreprocessConfig, RenderConfig
-from nvap.export.mesh_export import export_dataset_meshes, reconstruct_combined_mesh
-from nvap.io.stack_loader import load_dataset
-from nvap.pipeline import (
-    apply_psf_to_dataset,
-    default_green_threshold,
-    default_threshold,
-    fill_and_sync_dataset,
-    prepare_dataset_for_mesh,
-)
-from nvap.preprocess.enhancement import preprocess_dataset
+from logging.handlers import RotatingFileHandler
 
 logger = logging.getLogger(__name__)
 
 
 def configure_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        log_dir = Path(os.environ.get("NVAP_HOME") or (Path.home() / ".nvap"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_dir / "nvap.log",
+            maxBytes=2_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handlers.append(file_handler)
+    except OSError:
+        pass
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=handlers,
+        force=True,
     )
     logging.getLogger("PIL").setLevel(logging.WARNING)
 
 
 def run_headless_smoke(input_path: str | Path) -> int:
+    from nvap.analysis.metrics import compute_metrics
+    from nvap.analysis.vascular_analysis import analyze_vasculature
+    from nvap.config.types import DEFAULT_SPACING, PSFConfig, PreprocessConfig, RenderConfig
+    from nvap.io.stack_loader import load_dataset
+    from nvap.pipeline import (
+        apply_psf_to_dataset,
+        default_green_threshold,
+        default_threshold,
+        fill_and_sync_dataset,
+    )
+    from nvap.preprocess.enhancement import preprocess_dataset
+
     source = Path(input_path).resolve()
     logger.info("Headless smoke start: input=%s", source)
     dataset = load_dataset(source, spacing=DEFAULT_SPACING)
@@ -82,6 +95,12 @@ def run_headless_smoke(input_path: str | Path) -> int:
 
 def run_mesh_export(input_path: str | Path, output_dir: str | Path, fmt: str = "ply") -> int:
     """Full headless pipeline: load -> preprocess -> process -> mesh export."""
+    from nvap.config.types import DEFAULT_SPACING, MeshExportConfig, PSFConfig, PreprocessConfig
+    from nvap.export.mesh_export import export_dataset_meshes, reconstruct_combined_mesh
+    from nvap.io.stack_loader import load_dataset
+    from nvap.pipeline import apply_psf_to_dataset, fill_and_sync_dataset, prepare_dataset_for_mesh
+    from nvap.preprocess.enhancement import preprocess_dataset
+
     source = Path(input_path).resolve()
     out = Path(output_dir).resolve()
     logger.info("Mesh export pipeline: input=%s output=%s format=%s", source, out, fmt)
@@ -121,6 +140,9 @@ def run_benchmark_denoise(
 ) -> int:
     """Run green denoise benchmark and write JSON report."""
     from dataclasses import replace as dc_replace
+
+    from nvap.analysis.green_benchmark import run_green_denoise_benchmark
+    from nvap.config.types import PreprocessConfig
 
     source = Path(input_path).resolve()
     out = Path(output_path).resolve()
@@ -168,6 +190,23 @@ def main() -> int:
         help="Enable verbose debug logging.",
     )
     parser.add_argument(
+        "--compute-backend",
+        default=os.environ.get("NVAP_GPU_BACKEND", "auto"),
+        choices=["auto", "cpu", "cuda", "rocm", "directml", "mps"],
+        help="Compute backend preference. Default: auto-detect best available backend.",
+    )
+    parser.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=0,
+        help="Override auto-selected CPU worker count. Default: auto.",
+    )
+    parser.add_argument(
+        "--print-runtime-profile",
+        action="store_true",
+        help="Print backend/thread/memory optimization profile and exit.",
+    )
+    parser.add_argument(
         "--clear-cache",
         action="store_true",
         help="Safely clear NVAP processed cache files in .nvap_cache.",
@@ -210,9 +249,26 @@ def main() -> int:
     )
     args = parser.parse_args()
     configure_logging(args.debug)
-    logger.info("NVAP startup (debug=%s)", args.debug)
+    from nvap.runtime_optimization import configure_runtime_environment
+
+    runtime_profile = configure_runtime_environment(
+        requested_backend=args.compute_backend,
+        requested_cpu_workers=args.cpu_workers if args.cpu_workers > 0 else None,
+    )
+    logger.info(
+        "NVAP startup (debug=%s backend=%s workers=%d)",
+        args.debug,
+        runtime_profile.selected_backend,
+        runtime_profile.cpu_workers,
+    )
+
+    if args.print_runtime_profile:
+        print(runtime_profile.to_json())
+        return 0
 
     if args.clear_cache:
+        from nvap.cache.processed_cache import clear_processed_cache
+
         removed, cache_path = clear_processed_cache(args.cache_root)
         print(f"NVAP cache clear complete - removed={removed} path={cache_path}")
         return 0
@@ -226,15 +282,29 @@ def main() -> int:
     if args.export_mesh:
         return run_mesh_export(args.input, args.mesh_output, args.mesh_format)
 
-    from PySide6.QtWidgets import QApplication
-
-    from nvap.ui.main_window import MainWindow
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QSplashScreen
+    from nvap.ui.loading import build_loading_pixmap
     from nvap.ui.theme import DARK_THEME_QSS
 
     app = QApplication([])
     app.setStyleSheet(DARK_THEME_QSS)
+    splash_pixmap = build_loading_pixmap(
+        detail=(
+            f"Runtime: {runtime_profile.selected_backend.upper()} "
+            f"/ {runtime_profile.cpu_workers} workers"
+        ),
+        progress_fraction=0.45,
+    )
+    splash = QSplashScreen(splash_pixmap, Qt.WindowType.WindowStaysOnTopHint)
+    splash.show()
+    app.processEvents()
+
+    from nvap.ui.main_window import MainWindow
+
     window = MainWindow()
     window.show()
+    splash.finish(window)
     return app.exec()
 
 

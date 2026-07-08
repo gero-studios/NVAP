@@ -25,53 +25,65 @@ Provides-Extra: mesh
 Requires-Dist: trimesh>=4.0; extra == "mesh"
 Provides-Extra: rocm
 Requires-Dist: torch>=2.2; extra == "rocm"
+Provides-Extra: directml
+Requires-Dist: torch-directml==0.2.5.dev240914; (platform_system == "Windows" and python_version >= "3.8" and python_version < "3.13") and extra == "directml"
 
-# NVAP
+# NVAP — NeuroVascular Analytics Program
 
-NVAP (NeuroVascular Analytics Program) is a desktop 3D viewer and analyzer for microscopy image stacks containing:
+NVAP is a desktop application for loading, viewing, and quantifying two-channel
+3D microscopy stacks of brain tissue:
 
-- Green channel: microglia
-- Red channel: vasculature
+- **Green channel — microglia**
+- **Red channel — vasculature**
 
-It supports missing-slice interpolation, branch-preserving pixel-to-voxel denoising (no PSF), 3D volume + isosurface rendering, basic metrics, and export.
+It loads image stacks, cleans and aligns them, renders both channels together in
+interactive 3D, and computes morphometric and spatial-association metrics that
+you can export as CSV. It runs on CPU everywhere and uses a GPU automatically
+when a supported one is available.
 
-## Units and spacing
+For a full explanation of the processing pipeline and the meaning of every
+metric, see **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
 
-Default voxel spacing is interpreted in micrometers:
+---
 
-- `x = 0.331 um`
-- `y = 0.331 um`
-- `z = 0.4 um`
+## What NVAP does
 
-## Expected input layout
+- Loads per-slice image folders or single multi-page TIFF stacks for each channel.
+- Fills missing z-slices and aligns the two channels onto a common z-range.
+- Cleans the green channel with a branch-preserving masking pipeline.
+- Renders each channel as a volume and/or isosurface with independent controls.
+- Computes and displays:
+  - basic per-channel metrics (voxel count, physical volume, connected
+    components, largest component, red–green overlap);
+  - vascular morphometry (volume fraction, centreline length and density,
+    radius/diameter, junctions, tortuosity, surface area);
+  - per-cell microglia morphometry (branches, tips, process length, Sholl
+    profile, soma shape, distance to vasculature);
+  - neurovascular association (perivascular fractions, cell/soma/tip-to-vessel
+    distances).
+- Exports metrics to CSV, a snapshot PNG, and 3D meshes (PLY/OBJ/STL).
 
-Default auto-detection expects either:
+---
 
-- `Input/Segmented/Green/*.(png|tif|tiff)`
-- `Input/Segmented/Red/*.(png|tif|tiff)`
+## Voxel spacing
 
-or a selected root containing `Segmented/Green` and `Segmented/Red`.
+Metrics are physically calibrated using voxel spacing in micrometres. The
+default spacing is:
 
-NVAP also supports a single user-selected folder of RGB PNG/TIFF slices when:
+| Axis | Spacing |
+|------|---------|
+| x    | 0.331 µm |
+| y    | 0.331 µm |
+| z    | 0.4 µm   |
 
-- filenames include `_z###` (for example `sample_z030.png`), and
-- slice pixels are red/green-only (black background allowed; blue or mixed red+green pixels are ignored).
+---
 
-Each `Green` or `Red` folder can also contain a single stack file (for example `green_stack.tif`, `red_stack.tif`)
-with all z-slices in one TIFF.
+## Installing and running from source
 
-Filenames should include z-index and channel marker for slice-per-file layouts, for example:
-
-- `..._z030c1.png` / `..._z030c1.tif` (green)
-- `..._z030c2.png` / `..._z030c2.tif` (red)
-
-## Run from source
-
-### PowerShell quick start (Windows)
+Windows / PowerShell:
 
 ```powershell
-# From repo root
-cd nvap
+# From the repo root
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -79,175 +91,256 @@ python -m pip install -e ".[dev]"
 nvap --debug
 ```
 
-Optional model backend:
-
-```powershell
-# Torch / model backend (optional)
-python -m pip install -e ".[denoise_torch]"
-```
-
-If activation is blocked:
+If PowerShell blocks script activation:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 ```
 
-Launch GUI with verbose debug logs:
+`nvap` launches the GUI. `nvap --debug` launches it with verbose logging shown
+in the in-app **Debug Log** panel.
+
+---
+
+## GPU acceleration
+
+NVAP selects a compute backend automatically at startup. It probes CUDA, ROCm,
+DirectML, and Apple MPS in that order and falls back to CPU if none is usable.
+It also picks CPU worker counts and numeric-library thread limits from the local
+CPU/RAM profile. No environment variable is required.
+
+The header status pill shows the active backend, e.g. `GPU DirectML` or
+`CPU compute`.
+
+Optional backends are installed as extras:
 
 ```powershell
+# NVIDIA CUDA / generic Torch GPU
+python -m pip install -e ".[denoise_torch]"
+
+# AMD / Intel / other DirectX 12 GPUs on Windows (requires Python 3.12)
+python -m pip install -e ".[directml]"
+```
+
+**AMD GPUs on Windows:** the DirectML wheel is published only for Python ≤ 3.12,
+so a Python 3.13 environment runs on CPU even when the GPU is present. A
+project-local Python 3.12 setup:
+
+```powershell
+winget install --id astral-sh.uv -e
+uv python install 3.12
+uv venv --python 3.12 .venv-gpu
+.\.venv-gpu\Scripts\Activate.ps1
+python -m pip install -e ".[dev,directml]"
 nvap --debug
 ```
 
-Optional headless smoke test:
+Force CPU (for troubleshooting) or inspect the runtime decision:
 
 ```powershell
-nvap --headless-smoke --input Input
+$env:NVAP_GPU_BACKEND = "cpu"; nvap
+nvap --print-runtime-profile
+nvap --compute-backend cpu --cpu-workers 4
 ```
 
-Clear processed cache safely (only `.nvap_cache/processed_*.npz` in selected root):
+---
+
+## Loading a dataset
+
+### Accepted input layouts
+
+NVAP accepts either a folder of one-image-per-slice files, or a single
+multi-page TIFF, for each channel.
+
+**Per-slice folders.** Filenames must contain a z-index and a channel marker:
+
+- Green: `..._z030c1.png` / `..._z030c1.tif`
+- Red:   `..._z030c2.png` / `..._z030c2.tif`
+
+A common auto-detected layout is:
+
+```
+Input/Segmented/Green/*.(png|tif|tiff)
+Input/Segmented/Red/*.(png|tif|tiff)
+```
+
+**Single stack files.** Each `Green` or `Red` folder may instead contain one
+multi-page TIFF holding all z-slices (e.g. `green_stack.tif`, `red_stack.tif`).
+
+**RGB slice folders.** A single folder of RGB PNG/TIFF slices is also accepted
+when filenames include `_z###` and pixels are red/green-only (black background
+is fine; blue or mixed pixels are ignored).
+
+### Loading in the GUI
+
+1. Click **Load Dataset** (or press **Ctrl+L**).
+2. When prompted, choose the source for each channel in this order:
+   1. Vasculature (Red)
+   2. Microglia (Green)
+
+   For each, pick either a single stack file or an image-sequence folder.
+3. NVAP loads, then runs, with an elapsed-time and ETA dialog:
+   - channel stack loading,
+   - missing-slice interpolation,
+   - green microglia masking,
+   - initial render and metrics.
+4. Adjust thresholds, opacity, and other controls in the left panel.
+
+---
+
+## Using the app
+
+### Simple and advanced modes
+
+NVAP starts in **simple mode**. The core workflow is: **Load Dataset → adjust
+thresholds → export.** Toggle **Show advanced controls** to expose masking,
+preprocessing, and denoising settings.
+
+### Rendering controls
+
+- **Threshold (green / red):** the intensity cutoff that defines each structure.
+  The same threshold drives both the 3D view and every metric, so what you see
+  is what is measured.
+- **Opacity (green / red):** transparency of each volume.
+- **Isosurface toggles:** show a solid surface at the threshold instead of a
+  translucent cloud.
+- **Trim first/last Z:** exclude edge slices from both the view and all metrics
+  (default: 20 slices at each end).
+- **Offset (x/y/z):** shift the green channel relative to red to correct
+  registration; applied identically to the view and the overlap metric.
+- **Z height scale:** a display-only depth scale (default `0.70`; `1.0` matches
+  physical spacing). Metrics always use physical spacing regardless of this
+  setting.
+
+### Individual microglia viewer
+
+Use the **Microglia Viewer** panel to inspect one green component at a time:
+
+1. Enable **View one microglia**.
+2. Select a **Cell** index to isolate that component in 3D.
+
+Components are ranked by size (largest first) at the current green threshold.
+
+### Automatic on load
+
+Every time a dataset finishes loading — including each dataset when you page
+through a multi-stack project set — NVAP cleans it up automatically:
+
+1. **Default thresholds** (Green 0.80, Red 0.60) are applied.
+2. **Enhance microglia (clean)** runs the selected enhancement (default
+   *Microscopy clean soma/branch*) on the green channel. Skipped if the dataset
+   already has a cached enhancement.
+3. **Wipe specks** removes small isolated blobs from both channels.
+
+The two cleanup passes are controlled by the **Enhance microglia (clean) on
+load** and **Wipe specks on load** checkboxes in the Microglia Workbench (both on
+by default). They are always available, so you can turn them off *before* loading
+anything. **Speck size** sets the largest connected component (in voxels) treated
+as a speck; larger structures are kept. You can also run **Enhance Microglia** and
+**Wipe Specks** manually at any time.
+
+### Update mode
+
+Setting changes are debounced and applied automatically. Turn **Auto-apply**
+off to batch several edits and apply them together with the Apply button or
+**F5**.
+
+### Keyboard shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| Ctrl+L | Load dataset |
+| Ctrl+E | Export metrics CSV |
+| Ctrl+S | Export snapshot PNG |
+| Ctrl+M | Export 3D mesh |
+| Ctrl+A | Toggle auto-apply |
+| F5 / Return | Apply pending changes |
+
+---
+
+## Exports
+
+Exporting metrics writes a base CSV plus companion files alongside it. If you
+save as `metrics.csv`, you get:
+
+| File | Contents |
+|------|----------|
+| `metrics.csv` | Per-channel basic metrics and red–green overlap |
+| `metrics_provenance.csv` | The settings that produced the numbers (thresholds, trim, offsets, spacing, backend, dataset, timestamp) |
+| `metrics_vascular.csv` | Vascular morphometry (red channel) |
+| `metrics_microglia.csv` | Per-cell microglia morphometry |
+| `metrics_neurovascular.csv` | Neurovascular association patterns |
+
+Snapshot export writes a `snapshot.png`. Mesh export writes PLY/OBJ/STL files.
+
+The meaning of every column is documented in
+**[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
+
+---
+
+## Processed cache
+
+Processed volumes are cached in `.nvap_cache/`. Re-loading the same dataset with
+the same processing settings reuses the cache and skips reprocessing. Clear it
+with:
 
 ```powershell
 nvap --clear-cache
-# or choose another root that contains .nvap_cache
 nvap --clear-cache --cache-root "C:\path\to\root"
 ```
 
-Run tests:
+---
+
+## Command-line reference
+
+`nvap` also runs headless operations without opening the GUI:
+
+| Command | Purpose |
+|---------|---------|
+| `nvap` | Launch the GUI |
+| `nvap --debug` | Launch with verbose logging |
+| `nvap --print-runtime-profile` | Print the selected backend/threads/memory profile and exit |
+| `nvap --compute-backend {auto,cpu,cuda,rocm,directml,mps}` | Force a compute backend |
+| `nvap --cpu-workers N` | Override the auto-selected worker count |
+| `nvap --headless-smoke --input Input` | Run load/process/metrics without the GUI |
+| `nvap --export-mesh --input Input --mesh-output meshes --mesh-format ply` | Export meshes headless |
+| `nvap --benchmark-denoise --input Input --output report.json` | Run the green-denoise benchmark |
+| `nvap --clear-cache [--cache-root PATH]` | Remove `.nvap_cache/processed_*.npz` |
+
+Run the tests with:
 
 ```powershell
 python -m pytest
 ```
 
-## How to load dataset in NVAP
-
-1. Click `Load Dataset`.
-2. Select channels in this order when prompted:
-- Vasculature (Red)
-- Microglia (Green)
-  For each channel, choose either:
-  - a single stack file (`.tif/.tiff/.png`), or
-  - an image-sequence folder (`.png/.tif/.tiff` slices).
-3. NVAP loads those selected sources directly (no root auto-detection step in UI).
-4. Wait for loading dialogs to complete:
-- channel stack load
-- missing z-slice interpolation
-- MicrogliaMaskIsolate masking + processing
-- initial render + metrics
-  During this step, NVAP shows `Elapsed` and estimated `ETA`.
-5. Use threshold/opacity/isosurface controls in the left panel.
-6. Check debug output in the `Debug Log` panel.
-
-### Simplified controls
-
-- NVAP now starts in a simple mode by default.
-- Toggle `Show advanced controls` only when you need masking/preprocess expert settings.
-- Core workflow in simple mode: `Load Dataset` -> adjust thresholds -> export.
-
-### Individual microglia viewer
-
-- Use the `Microglia Viewer` panel to inspect one connected green component at a time.
-- Enable `View one microglia`.
-- Select a component index (`Cell`) to isolate that microglia in 3D.
-- Component ranking is size-based (largest first) at the current green threshold.
-
-### Processing note
-
-- NVAP now runs a single green masking mode: `microglia_masking`.
-- PSF deconvolution controls are removed from normal workflow.
-- Dataset processing runs in background threads with elapsed-time and ETA dialogs.
-
-### Branch-preserving preprocessing and mesh clarity
-
-NVAP now applies a preprocessing chain before visualization:
-
-- Flat-field/background correction
-- Per-slice contrast normalization
-- Green channel masking using the bundled MicrogliaMaskIsolate pipeline
-- Existing preprocessing path for red vasculature
-
-Green channel processing uses only:
-
-- `microglia_masking` (single default mode)
-
-In advanced controls, you can tune noise strength, noise multiplier, branch protection, and speckle attenuation.
-
-To better clean isosurfaces from anisotropic microscopy stacks, NVAP also resamples Z to near-isotropic spacing for mesh rendering.
-Metrics remain computed on the processed (non-resampled) dataset.
-
-For visualization, NVAP applies a display-only Z height scale (default `0.67`) so depth is less visually disproportionate.
-You can tune this live with `Rendering -> Z height scale`.
-
-For green microglia, default threshold initialization is biased lower to reduce the risk of cutting faint branches.
-Threshold suggestion now uses a branch-aware green mode by default.
-
-### Green denoise benchmark
-
-CLI benchmark report:
-
-```powershell
-nvap --benchmark-denoise --input Input --output green_denoise_report.json
-```
-
-Override profile:
-
-```powershell
-nvap --benchmark-denoise --input Input --output report.json --green-denoise-profile low_snr
-```
-
-Script alternative:
-
-```powershell
-python scripts/benchmark_green_denoise.py --input Input --output report.json
-```
-
-### Green masking notes
-
-- Default workflow: `microglia_masking` with bundled Fiji runtime.
-- Green denoise controls are no longer used in this mode.
-
-### Auto-save cache
-
-- Processed volumes are cached automatically in `.nvap_cache/`.
-- Re-loading the same dataset with the same processing settings reuses cache when available.
-- This avoids re-running full denoise processing and speeds up re-open/re-render workflows.
+---
 
 ## Windows packaging
 
-Use:
+Build a standalone executable with PyInstaller:
 
 ```powershell
 .\scripts\build_windows.ps1
 ```
 
-This builds a one-folder executable in `dist/NVAP/`.
+This produces `dist\NVAP.exe`. The build packages a CPU-safe app by default and
+includes DirectML automatically when built on Windows with a compatible Python
+(3.12). Launch by double-clicking `dist\NVAP.exe`; do not run anything from
+`build\`, which is PyInstaller scratch space.
 
-## Current v1 capabilities
+Force a packaging profile:
 
-- Auto-detect channels with manual directory override fallback.
-- Missing z-slice interpolation.
-- Pixel-to-voxel branch-preserving denoising (no PSF).
-- 3D rendering per channel with independent controls.
-- Basic metrics:
-  - voxel count
-  - physical volume
-  - connected component count
-  - largest component size
-  - red-green overlap in shared z-range
-  - Global metrics honor the active `Trim first/last Z` setting, so the cards
-    match the trimmed volume shown in the 3D view and the per-cell analytics.
-- Per-cell microglia morphometry (Analytics panel / CSV), computed in 3D with
-  anisotropy-aware spacing via [`skan`](https://skeleton-analysis.org/):
-  - branch count (distinct process segments) and terminal tip count
-  - branch-point (junction) count
-  - total and mean process length (geodesic, in um)
-  - soma volume
-  - Sholl ramification: peak intersections, critical radius, enclosing radius
-  - nearest tip / cell distance to vasculature
-- Export:
-  - metrics CSV
-  - snapshot PNG
+```powershell
+.\scripts\build_windows.ps1 -Acceleration cpu
+.\scripts\build_windows.ps1 -Acceleration directml -PythonExe .\.venv-gpu\Scripts\python.exe
+.\scripts\build_windows.ps1 -PackageMode onedir
+```
 
-## AI extension scaffold
+---
 
-NVAP exposes plugin discovery through the `nvap.plugins` entry point group and a `ChannelAnalyzerPlugin` protocol. v1 includes extension points only.
+## Extending NVAP
+
+NVAP exposes plugin discovery through the `nvap.plugins` entry-point group and a
+`ChannelAnalyzerPlugin` protocol (`src/nvap/plugins/`). This is an extension
+point for adding custom per-channel analyzers; no analyzers ship by default.

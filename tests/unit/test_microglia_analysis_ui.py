@@ -7,7 +7,9 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QScrollArea
 
+from nvap.analysis.microglia_analysis import MicrogliaAnalysisResult, MicrogliaCellAnalysis
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig, PSFConfig, VoxelSpacing
+from nvap.io.stack_loader import DatasetProjectCandidate
 from nvap.ui.main_window import MainWindow
 from nvap.ui.control_panel import ControlPanel
 from nvap.ui.services.project_files import load_project_state, save_project_state
@@ -53,13 +55,39 @@ def _multi_component_dataset() -> DatasetVolume:
     )
 
 
+def _analysis_cell(component_id: int = 1) -> MicrogliaCellAnalysis:
+    return MicrogliaCellAnalysis(
+        component_id=component_id,
+        voxel_count=12,
+        volume_um3=12.0,
+        soma_voxel_count=4,
+        soma_volume_um3=4.0,
+        branch_count=2,
+        tip_count=3,
+        branch_point_count=1,
+        total_process_length_um=8.0,
+        mean_branch_length_um=4.0,
+        sholl_max_intersections=2,
+        sholl_critical_radius_um=3.0,
+        sholl_enclosing_radius_um=5.0,
+        nearest_tip_to_vessel_um=1.5,
+        nearest_cell_to_vessel_um=2.0,
+        soma_to_vessel_um=2.5,
+    )
+
+
 def test_render_trim_defaults_and_updates(qtbot) -> None:
     panel = ControlPanel()
     qtbot.addWidget(panel)
     cfg = panel.current_render_config()
-    assert cfg.display_z_scale == 0.5
+    assert cfg.threshold_green == 0.80
+    assert cfg.threshold_red == 0.60
+    assert cfg.opacity_green == 0.40
+    assert cfg.opacity_red == 0.80
+    assert cfg.display_z_scale == 0.70
     assert cfg.trim_first_slices == 20
     assert cfg.trim_last_slices == 20
+    assert panel.microglia_branch_sensitivity.isHidden()
 
     panel.trim_first_slices.setValue(7)
     panel.trim_last_slices.setValue(11)
@@ -207,6 +235,40 @@ def test_recent_project_opens_saved_sources_without_prompt(qtbot, monkeypatch, t
     assert load_project_state(project_root) is not None
 
 
+def test_project_set_selector_loads_individual_dataset_entries(qtbot, monkeypatch, tmp_path) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    entries = [
+        DatasetProjectCandidate(
+            name="sample_a",
+            root=tmp_path / "sample_a",
+            channel_dirs={"green": tmp_path / "sample_a", "red": tmp_path / "sample_a"},
+        ),
+        DatasetProjectCandidate(
+            name="sample_b",
+            root=tmp_path / "sample_b",
+            channel_dirs={"green": tmp_path / "sample_b", "red": tmp_path / "sample_b"},
+        ),
+    ]
+    load_calls: list[Path] = []
+
+    def _start(root, **_kwargs):
+        load_calls.append(Path(root))
+
+    monkeypatch.setattr(window, "_start_dataset_load", _start)
+
+    window._set_project_set(tmp_path, entries, selected_index=0)
+
+    assert not window._project_set_bar.isHidden()
+    assert window._project_set_combo.count() == 2
+    assert load_calls == [tmp_path / "sample_a"]
+
+    window._project_set_combo.setCurrentIndex(1)
+
+    assert load_calls == [tmp_path / "sample_a", tmp_path / "sample_b"]
+    assert window._project_set_index == 1
+
+
 def test_main_window_opacity_change_skips_metrics_refresh(qtbot, monkeypatch) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
@@ -229,13 +291,124 @@ def test_main_window_trim_change_reuploads_scene_channels(qtbot, monkeypatch) ->
     window.visual_dataset = dataset
 
     push_calls: list[bool] = []
+    refresh_calls: list[str] = []
     monkeypatch.setattr(window.scene, "apply_render_config", lambda _cfg: None)
-    monkeypatch.setattr(window, "_refresh_metrics", lambda: None)
+    monkeypatch.setattr(window, "_refresh_metrics", lambda: refresh_calls.append("metrics"))
     monkeypatch.setattr(window, "_push_scene_channels", lambda green_only=False: push_calls.append(bool(green_only)))
 
     window._on_render_config_changed(replace(window.current_render, trim_first_slices=1))
 
     assert push_calls == [False]
+    assert refresh_calls == ["metrics"]
+
+
+def test_main_window_metrics_cache_key_includes_render_trim(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    base_key = window._metrics_cache_key_for_render(
+        replace(window.current_render, trim_first_slices=0, trim_last_slices=0)
+    )
+    trimmed_key = window._metrics_cache_key_for_render(
+        replace(window.current_render, trim_first_slices=1, trim_last_slices=0)
+    )
+
+    assert base_key != trimmed_key
+
+
+def test_enhancement_method_is_recorded_only_after_success(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.processed_dataset = _sample_dataset()
+
+    captured: dict[str, object] = {}
+
+    def _capture_task(**kwargs):
+        captured.update(kwargs)
+
+    success_methods: list[str | None] = []
+    monkeypatch.setattr(window, "_start_background_task", _capture_task)
+    monkeypatch.setattr(
+        window,
+        "_on_enhance_microglia_success",
+        lambda _result: success_methods.append(window._current_microglia_enhancement_method),
+    )
+
+    window._on_enhance_microglia_requested()
+
+    assert window._current_microglia_enhancement_method is None
+
+    on_success = captured["on_success"]
+    assert callable(on_success)
+    on_success(_sample_dataset())
+
+    assert success_methods == [window.controls.current_microglia_enhancement_method()]
+    assert window._current_microglia_enhancement_method == window.controls.current_microglia_enhancement_method()
+
+
+def test_auto_load_enhancement_method_is_recorded_only_after_success(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.processed_dataset = _sample_dataset()
+    window.controls.auto_enhance_on_load.setChecked(True)
+    window.controls.auto_wipe_on_load.setChecked(False)
+
+    captured: dict[str, object] = {}
+
+    def _capture_task(**kwargs):
+        captured.update(kwargs)
+
+    success_methods: list[str | None] = []
+    monkeypatch.setattr(window, "_start_background_task", _capture_task)
+    monkeypatch.setattr(
+        window,
+        "_on_wipe_specks_success",
+        lambda _result: success_methods.append(window._current_microglia_enhancement_method),
+    )
+
+    window._run_auto_load_pipeline()
+
+    assert window._current_microglia_enhancement_method is None
+
+    on_success = captured["on_success"]
+    assert callable(on_success)
+    on_success(_sample_dataset())
+
+    assert success_methods == [window.controls.current_microglia_enhancement_method()]
+    assert window._current_microglia_enhancement_method == window.controls.current_microglia_enhancement_method()
+
+
+def test_extended_analytics_export_includes_microglia_cells(qtbot, monkeypatch, tmp_path) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.latest_microglia_analysis = MicrogliaAnalysisResult(
+        cells=[_analysis_cell()],
+        analyzed_cell_count=1,
+    )
+
+    exports: dict[str, list[dict[str, object]]] = {}
+
+    def _capture_export(rows, file_path):
+        exports[Path(file_path).name] = list(rows)
+        return Path(file_path)
+
+    monkeypatch.setattr("nvap.ui.main_window.export_metrics_csv", _capture_export)
+
+    written = window._export_extended_analytics(tmp_path / "metrics.csv")
+
+    assert [path.name for path in written] == [
+        "metrics_provenance.csv",
+        "metrics_microglia.csv",
+        "metrics_neurovascular.csv",
+    ]
+    assert exports["metrics_microglia.csv"][0]["component_id"] == 1
+    assert any(
+        row["metric"] == "mean_cell_to_vessel_um"
+        for row in exports["metrics_neurovascular.csv"]
+    )
+    # Provenance records the settings that produced the numbers.
+    prov = {row["setting"]: row["value"] for row in exports["metrics_provenance.csv"]}
+    assert "threshold_green" in prov and "exported_at" in prov
 
 
 def test_analytics_page_populates_microglia_table_and_syncs_selection(qtbot, monkeypatch) -> None:
@@ -266,6 +439,39 @@ def test_analytics_page_populates_microglia_table_and_syncs_selection(qtbot, mon
 
     assert window.controls.microglia_view_state() == (True, 1)
     assert window._analytics_cell_table.currentRow() == 0
+
+
+def test_analytics_microglia_populates_while_metrics_pending(qtbot, monkeypatch) -> None:
+    # Regression: the per-cell microglia cards used to sit on "--" whenever the
+    # slower whole-volume metrics were still pending (latest_metrics is None),
+    # e.g. right after a load or a Wipe Specks. The microglia analysis is
+    # independent of those metrics and must populate on its own.
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _analytics_dataset()
+
+    monkeypatch.setattr(window, "_start_microglia_refresh_task", lambda: None)
+    # Keep whole-volume metrics unresolved so latest_metrics stays None.
+    monkeypatch.setattr(window, "_refresh_metrics", lambda: None)
+
+    window.processed_dataset = dataset
+    window.visual_dataset = dataset
+    window.current_render = replace(
+        window.current_render,
+        threshold_green=0.5,
+        threshold_red=0.5,
+        trim_first_slices=0,
+        trim_last_slices=0,
+    )
+
+    assert window.latest_metrics is None
+    window._nav_to(2)
+
+    assert window.latest_microglia_analysis is not None
+    assert window.latest_microglia_analysis.analyzed_cell_count >= 1
+    assert window._analytics_cell_table.rowCount() >= 1
+    # Whole-volume card stays in a pending state rather than showing a stale value.
+    assert window._analytics_cards["volume"]._value.text() == "--"
 
 
 def test_run_microglia_segmentation_button_starts_refresh(qtbot, monkeypatch) -> None:
@@ -365,6 +571,9 @@ def test_microglia_analysis_debug_overlay_builds_for_selected_cell(qtbot, monkey
     assert overlay.branch_points_xyz.shape[0] > 0
     assert overlay.soma_points_xyz.shape[0] > 0
     assert overlay.tip_points_xyz.shape[0] > 0
+    assert overlay.tip_segments_xyz.shape[0] > 0
+    assert overlay.soma_segments_xyz.shape[0] > 0
+    assert overlay.cell_segments_xyz.shape[0] > 0
 
 
 def test_microglia_analysis_debug_overlay_respects_layer_toggles(qtbot, monkeypatch) -> None:
@@ -391,6 +600,7 @@ def test_microglia_analysis_debug_overlay_respects_layer_toggles(qtbot, monkeypa
     window.controls.microglia_index.blockSignals(True)
     window.controls.microglia_debug_voxels.blockSignals(True)
     window.controls.microglia_debug_tips.blockSignals(True)
+    window.controls.microglia_debug_soma_distance.blockSignals(True)
     window.controls.microglia_debug_cell_distance.blockSignals(True)
     try:
         window.controls.microglia_analysis_debug.setChecked(True)
@@ -398,6 +608,7 @@ def test_microglia_analysis_debug_overlay_respects_layer_toggles(qtbot, monkeypa
         window.controls.microglia_index.setValue(1)
         window.controls.microglia_debug_voxels.setChecked(False)
         window.controls.microglia_debug_tips.setChecked(False)
+        window.controls.microglia_debug_soma_distance.setChecked(False)
         window.controls.microglia_debug_cell_distance.setChecked(False)
     finally:
         window.controls.microglia_analysis_debug.blockSignals(False)
@@ -405,6 +616,7 @@ def test_microglia_analysis_debug_overlay_respects_layer_toggles(qtbot, monkeypa
         window.controls.microglia_index.blockSignals(False)
         window.controls.microglia_debug_voxels.blockSignals(False)
         window.controls.microglia_debug_tips.blockSignals(False)
+        window.controls.microglia_debug_soma_distance.blockSignals(False)
         window.controls.microglia_debug_cell_distance.blockSignals(False)
 
     window._refresh_microglia_analysis_debug()
@@ -414,6 +626,7 @@ def test_microglia_analysis_debug_overlay_respects_layer_toggles(qtbot, monkeypa
     assert overlay is not None
     assert overlay.voxel_points_xyz.shape[0] == 0
     assert overlay.tip_points_xyz.shape[0] == 0
+    assert overlay.soma_segments_xyz.shape[0] == 0
     assert overlay.cell_segments_xyz.shape[0] == 0
     assert overlay.branch_points_xyz.shape[0] > 0
     assert overlay.soma_points_xyz.shape[0] > 0

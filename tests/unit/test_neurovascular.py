@@ -27,6 +27,7 @@ def _cell(cid: int, cell_d: float | None, soma_d: float | None, tip_d: float | N
         nearest_tip_to_vessel_um=tip_d,
         nearest_cell_to_vessel_um=cell_d,
         soma_to_vessel_um=soma_d,
+        soma_centroid_to_vessel_um=None if soma_d is None else soma_d + 1.0,
     )
 
 
@@ -49,8 +50,24 @@ def test_perivascular_fractions_and_tip_leading():
     assert fr[10.0] == 2 / 3
     assert fr[50.0] == 1.0
     assert assoc.min_cell_to_vessel_um == 2.0
-    # Cells 1 and 3 have tip closer-or-equal than cell distance: 2/3.
+    assert assoc.mean_soma_centroid_to_vessel_um > assoc.mean_soma_to_vessel_um
+    # Tip-leading compares tip vs soma: cells 1 (1<=6) and 3 (28<=32) lead,
+    # cell 2 (12>9) does not -> 2/3.
     assert abs(assoc.tip_leading_fraction - 2 / 3) < 1e-9
+
+
+def test_tip_leading_uses_soma_not_whole_cell_minimum():
+    # nearest_cell_to_vessel_um is the minimum over ALL cell voxels (the tips are
+    # a subset of them), so comparing the tip against it would collapse this
+    # fraction to ~0 by construction. The reference must be the soma: here the tip
+    # (5) sits between the whole-cell minimum (1) and the soma (10), so it leads
+    # the soma even though it is farther than the cell minimum.
+    cells = [_cell(1, cell_d=1.0, soma_d=10.0, tip_d=5.0)]
+    analysis = MicrogliaAnalysisResult(cells=cells, analyzed_cell_count=len(cells))
+
+    assoc = summarize_neurovascular_association(analysis)
+
+    assert assoc.tip_leading_fraction == 1.0
 
 
 def test_empty_analysis_is_safe():

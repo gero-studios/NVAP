@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import imageio.v3 as iio
 import numpy as np
 
 from nvap.config.types import DEFAULT_SPACING, ChannelVolume, DatasetVolume, VoxelSpacing
+from nvap.preprocess._executor import get_executor
+from nvap.runtime_optimization import configured_cpu_workers
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,21 @@ _COMBINED_RG_CACHE_MAX = 8
 _combined_rg_cache = OrderedDict()
 _COMBINED_RG_PRESENT_CACHE_MAX = 16
 _combined_rg_present_cache = OrderedDict()
+
+
+def _resolve_io_workers(item_count: int) -> int:
+    count = int(max(0, item_count))
+    if count < 4:
+        return 1
+    raw = os.environ.get("NVAP_IO_WORKERS", "").strip()
+    if raw:
+        try:
+            requested = int(raw)
+            if requested > 0:
+                return max(1, min(requested, count))
+        except ValueError:
+            logger.warning("Invalid NVAP_IO_WORKERS=%r. Falling back to auto.", raw)
+    return max(1, min(configured_cpu_workers(os.cpu_count() or 1), count))
 
 
 @dataclass(frozen=True)
@@ -73,6 +91,15 @@ class DatasetStackStats:
     @property
     def total_missing_slices(self) -> int:
         return self.green.missing_count + self.red.missing_count
+
+
+@dataclass(frozen=True)
+class DatasetProjectCandidate:
+    """A loadable dataset found inside a larger project-set folder."""
+
+    name: str
+    root: Path
+    channel_dirs: dict[str, Path]
 
 
 def _candidate_segmented_roots(input_root: Path) -> list[Path]:
@@ -215,16 +242,37 @@ def _list_combined_rg_files(channel_source: Path) -> list[tuple[int, Path]]:
     if cached is not None:
         return list(cached)
 
-    pairs: list[tuple[int, Path]] = []
+    candidates: list[tuple[int, Path]] = []
     for file_path in files:
         match = COMBINED_FILE_PATTERN.search(file_path.name)
         if not match:
             continue
-        image = iio.imread(file_path)
-        if not _is_red_green_only_image(image):
-            continue
         z_index = int(match.group("z"))
-        pairs.append((z_index, file_path))
+        candidates.append((z_index, file_path))
+
+    def _validate(item: tuple[int, Path]) -> tuple[int, Path] | None:
+        z_index, file_path = item
+        try:
+            image = iio.imread(file_path)
+        except Exception:
+            return None
+        if not _is_red_green_only_image(image):
+            return None
+        return z_index, file_path
+
+    workers = _resolve_io_workers(len(candidates))
+    if workers > 1:
+        logger.info(
+            "Validating combined red/green slices in parallel: files=%d workers=%d",
+            len(candidates),
+            workers,
+        )
+        with get_executor(workers, "nvap-io") as pool:
+            validated = list(pool.map(_validate, candidates))
+    else:
+        validated = [_validate(item) for item in candidates]
+
+    pairs = [item for item in validated if item is not None]
     pairs.sort(key=lambda item: item[0])
 
     while len(_combined_rg_cache) >= _COMBINED_RG_CACHE_MAX:
@@ -401,10 +449,25 @@ def _load_channel(
     try:
         z_and_files = _list_channel_files(channel_source, channel_name)
         z_indices = [z for z, _ in z_and_files]
-        slices = []
-        for _, file_path in z_and_files:
+
+        def _read_slice(item: tuple[int, Path]) -> tuple[int, np.ndarray]:
+            z, file_path = item
             img = iio.imread(file_path)
-            slices.append(_extract_and_normalize_plane(img, channel_name))
+            return z, _extract_and_normalize_plane(img, channel_name)
+
+        workers = _resolve_io_workers(len(z_and_files))
+        if workers > 1:
+            logger.info(
+                "Loading channel '%s' slices in parallel: files=%d workers=%d",
+                channel_name,
+                len(z_and_files),
+                workers,
+            )
+            with get_executor(workers, "nvap-io") as pool:
+                loaded = list(pool.map(_read_slice, z_and_files))
+        else:
+            loaded = [_read_slice(item) for item in z_and_files]
+        slices = [plane for _, plane in loaded]
         volume = np.stack(slices, axis=0).astype(np.float32, copy=False)
     except FileNotFoundError:
         stack_channel = _load_channel_from_single_stack(channel_name, channel_source)
@@ -495,12 +558,29 @@ def _load_combined_channels(
         # Repeated z-indices usually indicate channel-tagged c1/c2 files.
         return None
 
-    green_slices: list[np.ndarray] = []
-    red_slices: list[np.ndarray] = []
-    for _, file_path in z_and_files:
+    def _read_combined_slice(item: tuple[int, Path]) -> tuple[int, np.ndarray, np.ndarray]:
+        z, file_path = item
         img = iio.imread(file_path)
-        green_slices.append(_extract_and_normalize_plane(img, "green"))
-        red_slices.append(_extract_and_normalize_plane(img, "red"))
+        return (
+            z,
+            _extract_and_normalize_plane(img, "green"),
+            _extract_and_normalize_plane(img, "red"),
+        )
+
+    workers = _resolve_io_workers(len(z_and_files))
+    if workers > 1:
+        logger.info(
+            "Loading combined red/green slices in parallel: files=%d workers=%d",
+            len(z_and_files),
+            workers,
+        )
+        with get_executor(workers, "nvap-io") as pool:
+            loaded = list(pool.map(_read_combined_slice, z_and_files))
+    else:
+        loaded = [_read_combined_slice(item) for item in z_and_files]
+
+    green_slices = [green for _, green, _ in loaded]
+    red_slices = [red for _, _, red in loaded]
 
     green_volume = np.stack(green_slices, axis=0).astype(np.float32, copy=False)
     red_volume = np.stack(red_slices, axis=0).astype(np.float32, copy=False)
@@ -708,3 +788,79 @@ def inspect_dataset_stats(
         stats.total_full_voxels,
     )
     return stats
+
+
+def discover_dataset_projects(
+    input_root: str | Path,
+    *,
+    max_depth: int = 2,
+) -> list[DatasetProjectCandidate]:
+    """Find loadable dataset folders under ``input_root``.
+
+    The normal loader opens one dataset root. A project set is a parent folder
+    whose children are each normal dataset roots, e.g. ten image-series folders.
+    Discovery is intentionally shallow and stops descending once a loadable
+    dataset is found so nested ``Segmented``/``Green``/``Red`` folders do not
+    appear as duplicate projects.
+    """
+    root = Path(input_root).resolve()
+    if root.is_file():
+        try:
+            channel_dirs = resolve_channel_dirs(root)
+        except Exception:
+            return []
+        return [
+            DatasetProjectCandidate(
+                name=root.stem,
+                root=root,
+                channel_dirs=channel_dirs,
+            )
+        ]
+    if not root.exists() or not root.is_dir():
+        return []
+
+    found: list[DatasetProjectCandidate] = []
+    seen: set[Path] = set()
+
+    def _add_candidate(path: Path, channel_dirs: dict[str, Path]) -> None:
+        resolved = path.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        found.append(
+            DatasetProjectCandidate(
+                name=resolved.name,
+                root=resolved,
+                channel_dirs=channel_dirs,
+            )
+        )
+
+    def _walk(path: Path, depth: int) -> None:
+        try:
+            channel_dirs = resolve_channel_dirs(path)
+        except Exception:
+            channel_dirs = None
+        if channel_dirs is not None:
+            _add_candidate(path, channel_dirs)
+            return
+        if depth >= int(max_depth):
+            return
+        try:
+            children = [child for child in path.iterdir() if child.is_dir()]
+        except OSError:
+            return
+        for child in sorted(children, key=lambda p: p.name.lower()):
+            _walk(child, depth + 1)
+
+    for child in sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
+        _walk(child, 1)
+
+    if not found:
+        try:
+            channel_dirs = resolve_channel_dirs(root)
+        except Exception:
+            channel_dirs = None
+        if channel_dirs is not None:
+            _add_candidate(root, channel_dirs)
+
+    return found

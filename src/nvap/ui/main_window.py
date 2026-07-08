@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 import logging
+import os
 import threading
 import time
 import traceback
@@ -16,6 +18,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -35,8 +38,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from nvap.analysis.microglia_analysis import MicrogliaAnalysisResult, analyze_microglia_cells
-from nvap.analysis.microglia_analysis import build_microglia_cell_debug
+from nvap.analysis.microglia_analysis import (
+    MicrogliaAnalysisResult,
+    analyze_microglia_cells,
+    build_microglia_cell_debug,
+    microglia_analysis_to_csv_rows,
+)
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
 from nvap.analysis.vascular_analysis import (
     analyze_vasculature,
@@ -50,8 +57,12 @@ from nvap.cache.processed_cache import (
     build_dataset_signature,
     build_processed_cache_key,
     has_processed_cache,
+    load_enhanced_green,
     load_processed_dataset,
+    load_processed_thresholds,
+    save_enhanced_dataset,
     save_processed_dataset,
+    save_processed_metadata,
 )
 from nvap.config.types import (
     ChannelVolume,
@@ -66,11 +77,15 @@ from nvap.config.types import (
 )
 from nvap.export.exporters import export_metrics_csv
 from nvap.export.mesh_export import export_dataset_meshes, reconstruct_combined_mesh
-from nvap.io.stack_loader import inspect_dataset_stats, load_dataset, resolve_channel_dirs
+from nvap.io.stack_loader import (
+    DatasetProjectCandidate,
+    discover_dataset_projects,
+    inspect_dataset_stats,
+    load_dataset,
+    resolve_channel_dirs,
+)
 from nvap.pipeline import (
     apply_psf_to_dataset,
-    default_green_threshold,
-    default_threshold,
     fill_and_sync_dataset,
     prepare_dataset_for_mesh,
 )
@@ -79,7 +94,11 @@ from nvap.analysis.microglia_components import (
     filter_components_by_preferred_voxel_floor,
     isolate_component,
 )
-from nvap.preprocess.enhancement import enhance_microglia_background, preprocess_dataset
+from nvap.preprocess.enhancement import (
+    enhance_microglia_background,
+    preprocess_dataset,
+    wipe_small_specks,
+)
 from nvap.plugins.registry import discover_plugins
 from nvap.render.vtk_scene import MicrogliaDebugOverlay, VTKScene
 from nvap.ui.control_panel import ControlPanel
@@ -89,6 +108,7 @@ from nvap.ui.home_page import HomePage
 from nvap.ui.icons import icon, icon_pixmap
 from nvap.ui.metrics_panel import MetricsPanel
 from nvap.ui.services.recent_projects import RecentProjectsStore
+from nvap.samples import register_bundled_samples
 from nvap.ui.services.project_files import (
     load_project_state,
     project_channel_sources,
@@ -98,6 +118,11 @@ from nvap.ui.services.system_status import SystemStatus, gpu_status, memory_stat
 from nvap.ui.sidebar_pages import SettingsPage
 
 logger = logging.getLogger(__name__)
+_METRICS_BACKGROUND_MIN_VOXELS = 20_000_000
+
+# Default render/analysis thresholds chosen for the microscopy workbench.
+_DEFAULT_GREEN_THRESHOLD = 0.80
+_DEFAULT_RED_THRESHOLD = 0.60
 
 
 def _green_no_psf_mode(_config: PreprocessConfig) -> bool:
@@ -112,6 +137,7 @@ class _LoadTaskResult:
     visual_dataset: DatasetVolume
     threshold_green: float
     threshold_red: float
+    enhancement_method: str | None = None
 
 
 @dataclass
@@ -122,6 +148,73 @@ class _MicrogliaComponentsTaskResult:
     threshold: float
     branch_sensitivity: float
     shape: tuple[int, int, int]
+
+
+@dataclass
+class _MetricsTaskResult:
+    cache_key: tuple[int, float, float, int, int, float, float, float]
+    metrics: MetricsComputation
+    vascular_cache_key: tuple[float, int, int] | None = None
+    vascular_line: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProjectAnalyticsConfig:
+    render: RenderConfig
+    psf: PSFConfig
+    preprocess: PreprocessConfig
+    apply_enhancement: bool
+    enhancement_method: str
+    apply_wipe: bool
+    wipe_max_voxels: int
+    branch_sensitivity: float
+
+
+@dataclass(frozen=True)
+class _ProjectAnalyticsResult:
+    base_path: Path
+    files: list[Path]
+    sample_count: int
+    row_count: int
+
+
+def _vascular_cache_key_for(render: RenderConfig) -> tuple[float, int, int]:
+    return (
+        float(render.threshold_red),
+        int(render.trim_first_slices),
+        int(render.trim_last_slices),
+    )
+
+
+def _compute_vascular_summary_line(
+    dataset: DatasetVolume | None,
+    render: RenderConfig,
+) -> str | None:
+    """Heavy vascular morphometry summary. MUST run off the UI thread.
+
+    analyze_vasculature skeletonizes the full-resolution red volume and can take
+    well over a minute on large stacks; calling it on the Qt main thread freezes
+    the window (Windows AppHang) the instant the user pans. Compute it in a
+    worker and cache the formatted line for the UI to read.
+    """
+    if dataset is None:
+        return None
+    try:
+        vascular = analyze_vasculature(
+            dataset.red.data,
+            threshold=float(render.threshold_red),
+            spacing=dataset.red.spacing,
+            render=render,
+        )
+    except Exception:  # pragma: no cover - defensive background path
+        return None
+    return (
+        f"vasculature: vol_fraction={vascular.vessel_volume_fraction:.4f}, "
+        f"length_density={vascular.length_density_mm_per_mm3:.2f} mm/mm3, "
+        f"mean_diameter_um={vascular.mean_diameter_um:.2f}, "
+        f"junctions={vascular.junction_count}, "
+        f"tortuosity={vascular.mean_tortuosity:.3f}"
+    )
 
 
 class _AnalyticsMetricCard(QFrame):
@@ -187,20 +280,6 @@ class _FunctionThread(QThread):
 
 
 class MainWindow(QMainWindow):
-    @staticmethod
-    def _build_process_task_result(
-        processed_dataset: DatasetVolume,
-        preprocess_config: PreprocessConfig,
-    ) -> _LoadTaskResult:
-        return _LoadTaskResult(
-            synced_dataset=processed_dataset,
-            raw_dataset=processed_dataset,
-            processed_dataset=processed_dataset,
-            visual_dataset=processed_dataset,
-            threshold_green=default_green_threshold(processed_dataset.green.data),
-            threshold_red=default_threshold(processed_dataset.red.data),
-        )
-
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("NVAP — NeuroVascular Analytics Program")
@@ -215,18 +294,36 @@ class MainWindow(QMainWindow):
         self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.controls_scroll.setWidget(self.controls)
 
+        self._metrics_panel = MetricsPanel()
+
+        self._viewport_shell = QFrame(self)
+        self._viewport_shell.setObjectName("viewportShell")
+        viewport_layout = QVBoxLayout(self._viewport_shell)
+        viewport_layout.setContentsMargins(0, 0, 0, 0)
+        viewport_layout.setSpacing(0)
+        self._project_set_bar = self._build_project_set_bar()
+        viewport_layout.addWidget(self._project_set_bar)
+        viewport_layout.addWidget(self.scene.widget())
+
         # Workspace splitter: inspector | VTK viewport | metrics
         self._workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._workspace_splitter.setObjectName("workspaceSplitter")
         self._workspace_splitter.addWidget(self.controls_scroll)
-        self._workspace_splitter.addWidget(self.scene.widget())
+        self._workspace_splitter.addWidget(self._viewport_shell)
+        self._workspace_splitter.addWidget(self._metrics_panel)
         self._workspace_splitter.setStretchFactor(0, 0)
         self._workspace_splitter.setStretchFactor(1, 1)
+        self._workspace_splitter.setStretchFactor(2, 0)
+        self._workspace_splitter.setSizes([320, 980, 260])
 
         # ── Project store + pages ────────────────────────────────────────
         self._project_store = RecentProjectsStore()
+        try:
+            register_bundled_samples(self._project_store)
+        except Exception as exc:  # pragma: no cover - sample registration is best-effort
+            logger.warning("Bundled sample registration failed: %s", exc)
         self._home_page = HomePage(self._project_store)
         self._settings_page = SettingsPage()
-        self._metrics_panel = MetricsPanel()
         self._analytics_page = self._build_analytics_placeholder()
 
         self._page_stack = QStackedWidget()
@@ -283,14 +380,22 @@ class MainWindow(QMainWindow):
         self.latest_microglia_analysis: MicrogliaAnalysisResult | None = None
         self._metrics_revision = 0
         self._microglia_analysis_revision = 0
-        self._metrics_cache_key: tuple[int, float, float, float, float, float] | None = None
-        self._vascular_summary_cache: tuple[float, str | None] | None = None
+        self._metrics_cache_key: tuple[int, float, float, int, int, float, float, float] | None = None
+        self._metrics_thread: _FunctionThread | None = None
+        self._metrics_task_key: tuple[int, float, float, int, int, float, float, float] | None = None
+        self._metrics_refresh_pending = False
+        self._vascular_summary_cache: tuple[tuple[float, int, int], str | None] | None = None
         self._microglia_analysis_cache_key: tuple[int, tuple[int, int, int], float, float, int, int, float, float, float, float] | None = None
         self.dataset_root: Path | None = None
         self._dataset_signature: str | None = None
         self._current_channel_sources: dict[str, str] | None = None
         self._current_load_mode = "folder"
+        self._project_set_root: Path | None = None
+        self._project_set_entries: list[DatasetProjectCandidate] = []
+        self._project_set_index = -1
         self._last_processed_cache_key: str | None = None
+        self._current_microglia_enhancement_method: str | None = None
+        self._current_speck_wipe_applied = False
         self._busy_dialog: QProgressDialog | None = None
         self._busy_start = 0.0
         self._busy_base_message = ""
@@ -343,7 +448,11 @@ class MainWindow(QMainWindow):
             self._on_run_microglia_analysis_requested
         )
         self.controls.enhance_microglia_requested.connect(self._on_enhance_microglia_requested)
+        self.controls.wipe_specks_requested.connect(self._on_wipe_specks_requested)
         self.controls.export_metrics_requested.connect(self._on_export_metrics_requested)
+        self.controls.export_project_analytics_requested.connect(
+            self._on_export_project_analytics_requested
+        )
         self.controls.export_snapshot_requested.connect(self._on_export_snapshot_requested)
         self.controls.export_mesh_requested.connect(self._on_export_mesh_requested)
 
@@ -357,9 +466,16 @@ class MainWindow(QMainWindow):
         self._refresh_section_state()
 
     def closeEvent(self, event) -> None:
+        try:
+            self.controls.force_apply_pending_changes()
+        except Exception:
+            pass
         if self._active_thread is not None and self._active_thread.isRunning():
             self._log_info("Waiting briefly for active background task to finish before close.")
             self._active_thread.wait(2000)
+        if self._metrics_thread is not None and self._metrics_thread.isRunning():
+            self._log_info("Waiting briefly for metrics task to finish before close.")
+            self._metrics_thread.wait(1000)
         logging.getLogger("nvap").removeHandler(self._log_handler)
         # Clean up VTK resources to avoid GPU/memory leaks.
         try:
@@ -534,12 +650,47 @@ class MainWindow(QMainWindow):
         lo.addLayout(bottom_lo)
         return sidebar
 
+    def _build_project_set_bar(self) -> QFrame:
+        bar = QFrame(self)
+        bar.setObjectName("projectSetBar")
+        bar.setVisible(False)
+        lo = QHBoxLayout(bar)
+        lo.setContentsMargins(12, 8, 12, 8)
+        lo.setSpacing(8)
+
+        label = QLabel("Project set")
+        label.setObjectName("metricLabel")
+        lo.addWidget(label)
+
+        self._project_set_combo = QComboBox(bar)
+        self._project_set_combo.setObjectName("projectSetCombo")
+        self._project_set_combo.setMinimumWidth(260)
+        self._project_set_combo.currentIndexChanged.connect(self._on_project_set_combo_changed)
+        lo.addWidget(self._project_set_combo, 1)
+
+        self._project_set_count_label = QLabel("")
+        self._project_set_count_label.setObjectName("metricLabel")
+        lo.addWidget(self._project_set_count_label)
+
+        prev_btn = QPushButton("Previous")
+        prev_btn.setObjectName("secondaryActionHome")
+        prev_btn.clicked.connect(lambda: self._move_project_set_selection(-1))
+        lo.addWidget(prev_btn)
+        self._project_set_prev_btn = prev_btn
+
+        next_btn = QPushButton("Next")
+        next_btn.setObjectName("secondaryActionHome")
+        next_btn.clicked.connect(lambda: self._move_project_set_selection(1))
+        lo.addWidget(next_btn)
+        self._project_set_next_btn = next_btn
+        return bar
+
     def _build_analytics_placeholder(self) -> QWidget:
         """Analytics overview for dataset and per-cell microglia metrics."""
         w = QWidget()
         w.setObjectName("sectionPage")
         lo = QVBoxLayout(w)
-        lo.setContentsMargins(56, 48, 56, 48)
+        lo.setContentsMargins(40, 36, 40, 40)
         lo.setSpacing(0)
 
         eyebrow = QLabel("ANALYTICS")
@@ -554,11 +705,26 @@ class MainWindow(QMainWindow):
         intro.setObjectName("pageIntro")
         intro.setWordWrap(True)
         lo.addWidget(intro)
-        lo.addSpacing(28)
+        lo.addSpacing(20)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(10)
+        self._project_analytics_btn = QPushButton("Apply Current Settings to Project Set + Export CSV")
+        self._project_analytics_btn.setObjectName("primaryAction")
+        self._project_analytics_btn.setIcon(icon("bar-chart", ICON_SM, COLOR.text_inverse))
+        self._project_analytics_btn.setToolTip(
+            "Apply this sample's thresholds, clean, and wipe settings to every sample "
+            "in the project set, then export individual and cumulative analytics."
+        )
+        self._project_analytics_btn.clicked.connect(self._on_export_project_analytics_requested)
+        action_row.addWidget(self._project_analytics_btn)
+        action_row.addStretch(1)
+        lo.addLayout(action_row)
+        lo.addSpacing(18)
 
         card_grid = QGridLayout()
-        card_grid.setHorizontalSpacing(16)
-        card_grid.setVerticalSpacing(16)
+        card_grid.setHorizontalSpacing(12)
+        card_grid.setVerticalSpacing(12)
         self._analytics_cards: dict[str, _AnalyticsMetricCard] = {
             "volume": _AnalyticsMetricCard("Green volume", "--", "Thresholded green channel."),
             "overlap": _AnalyticsMetricCard("Channel overlap", "--", "Green/red shared voxels."),
@@ -571,7 +737,7 @@ class MainWindow(QMainWindow):
 
         section = QLabel("MICROGLIA ANALYSIS")
         section.setObjectName("pageEyebrow")
-        lo.addSpacing(28)
+        lo.addSpacing(24)
         lo.addWidget(section)
 
         self._analytics_microglia_hint = QLabel(
@@ -580,32 +746,38 @@ class MainWindow(QMainWindow):
         self._analytics_microglia_hint.setObjectName("pageIntro")
         self._analytics_microglia_hint.setWordWrap(True)
         lo.addWidget(self._analytics_microglia_hint)
-        lo.addSpacing(20)
+        lo.addSpacing(16)
 
         analysis_grid = QGridLayout()
-        analysis_grid.setHorizontalSpacing(16)
-        analysis_grid.setVerticalSpacing(16)
+        analysis_grid.setHorizontalSpacing(12)
+        analysis_grid.setVerticalSpacing(12)
         self._analytics_microglia_cards: dict[str, _AnalyticsMetricCard] = {
             "cells": _AnalyticsMetricCard("Cells analyzed", "--", "Visible separated microglia."),
             "branches": _AnalyticsMetricCard("Avg branches", "--", "Branch tips per visible cell."),
             "soma": _AnalyticsMetricCard("Avg soma volume", "--", "Non-branched soma body volume."),
+            "soma_shape": _AnalyticsMetricCard("Avg soma roundness", "--", "Soma shape: 1.0 is round."),
             "distance": _AnalyticsMetricCard("Closest vessel distance", "--", "Shortest cell-to-vessel distance."),
+            "tip_vessels": _AnalyticsMetricCard("Tips near vessels", "--", "Cells whose tips are near multiple vessel components."),
         }
         for idx, card in enumerate(self._analytics_microglia_cards.values()):
             analysis_grid.addWidget(card, idx // 2, idx % 2)
         lo.addLayout(analysis_grid)
-        lo.addSpacing(20)
+        lo.addSpacing(16)
 
-        self._analytics_cell_table = QTableWidget(0, 6)
+        self._analytics_cell_table = QTableWidget(0, 10)
         self._analytics_cell_table.setObjectName("analyticsCellTable")
         self._analytics_cell_table.setHorizontalHeaderLabels(
             [
                 "Cell",
                 "Branches",
+                "Branch tortuosity",
                 "Soma (um^3)",
+                "Soma diameter (um)",
+                "Soma roundness",
                 "Tip -> Vessel (um)",
                 "Cell -> Vessel (um)",
                 "Soma -> Vessel (um)",
+                "Soma center -> Vessel (um)",
             ]
         )
         self._analytics_cell_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -623,34 +795,50 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_analytics_cards"):
             return
 
-        for card in self._analytics_cards.values():
-            card.set_value("--", "Load a dataset to populate.")
-
+        # Whole-volume cards (green volume, overlap, component counts) come from
+        # the slower background metrics task. Show a clear pending state while it
+        # runs rather than leaving stale numbers.
         if self.latest_metrics is None:
-            return
+            pending = (
+                "Computing metrics…"
+                if self.processed_dataset is not None
+                else "Load a dataset to populate."
+            )
+            for card in self._analytics_cards.values():
+                card.set_value("--", pending)
+        else:
+            for card in self._analytics_cards.values():
+                card.set_value("--", "Load a dataset to populate.")
+            by_channel = {item.channel.lower(): item for item in self.latest_metrics.channel_results}
+            green = by_channel.get("green")
+            red = by_channel.get("red")
+            if green is not None:
+                self._analytics_cards["volume"].set_value(
+                    f"{green.volume_um3:,.1f}",
+                    f"{green.voxel_count:,} voxels",
+                )
+                self._analytics_cards["green_components"].set_value(
+                    f"{green.component_count:,}",
+                    f"largest {green.largest_component_voxels:,} voxels",
+                )
+            if red is not None:
+                self._analytics_cards["red_components"].set_value(
+                    f"{red.component_count:,}",
+                    f"largest {red.largest_component_voxels:,} voxels",
+                )
+            self._analytics_cards["overlap"].set_value(
+                f"{self.latest_metrics.overlap_volume_um3:,.1f}",
+                f"{self.latest_metrics.overlap_voxel_count:,} voxels",
+            )
 
-        by_channel = {item.channel.lower(): item for item in self.latest_metrics.channel_results}
-        green = by_channel.get("green")
-        red = by_channel.get("red")
-        if green is not None:
-            self._analytics_cards["volume"].set_value(
-                f"{green.volume_um3:,.1f}",
-                f"{green.voxel_count:,} voxels",
-            )
-            self._analytics_cards["green_components"].set_value(
-                f"{green.component_count:,}",
-                f"largest {green.largest_component_voxels:,} voxels",
-            )
-        if red is not None:
-            self._analytics_cards["red_components"].set_value(
-                f"{red.component_count:,}",
-                f"largest {red.largest_component_voxels:,} voxels",
-            )
-        self._analytics_cards["overlap"].set_value(
-            f"{self.latest_metrics.overlap_volume_um3:,.1f}",
-            f"{self.latest_metrics.overlap_voxel_count:,} voxels",
-        )
-        if self._page_stack.currentIndex() == 2 or self.latest_microglia_analysis is not None:
+        # Per-cell microglia analysis is independent of the whole-volume metrics
+        # above, so refresh it as soon as Analytics is open instead of gating it
+        # behind the (much slower) vascular morphometry. Previously this sat
+        # behind an early `return` when metrics were still pending, so the
+        # microglia cards showed "--" for minutes after a load or a Wipe Specks.
+        if self.visual_dataset is None:
+            self._clear_analytics_microglia_widgets("Load a dataset to populate.")
+        elif self._page_stack.currentIndex() == 2 or self.latest_microglia_analysis is not None:
             self._refresh_microglia_analysis()
         else:
             self._clear_analytics_microglia_widgets(
@@ -664,18 +852,30 @@ class MainWindow(QMainWindow):
 
         cache_key = self._microglia_analysis_cache_key_for_render(self.current_render)
         if self.latest_microglia_analysis is None or self._microglia_analysis_cache_key != cache_key:
-            labels, order, _sizes = self._ensure_microglia_components_current()
-            branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
-            self.latest_microglia_analysis = analyze_microglia_cells(
-                self.visual_dataset.green.data,
-                self.visual_dataset.red.data,
-                labels,
-                order,
-                spacing=self.visual_dataset.green.spacing,
-                render=self.current_render,
-                branch_sensitivity=branch_sensitivity,
+            # Runs synchronously and can take ~1 minute on large volumes; show a
+            # wait cursor + status so the UI doesn't look frozen or stuck on "--".
+            self._analytics_microglia_hint.setText(
+                "Analyzing visible microglia… this can take up to a minute on large volumes."
             )
-            self._microglia_analysis_cache_key = cache_key
+            self.statusBar().showMessage("Analyzing microglia cells…")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+            try:
+                labels, order, _sizes = self._ensure_microglia_components_current()
+                branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
+                self.latest_microglia_analysis = analyze_microglia_cells(
+                    self.visual_dataset.green.data,
+                    self.visual_dataset.red.data,
+                    labels,
+                    order,
+                    spacing=self.visual_dataset.green.spacing,
+                    render=self.current_render,
+                    branch_sensitivity=branch_sensitivity,
+                )
+                self._microglia_analysis_cache_key = cache_key
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.statusBar().showMessage("Microglia analysis updated.", 3000)
 
         self._set_analytics_microglia_result(self.latest_microglia_analysis)
 
@@ -725,11 +925,16 @@ class MainWindow(QMainWindow):
         self._analytics_microglia_cards["branches"].set_value(
             f"{analysis.mean_branch_count:,.2f}",
             f"Avg process branches per cell ({analysis.mean_tip_count:,.1f} tips, "
-            f"{analysis.mean_process_length_um:,.1f} um length).",
+            f"{analysis.mean_process_length_um:,.1f} um length, "
+            f"{analysis.mean_branch_tortuosity:,.2f} tortuosity).",
         )
         self._analytics_microglia_cards["soma"].set_value(
             f"{analysis.mean_soma_volume_um3:,.1f}",
-            "Average soma-body volume in um^3.",
+            f"Avg soma diameter {analysis.mean_soma_equivalent_diameter_um:,.1f} um.",
+        )
+        self._analytics_microglia_cards["soma_shape"].set_value(
+            f"{analysis.mean_soma_roundness:,.2f}",
+            "1.0 is rounder; lower values are elongated/rectangular.",
         )
         closest_distance = (
             "--"
@@ -740,16 +945,24 @@ class MainWindow(QMainWindow):
             closest_distance,
             "Shortest visible cell-to-vessel distance.",
         )
+        self._analytics_microglia_cards["tip_vessels"].set_value(
+            f"{analysis.cells_with_tips_near_multiple_vessels:,}",
+            "Cells with one or more tips within 5 um of multiple vessel components.",
+        )
 
         self._analytics_cell_table.setRowCount(int(len(analysis.cells)))
         for row, cell in enumerate(analysis.cells):
             values = [
                 str(row + 1),
                 str(cell.branch_count),
+                f"{cell.mean_branch_tortuosity:,.2f}",
                 f"{cell.soma_volume_um3:,.1f}",
+                f"{cell.soma_equivalent_diameter_um:,.1f}",
+                f"{cell.soma_roundness:,.2f}",
                 self._format_optional_analytics_value(cell.nearest_tip_to_vessel_um),
                 self._format_optional_analytics_value(cell.nearest_cell_to_vessel_um),
                 self._format_optional_analytics_value(cell.soma_to_vessel_um),
+                self._format_optional_analytics_value(cell.soma_centroid_to_vessel_um),
             ]
             for col, text in enumerate(values):
                 item = QTableWidgetItem(text)
@@ -804,11 +1017,13 @@ class MainWindow(QMainWindow):
 
         component_id = int(order[selected_index - 1])
         known_tip_distance = None
+        known_soma_distance = None
         known_cell_distance = None
         if self.latest_microglia_analysis is not None:
             for cell in self.latest_microglia_analysis.cells:
                 if int(cell.component_id) == component_id:
                     known_tip_distance = cell.nearest_tip_to_vessel_um
+                    known_soma_distance = cell.soma_to_vessel_um
                     known_cell_distance = cell.nearest_cell_to_vessel_um
                     break
 
@@ -821,6 +1036,7 @@ class MainWindow(QMainWindow):
             render=self.current_render,
             branch_sensitivity=float(self.controls.current_microglia_branch_sensitivity()),
             known_tip_distance_um=known_tip_distance,
+            known_soma_distance_um=known_soma_distance,
             known_cell_distance_um=known_cell_distance,
         )
         if debug is None:
@@ -880,6 +1096,16 @@ class MainWindow(QMainWindow):
                     source_offset_xyz=green_offset,
                 )
                 if "tip_distance" in debug_layers
+                else np.empty((0, 2, 3), dtype=np.float32)
+            ),
+            soma_segments_xyz=(
+                self._segment_zyx_to_world_xyz(
+                    debug.nearest_soma_segment_zyx,
+                    source_spacing=green_spacing,
+                    target_spacing=red_spacing,
+                    source_offset_xyz=green_offset,
+                )
+                if "soma_distance" in debug_layers
                 else np.empty((0, 2, 3), dtype=np.float32)
             ),
             cell_segments_xyz=(
@@ -991,6 +1217,80 @@ class MainWindow(QMainWindow):
             float(self.controls.current_microglia_branch_sensitivity()),
         )
 
+    def _clear_project_set(self) -> None:
+        self._project_set_root = None
+        self._project_set_entries = []
+        self._project_set_index = -1
+        if hasattr(self, "_project_set_combo"):
+            self._project_set_combo.blockSignals(True)
+            try:
+                self._project_set_combo.clear()
+            finally:
+                self._project_set_combo.blockSignals(False)
+        if hasattr(self, "_project_set_count_label"):
+            self._project_set_count_label.setText("")
+        if hasattr(self, "_project_set_bar"):
+            self._project_set_bar.setVisible(False)
+
+    def _set_project_set(
+        self,
+        root: Path,
+        entries: list[DatasetProjectCandidate],
+        *,
+        selected_index: int = 0,
+    ) -> None:
+        self._project_set_root = root.resolve()
+        self._project_set_entries = list(entries)
+        self._project_set_index = -1
+
+        self._project_set_combo.blockSignals(True)
+        try:
+            self._project_set_combo.clear()
+            for idx, entry in enumerate(self._project_set_entries):
+                self._project_set_combo.addItem(entry.name, idx)
+        finally:
+            self._project_set_combo.blockSignals(False)
+
+        self._project_set_bar.setVisible(bool(self._project_set_entries))
+        self._project_set_count_label.setText(f"{len(self._project_set_entries)} datasets")
+        self._load_project_set_entry(selected_index)
+
+    def _load_project_set_entry(self, index: int) -> None:
+        if not self._project_set_entries:
+            return
+        bounded = max(0, min(int(index), len(self._project_set_entries) - 1))
+        entry = self._project_set_entries[bounded]
+        self._project_set_index = bounded
+        self._project_set_combo.blockSignals(True)
+        try:
+            self._project_set_combo.setCurrentIndex(bounded)
+        finally:
+            self._project_set_combo.blockSignals(False)
+        self._project_set_count_label.setText(
+            f"{bounded + 1} of {len(self._project_set_entries)}"
+        )
+        self._project_set_prev_btn.setEnabled(bounded > 0)
+        self._project_set_next_btn.setEnabled(bounded < len(self._project_set_entries) - 1)
+        self._log_info(
+            f"Project set: opening {entry.name} ({bounded + 1}/{len(self._project_set_entries)})."
+        )
+        self._start_dataset_load(
+            entry.root,
+            channel_overrides=None,
+            channel_dirs=entry.channel_dirs,
+            load_mode="project_set",
+        )
+
+    def _on_project_set_combo_changed(self, index: int) -> None:
+        if index < 0 or index == self._project_set_index:
+            return
+        self._load_project_set_entry(index)
+
+    def _move_project_set_selection(self, delta: int) -> None:
+        if not self._project_set_entries:
+            return
+        self._load_project_set_entry(self._project_set_index + int(delta))
+
     def _nav_to(self, page_idx: int) -> None:
         """Switch the page stack and update nav button checked states."""
         self._page_stack.setCurrentIndex(page_idx)
@@ -1038,11 +1338,25 @@ class MainWindow(QMainWindow):
             "idle":    COLOR.text_disabled,
             "unknown": COLOR.text_disabled,
         }
+        bg_map = {
+            "good":    COLOR.channel_green_subtle,
+            "warn":    COLOR.accent_subtle,
+            "bad":     COLOR.channel_red_subtle,
+            "idle":    COLOR.bg_surface,
+            "unknown": COLOR.bg_surface,
+        }
         color = color_map.get(status.status, COLOR.text_disabled)
+        bg = bg_map.get(status.status, COLOR.bg_surface)
         dot.setStyleSheet(f"color: {color};")
         text.setText(status.label)
+        text.setStyleSheet(f"color: {color};")
+        pill.setStyleSheet(
+            f"QFrame#statusPill {{ background-color: {bg}; border: 1px solid {color}; border-radius: 2px; }}"
+        )
         if status.detail:
             pill.setToolTip(status.detail)
+        else:
+            pill.setToolTip("")
 
     def _refresh_system_indicators(self) -> None:
         try:
@@ -1090,6 +1404,7 @@ class MainWindow(QMainWindow):
                 psf_config=self.current_psf,
                 preprocess_config=self.preprocess_config,
                 cache_key=self._last_processed_cache_key,
+                enhancement_method=self._current_microglia_enhancement_method,
             )
         except OSError as exc:
             self._log_info(f"Project metadata save failed: {exc}")
@@ -1099,10 +1414,19 @@ class MainWindow(QMainWindow):
 
     def _refresh_section_state(self) -> None:
         dataset_name = self.dataset_root.name if self.dataset_root is not None else "No dataset loaded"
+        set_detail = ""
+        if self._project_set_entries and 0 <= self._project_set_index < len(self._project_set_entries):
+            dataset_name = (
+                f"{dataset_name} ({self._project_set_index + 1}/"
+                f"{len(self._project_set_entries)})"
+            )
+            if self._project_set_root is not None:
+                set_detail = f"\nProject set: {self._project_set_root}"
         cache_root = str(self._project_cache_base_dir() / ".nvap_cache")
         plugin_summary = self.controls.plugin_text.toPlainText().strip() or "No plugins discovered"
         auto_apply = bool(self.controls.auto_apply_checkbox.isChecked())
         has_dataset = bool(self.processed_dataset is not None and self.visual_dataset is not None)
+        has_project_set = bool(len(self._project_set_entries) > 1)
         self._settings_page.set_runtime_details(
             dataset_name=dataset_name,
             auto_apply_enabled=auto_apply,
@@ -1110,11 +1434,13 @@ class MainWindow(QMainWindow):
             cache_root=cache_root,
         )
         self.controls.set_microglia_workflow_enabled(has_dataset)
+        if hasattr(self, "_project_analytics_btn"):
+            self._project_analytics_btn.setEnabled(has_dataset and has_project_set)
         if self.dataset_root is not None:
             self._home_page.set_preview_summary(
                 "ACTIVE",
                 self.dataset_root.name,
-                f"{self.dataset_root}\nCache: {cache_root}",
+                f"{self.dataset_root}{set_detail}\nCache: {cache_root}",
             )
         self._home_page.refresh_projects()
 
@@ -1148,10 +1474,6 @@ class MainWindow(QMainWindow):
         self._refresh_metrics()
         self.statusBar().showMessage("Microglia analysis updated.", 3000)
 
-    def _sync_recent_project_pages(self) -> None:
-        """Compat shim — kept so any old call sites still work."""
-        self._home_page.refresh_projects()
-
     def _open_recent_project(self, path: str) -> None:
         p = Path(path)
         if not p.exists():
@@ -1170,6 +1492,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Project load failed", str(exc))
             return
+        self._clear_project_set()
         self.dataset_root = p.resolve()
         self._nav_to(1)
         self._start_dataset_load(
@@ -1226,6 +1549,8 @@ class MainWindow(QMainWindow):
         return bool(
             not np.isclose(float(previous.threshold_green), float(current.threshold_green), atol=1.0e-6)
             or not np.isclose(float(previous.threshold_red), float(current.threshold_red), atol=1.0e-6)
+            or int(previous.trim_first_slices) != int(current.trim_first_slices)
+            or int(previous.trim_last_slices) != int(current.trim_last_slices)
             or not np.isclose(float(previous.offset_x_um), float(current.offset_x_um), atol=1.0e-6)
             or not np.isclose(float(previous.offset_y_um), float(current.offset_y_um), atol=1.0e-6)
             or not np.isclose(float(previous.offset_z_um), float(current.offset_z_um), atol=1.0e-6)
@@ -1241,11 +1566,13 @@ class MainWindow(QMainWindow):
     def _metrics_cache_key_for_render(
         self,
         render: RenderConfig,
-    ) -> tuple[int, float, float, float, float, float]:
+    ) -> tuple[int, float, float, int, int, float, float, float]:
         return (
             int(self._metrics_revision),
             float(render.threshold_green),
             float(render.threshold_red),
+            int(render.trim_first_slices),
+            int(render.trim_last_slices),
             float(render.offset_x_um),
             float(render.offset_y_um),
             float(render.offset_z_um),
@@ -1272,36 +1599,24 @@ class MainWindow(QMainWindow):
         self.controls.set_metrics_text("\n".join(lines))
 
     def _vascular_summary_line(self) -> str | None:
-        """Compact vascular morphometry line for the metrics panel (best-effort)."""
-        dataset = self.processed_dataset
-        if dataset is None:
+        """Return the cached vascular morphometry line, if current.
+
+        The heavy analyze_vasculature call is performed off the UI thread (in
+        the metrics worker) and the formatted line cached; this reader never
+        computes synchronously, so it can be called from the main thread without
+        risking an AppHang freeze. Returns None until the worker fills the cache.
+        """
+        if self.processed_dataset is None:
             return None
-        threshold_red = float(self.current_render.threshold_red)
+        cache_key = _vascular_cache_key_for(self.current_render)
+        cache = self._vascular_summary_cache
         if (
-            self._vascular_summary_cache is not None
-            and np.isclose(self._vascular_summary_cache[0], threshold_red, atol=1.0e-6)
+            cache is not None
+            and np.isclose(cache[0][0], cache_key[0], atol=1.0e-6)
+            and cache[0][1:] == cache_key[1:]
         ):
-            return self._vascular_summary_cache[1]
-        try:
-            vascular = analyze_vasculature(
-                dataset.red.data,
-                threshold=threshold_red,
-                spacing=dataset.red.spacing,
-                render=self.current_render,
-            )
-        except Exception as exc:  # pragma: no cover - defensive UI path
-            self._log_debug(f"Vascular summary skipped: {exc}")
-            self._vascular_summary_cache = (threshold_red, None)
-            return None
-        result = (
-            f"vasculature: vol_fraction={vascular.vessel_volume_fraction:.4f}, "
-            f"length_density={vascular.length_density_mm_per_mm3:.2f} mm/mm3, "
-            f"mean_diameter_um={vascular.mean_diameter_um:.2f}, "
-            f"junctions={vascular.junction_count}, "
-            f"tortuosity={vascular.mean_tortuosity:.3f}"
-        )
-        self._vascular_summary_cache = (threshold_red, result)
-        return result
+            return cache[1]
+        return None
 
     def _invalidate_microglia_components(self) -> None:
         self._green_component_labels = None
@@ -1619,17 +1934,23 @@ class MainWindow(QMainWindow):
         return f"{mins:02d}:{secs:02d}"
 
     def _compose_busy_label(self, elapsed: float, progress_percent: float) -> str:
-        lines = [
-            self._busy_base_message,
-            f"Progress: {int(round(progress_percent))}%",
-            f"Elapsed: {self._format_seconds(elapsed)}",
+        title = (self._busy_title or "NVAP").upper()
+        message = self._busy_base_message.strip() or "Working..."
+        status_parts = [
+            f"Progress {int(round(progress_percent))}%",
+            f"Elapsed {self._format_seconds(elapsed)}",
         ]
-
         with self._busy_progress_lock:
             eta_total = self._busy_eta_total
         if eta_total is not None:
             remaining = max(0.0, float(eta_total) - elapsed)
-            lines.append(f"ETA: {self._format_seconds(remaining)}")
+            status_parts.append(f"ETA {self._format_seconds(remaining)}")
+        lines = [
+            title,
+            message,
+            "",
+            " / ".join(status_parts),
+        ]
         return "\n".join(lines)
 
     def _publish_busy_progress(
@@ -1949,8 +2270,13 @@ class MainWindow(QMainWindow):
     ) -> None:
         if self._busy_dialog is None:
             self._busy_dialog = QProgressDialog(message, "", 0, 100, self)
+            self._busy_dialog.setObjectName("busyDialog")
             self._busy_dialog.setMinimumDuration(0)
             self._busy_dialog.setWindowModality(Qt.WindowModal)
+            self._busy_dialog.setAutoClose(False)
+            self._busy_dialog.setAutoReset(False)
+            self._busy_dialog.setMinimumWidth(420)
+            self._busy_dialog.setMinimumHeight(180)
         else:
             self._busy_dialog.setRange(0, 100)
         try:
@@ -2190,9 +2516,11 @@ class MainWindow(QMainWindow):
         chooser.setWindowTitle("Open Dataset")
         chooser.setText("Choose how to load images.")
         chooser.setInformativeText(
-            "Use folder process for an auto-detected dataset folder, or select individual red/green TIFF files or sequence folders."
+            "Open one auto-detected dataset folder, a parent folder containing multiple datasets, "
+            "or select individual red/green TIFF files or sequence folders."
         )
         folder_btn = chooser.addButton("Folder Process", QMessageBox.ButtonRole.AcceptRole)
+        set_btn = chooser.addButton("Project Set Folder", QMessageBox.ButtonRole.ActionRole)
         manual_btn = chooser.addButton("Individual TIFF/Sequence", QMessageBox.ButtonRole.ActionRole)
         cancel_btn = chooser.addButton(QMessageBox.StandardButton.Cancel)
         chooser.exec()
@@ -2200,6 +2528,8 @@ class MainWindow(QMainWindow):
         clicked = chooser.clickedButton()
         if clicked is None or clicked == cancel_btn:
             return None
+        if clicked == set_btn:
+            return "project_set"
         if clicked == manual_btn:
             return "manual"
         if clicked == folder_btn:
@@ -2259,6 +2589,37 @@ class MainWindow(QMainWindow):
             return
         channel_overrides: dict[str, str] | None = None
         channel_dirs: dict[str, Path]
+
+        if load_mode == "project_set":
+            selected = QFileDialog.getExistingDirectory(
+                self,
+                "Select Project Set Folder",
+                str(base),
+            )
+            if not selected:
+                return
+            root = Path(selected).resolve()
+            entries = discover_dataset_projects(root)
+            if not entries:
+                self._show_error(
+                    "No Datasets Found",
+                    (
+                        "NVAP could not find any loadable red/green image-series datasets "
+                        f"inside:\n{root}"
+                    ),
+                )
+                return
+            self._log_info(
+                f"Project set discovered: root={root} datasets={len(entries)}"
+            )
+            self.statusBar().showMessage(
+                f"Project set loaded with {len(entries)} dataset(s). Opening first dataset...",
+                8000,
+            )
+            self._set_project_set(root, entries, selected_index=0)
+            return
+
+        self._clear_project_set()
 
         if load_mode == "folder":
             selected = QFileDialog.getExistingDirectory(
@@ -2371,14 +2732,62 @@ class MainWindow(QMainWindow):
         self._log_info("Load step 3/5 complete.")
         self._publish_busy_progress(percent=76.0, message="Preparing mesh dataset...")
 
+        enhancement_method: str | None = None
+        saved_state = load_project_state(root)
+        saved_method = str(saved_state.get("microglia_enhancement_method") or "") if saved_state else ""
+        if saved_method and self._last_processed_cache_key:
+            enhanced_green = load_enhanced_green(
+                self._last_processed_cache_key,
+                saved_method,
+                base_dir=self._project_cache_base_dir(),
+            )
+            if enhanced_green is not None and enhanced_green.shape == processed_dataset.green.data.shape:
+                processed_dataset = DatasetVolume(
+                    green=ChannelVolume(
+                        name="green",
+                        data=enhanced_green,
+                        z_indices=list(processed_dataset.green.z_indices),
+                        spacing=processed_dataset.green.spacing,
+                    ),
+                    red=processed_dataset.red,
+                    shared_z_range=processed_dataset.shared_z_range,
+                )
+                enhancement_method = saved_method
+                self._log_info(f"Restored microglia enhancement '{saved_method}' from cache.")
+
         self._log_info("Load step 4/5: preparing mesh dataset...")
         visual_dataset = prepare_dataset_for_mesh(processed_dataset, preprocess_cfg)
         self._log_info("Load step 4/5 complete.")
         self._publish_busy_progress(percent=86.0, message="Computing default thresholds...")
 
         self._log_info("Load step 5/5: computing thresholds...")
-        threshold_green = default_green_threshold(processed_dataset.green.data)
-        threshold_red = default_threshold(processed_dataset.red.data)
+        cached_thresholds = (
+            load_processed_thresholds(
+                self._last_processed_cache_key,
+                base_dir=self._project_cache_base_dir(),
+            )
+            if self._last_processed_cache_key
+            else None
+        )
+        if cached_thresholds is not None and enhancement_method is None:
+            threshold_green, threshold_red = cached_thresholds
+            self._log_info(
+                "Load step 5/5: using cached thresholds "
+                f"(green={threshold_green:.4f}, red={threshold_red:.4f})."
+            )
+        else:
+            threshold_green = _DEFAULT_GREEN_THRESHOLD
+            threshold_red = cached_thresholds[1] if cached_thresholds is not None else _DEFAULT_RED_THRESHOLD
+            if self._last_processed_cache_key and enhancement_method is None:
+                try:
+                    save_processed_metadata(
+                        self._last_processed_cache_key,
+                        threshold_green=threshold_green,
+                        threshold_red=threshold_red,
+                        base_dir=self._project_cache_base_dir(),
+                    )
+                except OSError as exc:
+                    self._log_info(f"Processed metadata save failed: {exc}")
         self._publish_busy_progress(percent=92.0, message="Finalizing load...")
         self._log_info(
             "Load complete. "
@@ -2392,6 +2801,7 @@ class MainWindow(QMainWindow):
             visual_dataset=visual_dataset,
             threshold_green=threshold_green,
             threshold_red=threshold_red,
+            enhancement_method=enhancement_method,
         )
 
     def _on_load_task_success(self, result: object) -> None:
@@ -2403,22 +2813,120 @@ class MainWindow(QMainWindow):
         self.raw_dataset = result.raw_dataset
         self.processed_dataset = result.processed_dataset
         self._mark_metrics_dirty()
+        self._current_microglia_enhancement_method = result.enhancement_method
+        self._current_speck_wipe_applied = False
+        if self._current_microglia_enhancement_method:
+            idx = self.controls.microglia_enhancement_method.findData(self._current_microglia_enhancement_method)
+            if idx >= 0:
+                self.controls.microglia_enhancement_method.setCurrentIndex(idx)
+
         self.visual_dataset = result.visual_dataset
         self._invalidate_microglia_components()
         self._push_scene_channels()
-        self._publish_busy_progress(percent=97.0, message="Applying initial thresholds + metrics...")
-        self._set_busy_message("Applying initial thresholds and computing metrics...")
-        # set_threshold_defaults emits render_config_changed → _on_render_config_changed which
-        # already calls apply_render_config + _refresh_metrics.  Do not repeat them here.
+        self._publish_busy_progress(percent=97.0, message="Applying initial thresholds...")
+        self._set_busy_message("Applying initial thresholds...")
+
+        # Block signals so set_threshold_defaults doesn't trigger _refresh_metrics
+        # synchronously and freeze the progress dialog at 97%.
+        self.controls.blockSignals(True)
         self.controls.set_threshold_defaults(result.threshold_green, result.threshold_red)
         self.controls.set_microglia_enhancement_enabled(True)
+        self.controls.blockSignals(False)
+        self.current_render = self.controls.current_render_config()
+        self.scene.apply_render_config(self.current_render)
         self._publish_busy_progress(percent=100.0, message="Load complete.")
+        self._set_busy_message("Load complete.")
         self._log_info("Dataset load and initial render completed.")
         # Navigate to workspace and record in recent projects
         self._nav_to(1)
         self._save_current_project_state()
         self._record_current_project(samples=1, status="Open")
         self._refresh_section_state()
+        # After the busy dialog closes, run the automatic on-load pipeline (clean
+        # enhancement + speck wipe) or, if both are disabled, just compute metrics.
+        # Deferring via a zero timer lets the load task's cleanup clear
+        # _active_thread first, so the pipeline's "another operation running" guard
+        # does not block it. This runs for single datasets and for every dataset
+        # in a multi-stack project set, since both paths land here.
+        QTimer.singleShot(0, self._run_auto_load_pipeline)
+
+    def _run_auto_load_pipeline(self) -> None:
+        """Automatically clean each freshly loaded dataset.
+
+        Runs the selected microglia enhancement (unless one was already applied
+        from cache) followed by the speck wipe, in a single background task, then
+        computes metrics. Each step is gated by its own on-load toggle so the user
+        can disable them before loading. With everything off this just refreshes
+        metrics, so behaviour is unchanged.
+        """
+        if self.processed_dataset is None:
+            self._refresh_metrics()
+            return
+
+        want_enhance = (
+            self.controls.auto_enhance_microglia_on_load_enabled()
+            and not self._current_microglia_enhancement_method
+        )
+        want_wipe = self.controls.auto_wipe_specks_on_load_enabled()
+        if not want_enhance and not want_wipe:
+            self._refresh_metrics()
+            return
+
+        dataset = self.processed_dataset
+        preprocess_cfg = self.preprocess_config
+        method = self.controls.current_microglia_enhancement_method()
+        max_voxels = int(self.controls.current_wipe_speck_max_voxels())
+        threshold_green = float(self.current_render.threshold_green)
+        threshold_red = float(self.current_render.threshold_red)
+        steps = [name for name, on in (("enhance", want_enhance), ("wipe", want_wipe)) if on]
+        self._log_info(
+            "Auto on-load pipeline: "
+            f"{' + '.join(steps)} (method={method if want_enhance else '-'}, "
+            f"speck<{max_voxels} vox)."
+        )
+
+        def _auto_task() -> DatasetVolume:
+            green = np.asarray(dataset.green.data, dtype=np.float32)
+            red = np.asarray(dataset.red.data, dtype=np.float32)
+            if want_enhance:
+                self._publish_busy_progress(percent=10.0, message="Enhancing microglia (clean)...")
+                green = enhance_microglia_background(green, preprocess_cfg, method=method)
+            if want_wipe:
+                self._publish_busy_progress(percent=60.0, message="Wiping microglia specks...")
+                green = wipe_small_specks(green, threshold=threshold_green, min_voxels=max_voxels)
+                self._publish_busy_progress(percent=80.0, message="Wiping vasculature specks...")
+                red = wipe_small_specks(red, threshold=threshold_red, min_voxels=max_voxels)
+            self._publish_busy_progress(percent=92.0, message="Updating dataset...")
+            return DatasetVolume(
+                green=ChannelVolume(
+                    name="green",
+                    data=green,
+                    z_indices=list(dataset.green.z_indices),
+                    spacing=dataset.green.spacing,
+                ),
+                red=ChannelVolume(
+                    name="red",
+                    data=red,
+                    z_indices=list(dataset.red.z_indices),
+                    spacing=dataset.red.spacing,
+                ),
+                shared_z_range=dataset.shared_z_range,
+            )
+
+        def _on_auto_success(result: object) -> None:
+            if want_enhance:
+                self._current_microglia_enhancement_method = method
+            self._on_wipe_specks_success(result)
+            self._current_speck_wipe_applied = bool(want_wipe)
+
+        self._start_background_task(
+            title="Auto-processing dataset",
+            message="Cleaning microglia and vasculature...",
+            fn=_auto_task,
+            on_success=_on_auto_success,
+            error_title="Automatic on-load processing failed",
+            success_status="Automatic cleanup complete.",
+        )
 
     def _on_psf_task_success(self, result: object) -> None:
         if not isinstance(result, DatasetVolume):
@@ -2431,17 +2939,18 @@ class MainWindow(QMainWindow):
         self._publish_busy_progress(percent=94.0, message="Uploading channels to VTK...")
         self._invalidate_microglia_components()
         self._push_scene_channels()
-        self._publish_busy_progress(percent=98.0, message="Refreshing render + metrics...")
-        self._set_busy_message("Refreshing render + metrics...")
+        self._publish_busy_progress(percent=98.0, message="Refreshing render...")
+        self._set_busy_message("Refreshing render...")
         self.controls.set_microglia_enhancement_enabled(True)
         self.scene.apply_render_config(self.current_render)
         self._refresh_microglia_analysis_debug()
-        self._refresh_metrics()
         self._publish_busy_progress(percent=100.0, message="Processing complete.")
+        self._set_busy_message("Processing complete.")
         self._log_info("Processing applied and scene refreshed.")
         self._save_current_project_state()
         self._record_current_project(samples=1, status="Open")
         self._refresh_section_state()
+        QTimer.singleShot(0, self._refresh_metrics)
 
     def _get_processed_dataset_with_cache(
         self,
@@ -2546,22 +3055,6 @@ class MainWindow(QMainWindow):
         publish_process_progress(1.0, "Processed dataset ready.")
         return processed
 
-    def _load_dataset_with_manual_fallback(self, root: Path):
-        # Kept for compatibility with older code paths.
-        try:
-            self._log_debug("Attempting dataset auto-detection.")
-            return load_dataset(root, spacing=self.spacing)
-        except FileNotFoundError:
-            self._log_info("Auto-detection failed; requesting channel sources in explicit order.")
-            channel_overrides = self._prompt_channel_sources_in_order(root)
-            if channel_overrides is None:
-                raise RuntimeError("Channel source selection canceled.")
-            return load_dataset(
-                root,
-                spacing=self.spacing,
-                channel_overrides=channel_overrides,
-            )
-
     def _on_psf_config_changed(self, config: PSFConfig) -> None:
         self.current_psf = config
         if config.iterations >= 8:
@@ -2569,15 +3062,6 @@ class MainWindow(QMainWindow):
                 "High RL iterations can take several minutes on large stacks.",
                 4000,
             )
-
-    def _on_preprocess_config_changed(self, config: PreprocessConfig) -> None:
-        self._log_info("Preprocessing controls are disabled; configuration change ignored.")
-
-    def _on_preview_green_denoise_requested(self) -> None:
-        self.statusBar().showMessage("Green pass-through mode is always active.", 5000)
-
-    def _on_apply_green_denoise_requested(self) -> None:
-        self.statusBar().showMessage("Green denoise/masking is disabled in pass-through mode.", 5000)
 
     def _on_apply_psf_requested(self) -> None:
         if self.synced_dataset is None:
@@ -2628,38 +3112,6 @@ class MainWindow(QMainWindow):
             cancel_event=cancel_event,
             canceled_status="Processing canceled. Previous rendering kept.",
         )
-
-    def _apply_psf_and_refresh(self, update_thresholds: bool) -> None:
-        # Kept for compatibility with older code paths.
-        assert self.synced_dataset is not None
-        self._set_busy_message("Applying pass-through/processing pipeline...")
-        psf_cfg = self._effective_psf_config(self.current_psf)
-        preprocessed = preprocess_dataset(self.synced_dataset, self.preprocess_config) if self.preprocess_config.enabled else self.synced_dataset
-        self.processed_dataset = apply_psf_to_dataset(
-            preprocessed,
-            psf_cfg,
-            preprocess_config=self.preprocess_config,
-        )
-        self._mark_metrics_dirty()
-        self.visual_dataset = prepare_dataset_for_mesh(self.processed_dataset, self.preprocess_config)
-        self._invalidate_microglia_components()
-        self._log_debug(
-            f"Processed dataset shapes - green={self.processed_dataset.green.data.shape}, "
-            f"red={self.processed_dataset.red.data.shape}"
-        )
-
-        self._push_scene_channels()
-
-        if update_thresholds:
-            self._set_busy_message("Computing initial Otsu thresholds...")
-            tg = default_green_threshold(self.processed_dataset.green.data)
-            tr = default_threshold(self.processed_dataset.red.data)
-            self.controls.set_threshold_defaults(tg, tr)
-            self._log_info(f"Default thresholds set: green={tg:.4f}, red={tr:.4f}")
-
-        self._set_busy_message("Refreshing render + metrics...")
-        self.scene.apply_render_config(self.current_render)
-        self._refresh_metrics()
 
     def _on_render_config_changed(self, config: RenderConfig) -> None:
         previous = self.current_render
@@ -2767,11 +3219,15 @@ class MainWindow(QMainWindow):
                 shared_z_range=dataset.shared_z_range,
             )
 
+        def _on_enhance_success(result: object) -> None:
+            self._current_microglia_enhancement_method = enhancement_method
+            self._on_enhance_microglia_success(result)
+
         self._start_background_task(
             title="Enhance Microglia",
             message=f"Enhancing microglia with {enhancement_method}...",
             fn=_enhance_task,
-            on_success=self._on_enhance_microglia_success,
+            on_success=_on_enhance_success,
             error_title="Microglia enhancement failed",
             success_status="Microglia enhancement complete.",
             eta_total_seconds=eta_seconds,
@@ -2787,30 +3243,701 @@ class MainWindow(QMainWindow):
         self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
         self._invalidate_microglia_components()
         self._push_scene_channels()
-        threshold_green = default_green_threshold(result.green.data)
-        threshold_red = default_threshold(result.red.data)
+        threshold_green = _DEFAULT_GREEN_THRESHOLD
+        threshold_red = _DEFAULT_RED_THRESHOLD
+        # Block signals so set_threshold_defaults doesn't trigger _refresh_metrics
+        # synchronously and freeze the progress dialog before it can show 100%.
+        self.controls.blockSignals(True)
         self.controls.set_threshold_defaults(threshold_green, threshold_red)
-        self._publish_busy_progress(percent=98.0, message="Refreshing enhanced render...")
+        self.controls.blockSignals(False)
+        self.current_render = self.controls.current_render_config()
+        self._publish_busy_progress(percent=96.0, message="Refreshing enhanced render...")
         self.scene.apply_render_config(self.current_render)
         self._refresh_microglia_analysis_debug()
-        self._refresh_metrics()
+        # Persist the enhanced green channel so the project can restore it on next open.
+        if self._last_processed_cache_key and self._current_microglia_enhancement_method:
+            try:
+                save_enhanced_dataset(
+                    self._last_processed_cache_key,
+                    self._current_microglia_enhancement_method,
+                    result.green.data,
+                    base_dir=self._project_cache_base_dir(),
+                )
+            except OSError as exc:
+                self._log_info(f"Enhanced cache save failed: {exc}")
         self._publish_busy_progress(percent=100.0, message="Microglia enhancement complete.")
         self._log_info(
             "Microglia enhancement applied: "
             f"green_shape={result.green.data.shape} thresholds=(green={threshold_green:.4f}, red={threshold_red:.4f})"
         )
+        self._save_current_project_state()
+        QTimer.singleShot(0, self._refresh_metrics)
+
+    def _on_wipe_specks_requested(self) -> None:
+        if self.processed_dataset is None:
+            self._show_error("No dataset", "Load and render a dataset before wiping specks.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+
+        dataset = self.processed_dataset
+        max_voxels = int(self.controls.current_wipe_speck_max_voxels())
+        # Detect specks among the voxels that are currently visible, so the wipe
+        # removes exactly the small dots the user sees in each channel.
+        threshold_green = float(self.current_render.threshold_green)
+        threshold_red = float(self.current_render.threshold_red)
+
+        def _wipe_task() -> DatasetVolume:
+            self._publish_busy_progress(percent=10.0, message="Wiping microglia specks...")
+            green = wipe_small_specks(
+                dataset.green.data,
+                threshold=threshold_green,
+                min_voxels=max_voxels,
+            )
+            self._publish_busy_progress(percent=55.0, message="Wiping vasculature specks...")
+            red = wipe_small_specks(
+                dataset.red.data,
+                threshold=threshold_red,
+                min_voxels=max_voxels,
+            )
+            self._publish_busy_progress(percent=85.0, message="Updating dataset...")
+            return DatasetVolume(
+                green=ChannelVolume(
+                    name="green",
+                    data=green,
+                    z_indices=list(dataset.green.z_indices),
+                    spacing=dataset.green.spacing,
+                ),
+                red=ChannelVolume(
+                    name="red",
+                    data=red,
+                    z_indices=list(dataset.red.z_indices),
+                    spacing=dataset.red.spacing,
+                ),
+                shared_z_range=dataset.shared_z_range,
+            )
+
+        self._start_background_task(
+            title="Wipe Specks",
+            message=f"Removing isolated specks smaller than {max_voxels} voxels...",
+            fn=_wipe_task,
+            on_success=self._on_wipe_specks_success,
+            error_title="Speck wipe failed",
+            success_status="Speck wipe complete.",
+        )
+
+    def _on_wipe_specks_success(self, result: object) -> None:
+        if not isinstance(result, DatasetVolume):
+            raise TypeError("Invalid speck-wipe result payload.")
+        self._publish_busy_progress(percent=90.0, message="Preparing render...")
+        self.processed_dataset = result
+        self._mark_metrics_dirty()
+        self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
+        self._invalidate_microglia_components()
+        self._push_scene_channels()
+        self._publish_busy_progress(percent=96.0, message="Refreshing render...")
+        self.scene.apply_render_config(self.current_render)
+        self._refresh_microglia_analysis_debug()
+        self._publish_busy_progress(percent=100.0, message="Speck wipe complete.")
+        self._log_info(
+            "Speck wipe applied: "
+            f"green_shape={result.green.data.shape} red_shape={result.red.data.shape}"
+        )
+        self._current_speck_wipe_applied = True
+        self._save_current_project_state()
+        QTimer.singleShot(0, self._refresh_metrics)
 
     def _refresh_metrics(self) -> None:
         if self.processed_dataset is None:
             return
         cache_key = self._metrics_cache_key_for_render(self.current_render)
-        if self.latest_metrics is None or self._metrics_cache_key != cache_key:
+        if self.latest_metrics is not None and self._metrics_cache_key == cache_key:
+            self._set_metrics_text_from_result(self.latest_metrics)
+            self._metrics_panel.update_from_metrics(self.latest_metrics)
+            self._refresh_analytics_metrics()
+            self._log_debug("Metrics updated from cache.")
+            return
+
+        total_voxels = int(self.processed_dataset.green.data.size + self.processed_dataset.red.data.size)
+        if total_voxels <= _METRICS_BACKGROUND_MIN_VOXELS:
             self.latest_metrics = compute_metrics(self.processed_dataset, self.current_render)
             self._metrics_cache_key = cache_key
-        self._set_metrics_text_from_result(self.latest_metrics)
-        self._metrics_panel.update_from_metrics(self.latest_metrics)
-        self._refresh_analytics_metrics()
-        self._log_debug("Metrics updated.")
+            self._vascular_summary_cache = (
+                _vascular_cache_key_for(self.current_render),
+                _compute_vascular_summary_line(self.processed_dataset, self.current_render),
+            )
+            self._set_metrics_text_from_result(self.latest_metrics)
+            self._metrics_panel.update_from_metrics(self.latest_metrics)
+            self._refresh_analytics_metrics()
+            self._log_debug("Metrics updated synchronously for small dataset.")
+            return
+
+        if self._metrics_thread is not None and self._metrics_thread.isRunning():
+            self._metrics_refresh_pending = self._metrics_task_key != cache_key
+            self.statusBar().showMessage("Computing metrics in background...", 3000)
+            self._log_debug("Metrics refresh queued while previous metrics task is running.")
+            return
+
+        dataset = self.processed_dataset
+        render = self.current_render
+        self._metrics_task_key = cache_key
+        self._metrics_refresh_pending = False
+        self.statusBar().showMessage("Computing metrics in background...", 3000)
+        self._log_info("Metrics computation started in background.")
+
+        def _metrics_task() -> _MetricsTaskResult:
+            # Both compute_metrics and the vascular morphometry run here, off the
+            # UI thread, so the window keeps pumping events during the (often
+            # >60s) analysis instead of freezing into a Windows AppHang.
+            metrics = compute_metrics(dataset, render)
+            return _MetricsTaskResult(
+                cache_key=cache_key,
+                metrics=metrics,
+                vascular_cache_key=_vascular_cache_key_for(render),
+                vascular_line=_compute_vascular_summary_line(dataset, render),
+            )
+
+        thread = _FunctionThread(_metrics_task, self)
+        self._metrics_thread = thread
+
+        def cleanup() -> None:
+            if self._metrics_thread is thread:
+                self._metrics_thread = None
+                self._metrics_task_key = None
+            thread.deleteLater()
+            if self._metrics_refresh_pending:
+                self._metrics_refresh_pending = False
+                QTimer.singleShot(0, self._refresh_metrics)
+
+        def handle_success(result: object) -> None:
+            try:
+                if not isinstance(result, _MetricsTaskResult):
+                    raise TypeError("Invalid metrics task result payload.")
+                current_key = (
+                    self._metrics_cache_key_for_render(self.current_render)
+                    if self.processed_dataset is not None
+                    else None
+                )
+                if result.cache_key != current_key:
+                    self._metrics_refresh_pending = True
+                    self._log_debug("Ignored stale metrics result; scheduling refresh.")
+                    return
+                self.latest_metrics = result.metrics
+                self._metrics_cache_key = result.cache_key
+                if result.vascular_cache_key is not None:
+                    self._vascular_summary_cache = (
+                        result.vascular_cache_key,
+                        result.vascular_line,
+                    )
+                self._set_metrics_text_from_result(result.metrics)
+                self._metrics_panel.update_from_metrics(result.metrics)
+                self._refresh_analytics_metrics()
+                self.statusBar().showMessage("Metrics updated.", 3000)
+                self._log_info("Metrics computation completed.")
+            except Exception as exc:
+                self._log_info(f"Metrics update failed: {exc}")
+            finally:
+                cleanup()
+
+        def handle_error(error_text: str) -> None:
+            logger.error("Metrics task error:\n%s", error_text)
+            concise = error_text.strip().splitlines()[-1] if error_text.strip() else "Unknown error"
+            self.statusBar().showMessage(f"Metrics failed: {concise}", 5000)
+            self._log_info(f"Metrics computation failed: {concise}")
+            cleanup()
+
+        thread.result_ready.connect(handle_success)
+        thread.error_raised.connect(handle_error)
+        thread.start()
+
+    def _on_export_project_analytics_requested(self) -> None:
+        if len(self._project_set_entries) <= 1 or self._project_set_root is None:
+            self._show_error(
+                "No project set",
+                "Load a Project Set Folder before exporting whole-project analytics.",
+            )
+            return
+        if self.processed_dataset is None:
+            self._show_error("No current sample", "Open one sample in the project set first.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+        self.controls.force_apply_pending_changes()
+
+        start = str(self._project_set_root / "project_analytics.csv")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Project Analytics CSV",
+            start,
+            "CSV files (*.csv)",
+        )
+        if not file_path:
+            return
+
+        config = _ProjectAnalyticsConfig(
+            render=self.current_render,
+            psf=self._effective_psf_config(self.current_psf),
+            preprocess=self.preprocess_config,
+            apply_enhancement=bool(
+                self._current_microglia_enhancement_method
+                or self.controls.auto_enhance_microglia_on_load_enabled()
+            ),
+            enhancement_method=str(
+                self._current_microglia_enhancement_method
+                or self.controls.current_microglia_enhancement_method()
+            ),
+            apply_wipe=bool(
+                self._current_speck_wipe_applied
+                or self.controls.auto_wipe_specks_on_load_enabled()
+            ),
+            wipe_max_voxels=int(self.controls.current_wipe_speck_max_voxels()),
+            branch_sensitivity=float(self.controls.current_microglia_branch_sensitivity()),
+        )
+        entries = list(self._project_set_entries)
+        base_path = Path(file_path).resolve()
+        root = self._project_set_root
+
+        confirm = QMessageBox.question(
+            self,
+            "Export Project Analytics",
+            (
+                f"Analyze {len(entries)} samples using the current sample settings?\n\n"
+                f"Green threshold: {config.render.threshold_green:.3f}\n"
+                f"Red threshold: {config.render.threshold_red:.3f}\n"
+                f"Clean: {'yes (' + config.enhancement_method + ')' if config.apply_enhancement else 'no'}\n"
+                f"Wipe specks: {'yes (< ' + str(config.wipe_max_voxels) + ' vox)' if config.apply_wipe else 'no'}"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        def _batch_task() -> _ProjectAnalyticsResult:
+            return self._export_project_analytics_batch(root, entries, config, base_path)
+
+        self._start_background_task(
+            title="Project Analytics Export",
+            message="Analyzing all project-set samples...",
+            fn=_batch_task,
+            on_success=self._on_project_analytics_export_success,
+            error_title="Project analytics export failed",
+            success_status="Project analytics exported.",
+            eta_kind="microglia-separation",
+        )
+
+    def _export_project_analytics_batch(
+        self,
+        project_root: Path,
+        entries: list[DatasetProjectCandidate],
+        config: _ProjectAnalyticsConfig,
+        base_path: Path,
+    ) -> _ProjectAnalyticsResult:
+        individual_rows: list[dict[str, object]] = []
+        provenance_rows: list[dict[str, object]] = []
+        total = max(1, len(entries))
+        run_started = datetime.now().isoformat(timespec="seconds")
+
+        for idx, entry in enumerate(entries, start=1):
+            sample_start = time.perf_counter()
+            base_percent = 100.0 * float(idx - 1) / float(total)
+            span = 100.0 / float(total)
+
+            def stage(fraction: float, message: str) -> None:
+                self._publish_busy_progress(
+                    percent=base_percent + span * float(np.clip(fraction, 0.0, 1.0)),
+                    message=f"{entry.name} ({idx}/{total}): {message}",
+                )
+
+            stage(0.03, "loading stacks...")
+            dataset = load_dataset(entry.root, spacing=self.spacing)
+            stage(0.12, "synchronizing slices...")
+            synced = fill_and_sync_dataset(dataset)
+            working = synced
+            if config.preprocess.enabled:
+                stage(0.22, "preprocessing...")
+                working = preprocess_dataset(working, config.preprocess)
+            stage(0.36, "processing channels...")
+            processed = apply_psf_to_dataset(
+                working,
+                config.psf,
+                preprocess_config=config.preprocess,
+                cancel_event=None,
+            )
+            green = np.asarray(processed.green.data, dtype=np.float32)
+            red = np.asarray(processed.red.data, dtype=np.float32)
+            if config.apply_enhancement:
+                stage(0.52, "enhancing microglia...")
+                green = enhance_microglia_background(
+                    green,
+                    config.preprocess,
+                    method=config.enhancement_method,
+                )
+            if config.apply_wipe:
+                stage(0.62, "wiping specks...")
+                green = wipe_small_specks(
+                    green,
+                    threshold=float(config.render.threshold_green),
+                    min_voxels=int(config.wipe_max_voxels),
+                )
+                red = wipe_small_specks(
+                    red,
+                    threshold=float(config.render.threshold_red),
+                    min_voxels=int(config.wipe_max_voxels),
+                )
+            processed = DatasetVolume(
+                green=ChannelVolume(
+                    name="green",
+                    data=green,
+                    z_indices=list(processed.green.z_indices),
+                    spacing=processed.green.spacing,
+                ),
+                red=ChannelVolume(
+                    name="red",
+                    data=red,
+                    z_indices=list(processed.red.z_indices),
+                    spacing=processed.red.spacing,
+                ),
+                shared_z_range=processed.shared_z_range,
+            )
+            visual = prepare_dataset_for_mesh(processed, config.preprocess)
+
+            stage(0.70, "computing whole-volume metrics...")
+            metrics = compute_metrics(processed, config.render)
+            individual_rows.extend(
+                self._stamp_project_rows(
+                    metrics_to_csv_rows(metrics),
+                    entry=entry,
+                    sample_index=idx,
+                    metric_family="basic",
+                )
+            )
+
+            stage(0.78, "computing vascular analytics...")
+            vascular = analyze_vasculature(
+                processed.red.data,
+                threshold=float(config.render.threshold_red),
+                spacing=processed.red.spacing,
+                render=config.render,
+            )
+            individual_rows.extend(
+                self._stamp_project_rows(
+                    vascular_analysis_to_csv_rows(vascular),
+                    entry=entry,
+                    sample_index=idx,
+                    metric_family="vascular",
+                )
+            )
+
+            stage(0.88, "computing microglia analytics...")
+            spacing = visual.green.spacing
+            spacing_zyx = (float(spacing.z_um), float(spacing.y_um), float(spacing.x_um))
+            base_min_voxels = max(64, int(config.preprocess.green_speckle_min_voxels) * 4)
+            labels, order, _sizes = self._compute_microglia_components_from_params(
+                visual.green.data,
+                threshold=float(config.render.threshold_green),
+                branch_sense=float(config.branch_sensitivity),
+                base_min_voxels=base_min_voxels,
+                spacing=spacing_zyx,
+            )
+            microglia = analyze_microglia_cells(
+                visual.green.data,
+                visual.red.data,
+                labels,
+                order,
+                spacing=visual.green.spacing,
+                render=config.render,
+                branch_sensitivity=float(config.branch_sensitivity),
+            )
+            individual_rows.extend(
+                self._stamp_project_rows(
+                    microglia_analysis_to_csv_rows(microglia),
+                    entry=entry,
+                    sample_index=idx,
+                    metric_family="microglia_cell",
+                )
+            )
+            assoc = summarize_neurovascular_association(microglia)
+            individual_rows.extend(
+                self._stamp_project_rows(
+                    neurovascular_association_to_csv_rows(assoc),
+                    entry=entry,
+                    sample_index=idx,
+                    metric_family="neurovascular",
+                )
+            )
+
+            provenance_rows.extend(
+                self._project_sample_provenance_rows(
+                    entry=entry,
+                    sample_index=idx,
+                    project_root=project_root,
+                    config=config,
+                    processed=processed,
+                    analyzed_cell_count=int(microglia.analyzed_cell_count),
+                    run_started=run_started,
+                    elapsed_seconds=time.perf_counter() - sample_start,
+                )
+            )
+            stage(1.0, "complete.")
+
+        cumulative_rows = self._build_project_cumulative_rows(individual_rows, len(entries))
+        all_rows = [*individual_rows, *cumulative_rows]
+        self._publish_busy_progress(percent=98.0, message="Writing project CSV files...")
+        main_path = export_metrics_csv(all_rows, base_path)
+        stem = main_path.stem
+        individual_path = export_metrics_csv(
+            individual_rows,
+            main_path.with_name(f"{stem}_individual.csv"),
+        )
+        cumulative_path = export_metrics_csv(
+            cumulative_rows,
+            main_path.with_name(f"{stem}_cumulative.csv"),
+        )
+        provenance_path = export_metrics_csv(
+            provenance_rows,
+            main_path.with_name(f"{stem}_provenance.csv"),
+        )
+        self._publish_busy_progress(percent=100.0, message="Project analytics export complete.")
+        return _ProjectAnalyticsResult(
+            base_path=main_path,
+            files=[main_path, individual_path, cumulative_path, provenance_path],
+            sample_count=len(entries),
+            row_count=len(all_rows),
+        )
+
+    def _stamp_project_rows(
+        self,
+        rows: list[dict[str, object]],
+        *,
+        entry: DatasetProjectCandidate,
+        sample_index: int,
+        metric_family: str,
+    ) -> list[dict[str, object]]:
+        stamped: list[dict[str, object]] = []
+        for row in rows:
+            out: dict[str, object] = {
+                "row_scope": "individual",
+                "metric_family": metric_family,
+                "sample_index": int(sample_index),
+                "sample_name": entry.name,
+                "sample_path": str(entry.root),
+            }
+            out.update(row)
+            stamped.append(out)
+        return stamped
+
+    def _project_sample_provenance_rows(
+        self,
+        *,
+        entry: DatasetProjectCandidate,
+        sample_index: int,
+        project_root: Path,
+        config: _ProjectAnalyticsConfig,
+        processed: DatasetVolume,
+        analyzed_cell_count: int,
+        run_started: str,
+        elapsed_seconds: float,
+    ) -> list[dict[str, object]]:
+        spacing = processed.green.spacing
+        values: dict[str, object] = {
+            "run_started_at": run_started,
+            "project_root": str(project_root),
+            "sample_name": entry.name,
+            "sample_path": str(entry.root),
+            "threshold_green": float(config.render.threshold_green),
+            "threshold_red": float(config.render.threshold_red),
+            "trim_first_slices": int(config.render.trim_first_slices),
+            "trim_last_slices": int(config.render.trim_last_slices),
+            "offset_x_um": float(config.render.offset_x_um),
+            "offset_y_um": float(config.render.offset_y_um),
+            "offset_z_um": float(config.render.offset_z_um),
+            "microglia_enhancement_applied": bool(config.apply_enhancement),
+            "microglia_enhancement_method": config.enhancement_method if config.apply_enhancement else "",
+            "wipe_specks_applied": bool(config.apply_wipe),
+            "speck_max_voxels": int(config.wipe_max_voxels),
+            "branch_sensitivity": float(config.branch_sensitivity),
+            "spacing_x_um": float(spacing.x_um),
+            "spacing_y_um": float(spacing.y_um),
+            "spacing_z_um": float(spacing.z_um),
+            "voxel_volume_um3": float(spacing.voxel_volume_um3),
+            "green_shape_zyx": "x".join(str(int(v)) for v in processed.green.data.shape),
+            "red_shape_zyx": "x".join(str(int(v)) for v in processed.red.data.shape),
+            "shared_z_range": f"{processed.shared_z_range[0]}-{processed.shared_z_range[1]}",
+            "microglia_cell_count": int(analyzed_cell_count),
+            "elapsed_seconds": float(elapsed_seconds),
+        }
+        return [
+            {
+                "sample_index": int(sample_index),
+                "sample_name": entry.name,
+                "setting": key,
+                "value": value,
+            }
+            for key, value in values.items()
+        ]
+
+    def _build_project_cumulative_rows(
+        self,
+        individual_rows: list[dict[str, object]],
+        sample_count: int,
+    ) -> list[dict[str, object]]:
+        cumulative: list[dict[str, object]] = [
+            {
+                "row_scope": "cumulative",
+                "metric_family": "project_summary",
+                "metric": "sample_count",
+                "value": int(sample_count),
+            }
+        ]
+
+        def numeric(value: object) -> float | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                val = float(value)
+                return val if np.isfinite(val) else None
+            return None
+
+        basic_groups: dict[str, dict[str, float]] = {}
+        basic_counts: dict[str, int] = {}
+        for row in individual_rows:
+            if row.get("metric_family") != "basic":
+                continue
+            channel = str(row.get("channel", "unknown"))
+            group = basic_groups.setdefault(channel, {})
+            basic_counts[channel] = basic_counts.get(channel, 0) + 1
+            for key, value in row.items():
+                if key in {"sample_index", "metric_family", "row_scope"}:
+                    continue
+                val = numeric(value)
+                if val is not None:
+                    group[key] = group.get(key, 0.0) + val
+        for channel, sums in sorted(basic_groups.items()):
+            count = max(1, basic_counts.get(channel, 1))
+            for key, total in sorted(sums.items()):
+                cumulative.append(
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": "basic_sum",
+                        "channel": channel,
+                        "metric": key,
+                        "value": total,
+                    }
+                )
+                cumulative.append(
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": "basic_mean_per_sample",
+                        "channel": channel,
+                        "metric": key,
+                        "value": total / float(count),
+                    }
+                )
+
+        metric_value_groups: dict[tuple[str, str], list[float]] = {}
+        microglia_groups: dict[str, list[float]] = {}
+        for row in individual_rows:
+            family = str(row.get("metric_family", ""))
+            if family in {"vascular", "neurovascular"}:
+                metric = str(row.get("metric", ""))
+                val = numeric(row.get("value"))
+                if metric and val is not None:
+                    metric_value_groups.setdefault((family, metric), []).append(val)
+            elif family == "microglia_cell":
+                for key, value in row.items():
+                    if key in {"sample_index", "sample_name", "sample_path", "metric_family", "row_scope"}:
+                        continue
+                    val = numeric(value)
+                    if val is not None:
+                        microglia_groups.setdefault(key, []).append(val)
+
+        for (family, metric), values in sorted(metric_value_groups.items()):
+            arr = np.asarray(values, dtype=np.float64)
+            cumulative.extend(
+                [
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": f"{family}_mean_per_sample",
+                        "metric": metric,
+                        "value": float(np.mean(arr)),
+                    },
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": f"{family}_sum",
+                        "metric": metric,
+                        "value": float(np.sum(arr)),
+                    },
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": f"{family}_min",
+                        "metric": metric,
+                        "value": float(np.min(arr)),
+                    },
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": f"{family}_max",
+                        "metric": metric,
+                        "value": float(np.max(arr)),
+                    },
+                ]
+            )
+
+        for metric, values in sorted(microglia_groups.items()):
+            arr = np.asarray(values, dtype=np.float64)
+            cumulative.extend(
+                [
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": "microglia_cell_mean",
+                        "metric": metric,
+                        "value": float(np.mean(arr)),
+                    },
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": "microglia_cell_sum",
+                        "metric": metric,
+                        "value": float(np.sum(arr)),
+                    },
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": "microglia_cell_min",
+                        "metric": metric,
+                        "value": float(np.min(arr)),
+                    },
+                    {
+                        "row_scope": "cumulative",
+                        "metric_family": "microglia_cell_max",
+                        "metric": metric,
+                        "value": float(np.max(arr)),
+                    },
+                ]
+            )
+        return cumulative
+
+    def _on_project_analytics_export_success(self, result: object) -> None:
+        if not isinstance(result, _ProjectAnalyticsResult):
+            raise TypeError("Invalid project analytics export result payload.")
+        files = ", ".join(str(path) for path in result.files)
+        self.statusBar().showMessage(
+            f"Project analytics exported for {result.sample_count} samples.",
+            7000,
+        )
+        self._log_info(
+            f"Project analytics exported: samples={result.sample_count} "
+            f"rows={result.row_count} files={files}"
+        )
+        QMessageBox.information(
+            self,
+            "Project Analytics Exported",
+            (
+                f"Analyzed {result.sample_count} samples and wrote {result.row_count} rows.\n\n"
+                f"Main CSV:\n{result.base_path}\n\n"
+                "Companion files include individual, cumulative, and provenance CSVs."
+            ),
+        )
 
     def _on_export_metrics_requested(self) -> None:
         if self.latest_metrics is None:
@@ -2852,6 +3979,15 @@ class MainWindow(QMainWindow):
         base = Path(base_path)
         stem = base.stem
 
+        # Provenance: record exactly which settings produced these numbers so the
+        # CSVs are self-describing and reproducible.
+        try:
+            ppath = base.with_name(f"{stem}_provenance.csv")
+            export_metrics_csv(self._provenance_rows(), ppath)
+            written.append(ppath)
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            self._log_info(f"Provenance export skipped: {exc}")
+
         dataset = self.processed_dataset
         if dataset is not None:
             try:
@@ -2869,14 +4005,63 @@ class MainWindow(QMainWindow):
 
         if self.latest_microglia_analysis is not None:
             try:
+                mpath = base.with_name(f"{stem}_microglia.csv")
+                export_metrics_csv(microglia_analysis_to_csv_rows(self.latest_microglia_analysis), mpath)
+                written.append(mpath)
+
                 assoc = summarize_neurovascular_association(self.latest_microglia_analysis)
                 npath = base.with_name(f"{stem}_neurovascular.csv")
                 export_metrics_csv(neurovascular_association_to_csv_rows(assoc), npath)
                 written.append(npath)
             except Exception as exc:  # pragma: no cover - defensive UI path
-                self._log_info(f"Neurovascular metrics export skipped: {exc}")
+                self._log_info(f"Microglia/neurovascular metrics export skipped: {exc}")
 
         return written
+
+    def _provenance_rows(self) -> list[dict[str, object]]:
+        """Long-format (setting, value) rows describing how the metrics were made."""
+        render = self.current_render
+        dataset = self.processed_dataset
+        spacing = dataset.green.spacing if dataset is not None else None
+        cells = (
+            self.latest_microglia_analysis.analyzed_cell_count
+            if self.latest_microglia_analysis is not None
+            else None
+        )
+        values: dict[str, object] = {
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "dataset_name": self.dataset_root.name if self.dataset_root else "",
+            "dataset_path": str(self.dataset_root) if self.dataset_root else "",
+            "compute_backend": os.environ.get("NVAP_GPU_BACKEND", "auto"),
+            "threshold_green": float(render.threshold_green),
+            "threshold_red": float(render.threshold_red),
+            "trim_first_slices": int(render.trim_first_slices),
+            "trim_last_slices": int(render.trim_last_slices),
+            "offset_x_um": float(render.offset_x_um),
+            "offset_y_um": float(render.offset_y_um),
+            "offset_z_um": float(render.offset_z_um),
+            "display_z_scale": float(render.display_z_scale),
+            "microglia_enhancement_method": self._current_microglia_enhancement_method or "",
+            "wipe_specks_on_load": bool(self.controls.auto_wipe_specks_on_load_enabled()),
+            "enhance_microglia_on_load": bool(self.controls.auto_enhance_microglia_on_load_enabled()),
+            "speck_max_voxels": int(self.controls.current_wipe_speck_max_voxels()),
+        }
+        if spacing is not None:
+            values.update(
+                {
+                    "spacing_x_um": float(spacing.x_um),
+                    "spacing_y_um": float(spacing.y_um),
+                    "spacing_z_um": float(spacing.z_um),
+                    "voxel_volume_um3": float(spacing.voxel_volume_um3),
+                }
+            )
+        if dataset is not None:
+            values["green_shape_zyx"] = "x".join(str(int(v)) for v in dataset.green.data.shape)
+            values["red_shape_zyx"] = "x".join(str(int(v)) for v in dataset.red.data.shape)
+            values["shared_z_range"] = f"{dataset.shared_z_range[0]}-{dataset.shared_z_range[1]}"
+        if cells is not None:
+            values["microglia_cell_count"] = int(cells)
+        return [{"setting": key, "value": value} for key, value in values.items()]
 
     def _on_export_snapshot_requested(self) -> None:
         start = str((self.dataset_root or Path.cwd()) / "snapshot.png")

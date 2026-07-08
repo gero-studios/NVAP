@@ -38,6 +38,9 @@ mesh = [
 rocm = [
   "torch>=2.2",
 ]
+directml = [
+  "torch-directml==0.2.5.dev240914; platform_system == 'Windows' and python_version >= '3.8' and python_version < '3.13'",
+]
 
 [project.scripts]
 nvap = "nvap.app:main"

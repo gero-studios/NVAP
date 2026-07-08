@@ -1,0 +1,24 @@
+{
+  "expected_branch_count": 2,
+  "expected_cell_to_vessel_um": 0.331,
+  "expected_microglia_count": 1,
+  "expected_tip_count": 2,
+  "expected_tip_to_vessel_um": 0.331,
+  "green_component_count": 1,
+  "green_volume_um3": 19.1512628,
+  "green_voxel_count": 437,
+  "overlap_voxel_count": 0,
+  "red_component_count": 2,
+  "red_volume_um3": 0.08764880000000001,
+  "red_voxel_count": 2,
+  "shape_zyx": {
+    "x": 55,
+    "y": 55,
+    "z": 17
+  },
+  "spacing_um": {
+    "x_um": 0.331,
+    "y_um": 0.331,
+    "z_um": 0.4
+  }
+}

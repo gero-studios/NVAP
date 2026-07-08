@@ -36,6 +36,8 @@ class NeurovascularAssociation:
     min_cell_to_vessel_um: float
     mean_soma_to_vessel_um: float
     median_soma_to_vessel_um: float
+    mean_soma_centroid_to_vessel_um: float
+    median_soma_centroid_to_vessel_um: float
     mean_tip_to_vessel_um: float
     median_tip_to_vessel_um: float
 
@@ -61,6 +63,7 @@ def summarize_neurovascular_association(
     cells = list(analysis.cells)
     cell_d = _finite([c.nearest_cell_to_vessel_um for c in cells])
     soma_d = _finite([c.soma_to_vessel_um for c in cells])
+    soma_center_d = _finite([c.soma_centroid_to_vessel_um for c in cells])
     tip_d = _finite([c.nearest_tip_to_vessel_um for c in cells])
 
     cells_with_vessel = int(cell_d.size)
@@ -73,17 +76,22 @@ def summarize_neurovascular_association(
 
     # Tip-leading: among cells with both measurements, how often does a process
     # tip sit closer to a vessel than the cell body (processes reaching out)?
+    # The reference is the SOMA, not the whole-cell minimum: the tips are a
+    # subset of the cell voxels, so nearest_cell_to_vessel <= nearest_tip always
+    # and comparing against it would make this fraction collapse to ~0 by
+    # construction. Comparing tip-to-vessel against soma-to-vessel is what
+    # actually measures processes extending ahead of the cell body.
     tip_leading = 0.0
     paired = [
-        (c.nearest_tip_to_vessel_um, c.nearest_cell_to_vessel_um)
+        (c.nearest_tip_to_vessel_um, c.soma_to_vessel_um)
         for c in cells
         if c.nearest_tip_to_vessel_um is not None
-        and c.nearest_cell_to_vessel_um is not None
+        and c.soma_to_vessel_um is not None
         and np.isfinite(float(c.nearest_tip_to_vessel_um))
-        and np.isfinite(float(c.nearest_cell_to_vessel_um))
+        and np.isfinite(float(c.soma_to_vessel_um))
     ]
     if paired:
-        leads = sum(1 for tip, cell in paired if float(tip) <= float(cell) + 1.0e-6)
+        leads = sum(1 for tip, soma in paired if float(tip) <= float(soma) + 1.0e-6)
         tip_leading = float(leads) / float(len(paired))
 
     result = NeurovascularAssociation(
@@ -94,6 +102,12 @@ def summarize_neurovascular_association(
         min_cell_to_vessel_um=float(np.min(cell_d)) if cell_d.size else 0.0,
         mean_soma_to_vessel_um=float(np.mean(soma_d)) if soma_d.size else 0.0,
         median_soma_to_vessel_um=float(np.median(soma_d)) if soma_d.size else 0.0,
+        mean_soma_centroid_to_vessel_um=(
+            float(np.mean(soma_center_d)) if soma_center_d.size else 0.0
+        ),
+        median_soma_centroid_to_vessel_um=(
+            float(np.median(soma_center_d)) if soma_center_d.size else 0.0
+        ),
         mean_tip_to_vessel_um=float(np.mean(tip_d)) if tip_d.size else 0.0,
         median_tip_to_vessel_um=float(np.median(tip_d)) if tip_d.size else 0.0,
         perivascular_fraction_by_radius=perivascular,

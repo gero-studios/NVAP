@@ -90,22 +90,17 @@ def laplacian_smooth(
     lam = float(relaxation)
     mu = -lam / 0.9  # Taubin shrinkage compensation
 
-    # Build sparse Laplacian L = I - D⁻¹A via CSR from COO edges.
+    # Build the row-averaging operator W = D⁻¹A via CSR from COO edges.
+    # Taubin then smooths with (I + step·(W - I)); (W - I) is the graph Laplacian
+    # that measures each vertex's displacement from its neighbour centroid.
+    # Both directed half-edges of every triangle edge, built vectorised.
     face_arr = np.asarray(faces, dtype=np.int64)
-    n_edges = 6 * n_faces
-    rows = np.empty(n_edges, dtype=np.int64)
-    cols = np.empty(n_edges, dtype=np.int64)
-    idx = 0
-    for v0, v1, v2 in face_arr:
-        rows[idx] = v0; cols[idx] = v1; idx += 1
-        rows[idx] = v1; cols[idx] = v0; idx += 1
-        rows[idx] = v1; cols[idx] = v2; idx += 1
-        rows[idx] = v2; cols[idx] = v1; idx += 1
-        rows[idx] = v2; cols[idx] = v0; idx += 1
-        rows[idx] = v0; cols[idx] = v2; idx += 1
+    v0, v1, v2 = face_arr[:, 0], face_arr[:, 1], face_arr[:, 2]
+    rows = np.concatenate([v0, v1, v1, v2, v2, v0])
+    cols = np.concatenate([v1, v0, v2, v1, v0, v2])
 
     adj = sp_sparse.coo_matrix(
-        (np.ones(idx, dtype=np.float64), (rows[:idx], cols[:idx])),
+        (np.ones(rows.shape[0], dtype=np.float64), (rows, cols)),
         shape=(n_verts, n_verts),
     ).tocsr()
     adj.sum_duplicates()
@@ -114,16 +109,20 @@ def laplacian_smooth(
     deg[deg == 0] = 1.0
     inv_deg = 1.0 / deg
 
-    lap = sp_sparse.coo_matrix(
-        (inv_deg[rows[:idx]], (rows[:idx], cols[:idx])),
+    avg = sp_sparse.coo_matrix(
+        (inv_deg[rows], (rows, cols)),
         shape=(n_verts, n_verts),
     ).tocsr()
-    lap.setdiag(1.0)
-    lap.eliminate_zeros()
+    avg.eliminate_zeros()
 
-    I = sp_sparse.eye(n_verts, format="csr", dtype=np.float64)
-    op_fwd = I + lam * (lap - I)
-    op_bwd = I + mu * (lap - I)
+    ident = sp_sparse.eye(n_verts, format="csr", dtype=np.float64)
+    # Correct Taubin operators: on a locally flat patch W·v == v, so (W - I)·v == 0
+    # and the vertex is left in place (feature/volume preserving). A previous
+    # `avg.setdiag(1.0)` made this `I + step·W`, which instead scaled every vertex
+    # toward the coordinate origin each pass and shrank the exported mesh.
+    laplacian = avg - ident
+    op_fwd = ident + lam * laplacian
+    op_bwd = ident + mu * laplacian
 
     for it in range(iterations):
         verts = op_fwd.dot(verts)
@@ -387,23 +386,17 @@ def reconstruct_combined_mesh(
             logger.warning("No mesh data to combine")
             return None
 
-        # Offset red face indices
+        # Offset red face indices. The combined PLY stores position + per-vertex
+        # colour only (no normals in the header), so channel normals are not
+        # carried through here.
         if len(green_v) > 0 and len(red_v) > 0:
             red_f_offset = red_f + len(green_v)
             all_verts = np.vstack([green_v, red_v])
             all_faces = np.vstack([green_f, red_f_offset])
-            all_normals = None
-            if green_n is not None and red_n is not None:
-                gn = green_n[:len(green_v)] if len(green_n) >= len(green_v) else green_n
-                rn = red_n[:len(red_v)] if len(red_n) >= len(red_v) else red_n
-                if len(gn) == len(green_v) and len(rn) == len(red_v):
-                    all_normals = np.vstack([gn, rn])
         elif len(green_v) > 0:
             all_verts, all_faces = green_v, green_f
-            all_normals = green_n
         else:
             all_verts, all_faces = red_v, red_f
-            all_normals = red_n
 
         path = Path(output_path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)

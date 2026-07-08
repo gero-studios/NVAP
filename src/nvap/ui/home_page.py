@@ -38,7 +38,7 @@ class _FeatureCard(QWidget):
         super().__init__(parent)
         self.setObjectName("featureCard")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(SPACE.sm)
 
         icon_lbl = QLabel()
@@ -64,11 +64,11 @@ class _PreviewPanel(QFrame):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("homePreviewBox")
-        self.setFixedSize(420, 300)
+        self.setFixedSize(360, 220)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 28, 28, 28)
+        layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(8)
 
         self._kicker = QLabel("WORKSPACE")
@@ -143,12 +143,12 @@ class HomePage(QWidget):
         content = QWidget()
         content.setObjectName("homeContent")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(SPACE.huge, 56, SPACE.huge, 56)
+        layout.setContentsMargins(40, 36, 40, 40)
         layout.setSpacing(0)
 
         # ─── Hero row ───────────────────────────────────────────────────
         hero_row = QHBoxLayout()
-        hero_row.setSpacing(SPACE.xxxl)
+        hero_row.setSpacing(SPACE.xl)
 
         hero_left = QVBoxLayout()
         hero_left.setSpacing(0)
@@ -160,7 +160,7 @@ class HomePage(QWidget):
         subtitle = QLabel("Microglia + Vasculature Analysis Platform")
         subtitle.setObjectName("heroSubtitle")
         hero_left.addWidget(subtitle)
-        hero_left.addSpacing(SPACE.lg)
+        hero_left.addSpacing(SPACE.md)
 
         desc = QLabel(
             "Reconstruct, segment, and quantify microglia and brain vasculature\n"
@@ -168,7 +168,7 @@ class HomePage(QWidget):
         )
         desc.setObjectName("heroDesc")
         hero_left.addWidget(desc)
-        hero_left.addSpacing(SPACE.xxl)
+        hero_left.addSpacing(SPACE.xl)
 
         # Quick action grid (2×2)
         actions = QGridLayout()
@@ -201,11 +201,11 @@ class HomePage(QWidget):
         self._preview = _PreviewPanel()
         hero_row.addWidget(self._preview, 0, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(hero_row)
-        layout.addSpacing(SPACE.xxxl)
+        layout.addSpacing(SPACE.xl)
 
         # ─── Feature cards ──────────────────────────────────────────────
         cards = QGridLayout()
-        cards.setSpacing(SPACE.lg)
+        cards.setSpacing(SPACE.md)
         for col in range(4):
             cards.setColumnStretch(col, 1)
         feature_specs = [
@@ -217,7 +217,7 @@ class HomePage(QWidget):
         for i, (ic, title_text, desc_text) in enumerate(feature_specs):
             cards.addWidget(_FeatureCard(ic, title_text, desc_text), 0, i)
         layout.addLayout(cards)
-        layout.addSpacing(SPACE.xxxl)
+        layout.addSpacing(SPACE.xxl)
 
         # ─── Projects library ──────────────────────────────────────────
         lib_header = QHBoxLayout()
@@ -269,7 +269,7 @@ class HomePage(QWidget):
     def _make_action_btn(self, icon_name: str, label: str, *, primary: bool = False) -> QPushButton:
         btn = QPushButton(f"  {label}")
         btn.setObjectName("primaryActionHome" if primary else "secondaryActionHome")
-        btn.setFixedHeight(46)
+        btn.setFixedHeight(40)
         btn.setIcon(icon(icon_name, size=ICON_MD, color="#FFFFFF" if primary else COLOR.text_primary))
         btn.setIconSize(icon_size(ICON_MD))
         btn.setCursor(Qt.CursorShape.PointingHandCursor)

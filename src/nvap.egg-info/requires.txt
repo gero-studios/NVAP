@@ -19,6 +19,11 @@ pytest>=8.0
 pytest-qt>=4.4
 pyinstaller>=6.3
 
+[directml]
+
+[directml:platform_system == "Windows" and python_version >= "3.8" and python_version < "3.13"]
+torch-directml==0.2.5.dev240914
+
 [mesh]
 trimesh>=4.0
 

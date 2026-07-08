@@ -44,54 +44,58 @@ def _component_stats(mask: np.ndarray) -> tuple[int, int]:
     return int(count), largest
 
 
-def _shift_mask_integer(mask: np.ndarray, dz: int, dy: int, dx: int) -> np.ndarray:
-    shifted = np.zeros_like(mask, dtype=bool)
-
-    src_z0 = max(0, -dz)
-    src_z1 = min(mask.shape[0], mask.shape[0] - dz)  # exclusive
-    dst_z0 = max(0, dz)
-    dst_z1 = min(mask.shape[0], mask.shape[0] + dz)  # exclusive
-
+def _shift_slice_in_plane(slice_mask: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    """Shift a single (y, x) mask by integer voxels, zero-filling exposed edges."""
+    out = np.zeros_like(slice_mask, dtype=bool)
+    ny, nx = slice_mask.shape
     src_y0 = max(0, -dy)
-    src_y1 = min(mask.shape[1], mask.shape[1] - dy)
+    src_y1 = min(ny, ny - dy)
     dst_y0 = max(0, dy)
-    dst_y1 = min(mask.shape[1], mask.shape[1] + dy)
-
+    dst_y1 = min(ny, ny + dy)
     src_x0 = max(0, -dx)
-    src_x1 = min(mask.shape[2], mask.shape[2] - dx)
+    src_x1 = min(nx, nx - dx)
     dst_x0 = max(0, dx)
-    dst_x1 = min(mask.shape[2], mask.shape[2] + dx)
-
-    if (
-        src_z0 < src_z1
-        and src_y0 < src_y1
-        and src_x0 < src_x1
-        and dst_z0 < dst_z1
-        and dst_y0 < dst_y1
-        and dst_x0 < dst_x1
-    ):
-        shifted[dst_z0:dst_z1, dst_y0:dst_y1, dst_x0:dst_x1] = mask[
-            src_z0:src_z1, src_y0:src_y1, src_x0:src_x1
-        ]
-
-    return shifted
+    dst_x1 = min(nx, nx + dx)
+    if src_y0 < src_y1 and src_x0 < src_x1 and dst_y0 < dst_y1 and dst_x0 < dst_x1:
+        out[dst_y0:dst_y1, dst_x0:dst_x1] = slice_mask[src_y0:src_y1, src_x0:src_x1]
+    return out
 
 
-def _shared_subvolumes(
+def _shifted_overlap_voxels(
     green_mask: np.ndarray,
     red_mask: np.ndarray,
     green_z_indices: list[int],
     red_z_indices: list[int],
     shared_z_range: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
+    *,
+    dz: int,
+    dy: int,
+    dx: int,
+) -> int:
+    """Voxel overlap of the (dz, dy, dx)-shifted green mask with the red mask.
+
+    The z-shift is resolved in *physical* slice space: for each shared physical z
+    aligned with red, the contributing green slice is sampled from physical
+    ``z - dz``. That source slice may lie outside the shared range but still
+    within green's acquired stack, so voxels shifting across the shared-range
+    boundary are handled correctly instead of being dropped (and slices are pulled
+    in from outside the boundary rather than zero-filled).
+    """
     z0, z1 = shared_z_range
-    shared = list(range(z0, z1 + 1))
     g_map = {z: i for i, z in enumerate(green_z_indices)}
     r_map = {z: i for i, z in enumerate(red_z_indices)}
 
-    g_stack = np.stack([green_mask[g_map[z]] for z in shared], axis=0)
-    r_stack = np.stack([red_mask[r_map[z]] for z in shared], axis=0)
-    return g_stack, r_stack
+    overlap = 0
+    for z in range(z0, z1 + 1):
+        r_idx = r_map.get(z)
+        if r_idx is None:
+            continue
+        g_idx = g_map.get(z - dz)
+        if g_idx is None:
+            continue
+        green_slice = _shift_slice_in_plane(green_mask[g_idx], dy, dx)
+        overlap += int(np.logical_and(green_slice, red_mask[r_idx]).sum())
+    return overlap
 
 
 def compute_metrics(dataset: DatasetVolume, render: RenderConfig) -> MetricsComputation:
@@ -120,15 +124,16 @@ def compute_metrics(dataset: DatasetVolume, render: RenderConfig) -> MetricsComp
     dy = int(round(render.offset_y_um / spacing.y_um))
     dx = int(round(render.offset_x_um / spacing.x_um))
 
-    green_shared, red_shared = _shared_subvolumes(
+    overlap_voxels = _shifted_overlap_voxels(
         green_mask=green_mask,
         red_mask=red_mask,
         green_z_indices=green.z_indices,
         red_z_indices=red.z_indices,
         shared_z_range=dataset.shared_z_range,
+        dz=dz,
+        dy=dy,
+        dx=dx,
     )
-    shifted_green = _shift_mask_integer(green_shared, dz=dz, dy=dy, dx=dx)
-    overlap_voxels = int(np.logical_and(shifted_green, red_shared).sum())
 
     overlap_volume = overlap_voxels * voxel_volume_um3
     result_green = MetricsResult(

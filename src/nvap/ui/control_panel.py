@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -145,7 +146,9 @@ class ControlPanel(QWidget):
     run_microglia_segmentation_requested = Signal()
     run_microglia_analysis_requested  = Signal()
     enhance_microglia_requested       = Signal()
+    wipe_specks_requested             = Signal()
     export_metrics_requested          = Signal()
+    export_project_analytics_requested = Signal()
     export_snapshot_requested         = Signal()
     export_mesh_requested             = Signal()
 
@@ -305,14 +308,14 @@ class ControlPanel(QWidget):
         form.addRow("Channels", vis_row)
 
         # Thresholds
-        self.threshold_green = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.15)
+        self.threshold_green = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.80)
         self.threshold_green.setToolTip("Min intensity to render green channel (microglia)")
         self.threshold_green.valueChanged.connect(self._on_render_setting_changed)
         _g = QLabel("Threshold G")
         _g.setObjectName("channelGreen")
         form.addRow(_g, self.threshold_green)
 
-        self.threshold_red = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.15)
+        self.threshold_red = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.60)
         self.threshold_red.setToolTip("Min intensity to render red channel (vasculature)")
         self.threshold_red.valueChanged.connect(self._on_render_setting_changed)
         _r = QLabel("Threshold R")
@@ -326,7 +329,7 @@ class ControlPanel(QWidget):
         _og.setObjectName("channelGreen")
         form.addRow(_og, self.opacity_green)
 
-        self.opacity_red = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.40)
+        self.opacity_red = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.80)
         self.opacity_red.valueChanged.connect(self._on_render_setting_changed)
         _or = QLabel("Opacity R")
         _or.setObjectName("channelRed")
@@ -350,21 +353,18 @@ class ControlPanel(QWidget):
         iso_row.addStretch(1)
         form.addRow("Isosurfaces", iso_row)
 
+        # Iso level is retired from the UI: the Threshold sliders now drive both
+        # the 3D surface level and the analysis, so a separate iso control was
+        # redundant and confusing. The spinboxes are kept (hidden) so render
+        # config / saved projects stay backward compatible.
         self.iso_green = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.20)
-        self.iso_green.valueChanged.connect(self._on_render_setting_changed)
-        _ig = QLabel("Iso level G")
-        _ig.setObjectName("channelGreen")
-        form.addRow(_ig, self.iso_green)
-
         self.iso_red = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.20)
-        self.iso_red.valueChanged.connect(self._on_render_setting_changed)
-        _ir = QLabel("Iso level R")
-        _ir.setObjectName("channelRed")
-        form.addRow(_ir, self.iso_red)
+        self.iso_green.hide()
+        self.iso_red.hide()
 
         # Z / trim / offset
-        self.display_z_scale = self._make_unit_spinbox(0.2, 3.0, 0.05, 0.5)
-        self.display_z_scale.setToolTip("Visual-only Z scale. Lower values flatten the stack; 1.0 matches physical spacing.")
+        self.display_z_scale = self._make_unit_spinbox(0.2, 3.0, 0.05, 0.70)
+        self.display_z_scale.setToolTip("Visual-only Z scale (depth). 1.0 matches physical spacing; higher exaggerates depth. Metrics stay in physical units.")
         self.display_z_scale.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Z height scale", self.display_z_scale)
 
@@ -398,7 +398,7 @@ class ControlPanel(QWidget):
     def _build_microglia_viewer_section(
         self, parent_lo: QVBoxLayout
     ) -> _CollapsibleSection:
-        sec = _CollapsibleSection("Microglia Viewer", "eye", expanded=True, parent=self)
+        sec = _CollapsibleSection("Microglia Workbench", "eye", expanded=True, parent=self)
         parent_lo.addWidget(sec)
 
         form = QFormLayout()
@@ -442,10 +442,7 @@ class ControlPanel(QWidget):
         form.addRow(self.microglia_info)
 
         self.microglia_branch_sensitivity = self._make_unit_spinbox(0.4, 2.0, 0.05, 1.0)
-        self.microglia_branch_sensitivity.valueChanged.connect(
-            self._on_microglia_setting_changed
-        )
-        form.addRow("Branch sensitivity", self.microglia_branch_sensitivity)
+        self.microglia_branch_sensitivity.setVisible(False)
 
         self.microglia_analysis_debug = QCheckBox("Show analysis debug")
         self.microglia_analysis_debug.toggled.connect(self._set_microglia_debug_layers_enabled)
@@ -453,20 +450,17 @@ class ControlPanel(QWidget):
         form.addRow(self.microglia_analysis_debug)
 
         debug_layers = QWidget()
-        debug_layers_layout = QVBoxLayout(debug_layers)
+        debug_layers_layout = QGridLayout(debug_layers)
         debug_layers_layout.setContentsMargins(18, 0, 0, 0)
-        debug_layers_layout.setSpacing(4)
-
-        debug_row_one = QHBoxLayout()
-        debug_row_one.setSpacing(6)
-        debug_row_two = QHBoxLayout()
-        debug_row_two.setSpacing(6)
+        debug_layers_layout.setHorizontalSpacing(10)
+        debug_layers_layout.setVerticalSpacing(4)
 
         self.microglia_debug_voxels = QCheckBox("Voxels")
         self.microglia_debug_branches = QCheckBox("Branches")
         self.microglia_debug_soma = QCheckBox("Soma")
         self.microglia_debug_tips = QCheckBox("Tips")
         self.microglia_debug_tip_distance = QCheckBox("Tip distance")
+        self.microglia_debug_soma_distance = QCheckBox("Soma distance")
         self.microglia_debug_cell_distance = QCheckBox("Cell distance")
 
         for checkbox in (
@@ -475,20 +469,19 @@ class ControlPanel(QWidget):
             self.microglia_debug_soma,
             self.microglia_debug_tips,
             self.microglia_debug_tip_distance,
+            self.microglia_debug_soma_distance,
             self.microglia_debug_cell_distance,
         ):
             checkbox.setChecked(True)
             checkbox.toggled.connect(self._on_microglia_setting_changed)
 
-        debug_row_one.addWidget(self.microglia_debug_voxels)
-        debug_row_one.addWidget(self.microglia_debug_branches)
-        debug_row_one.addWidget(self.microglia_debug_soma)
-        debug_row_two.addWidget(self.microglia_debug_tips)
-        debug_row_two.addWidget(self.microglia_debug_tip_distance)
-        debug_row_two.addWidget(self.microglia_debug_cell_distance)
-
-        debug_layers_layout.addLayout(debug_row_one)
-        debug_layers_layout.addLayout(debug_row_two)
+        debug_layers_layout.addWidget(self.microglia_debug_voxels, 0, 0)
+        debug_layers_layout.addWidget(self.microglia_debug_branches, 0, 1)
+        debug_layers_layout.addWidget(self.microglia_debug_soma, 1, 0)
+        debug_layers_layout.addWidget(self.microglia_debug_tips, 1, 1)
+        debug_layers_layout.addWidget(self.microglia_debug_tip_distance, 2, 0)
+        debug_layers_layout.addWidget(self.microglia_debug_soma_distance, 2, 1)
+        debug_layers_layout.addWidget(self.microglia_debug_cell_distance, 3, 0, 1, 2)
         form.addRow("Layers", debug_layers)
         self._set_microglia_debug_layers_enabled(False)
 
@@ -515,19 +508,91 @@ class ControlPanel(QWidget):
 
         sec.add_layout(form)
 
+        action_panel = QFrame(self)
+        action_panel.setObjectName("workbenchActionPanel")
+        action_panel_layout = QVBoxLayout(action_panel)
+        action_panel_layout.setContentsMargins(8, 8, 8, 8)
+        action_panel_layout.setSpacing(6)
+
+        primary_row = QHBoxLayout()
+        primary_row.setSpacing(6)
+
         self.enhance_microglia_btn = QPushButton("  Enhance Microglia")
+        self.enhance_microglia_btn.setObjectName("workbenchPrimaryAction")
         self.enhance_microglia_btn.setIcon(icon("sparkles", ICON_SM, COLOR.accent))
         self.enhance_microglia_btn.setEnabled(False)
         self.enhance_microglia_btn.setToolTip(
             "Remove green-channel background after loading while preserving somas and branches."
         )
         self.enhance_microglia_btn.clicked.connect(self.enhance_microglia_requested.emit)
-        sec.add_widget(self.enhance_microglia_btn)
+        primary_row.addWidget(self.enhance_microglia_btn)
+
+        # Speck wipe — remove tiny isolated blobs from both channels.
+        wipe_form = QFormLayout()
+        wipe_form.setSpacing(6)
+        wipe_form.setContentsMargins(0, 0, 0, 0)
+        wipe_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        wipe_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self.wipe_speck_max_voxels = QSpinBox()
+        self.wipe_speck_max_voxels.setRange(1, 1_000_000)
+        self.wipe_speck_max_voxels.setValue(128)
+        self.wipe_speck_max_voxels.setSuffix(" vox")
+        self.wipe_speck_max_voxels.setKeyboardTracking(False)
+        self.wipe_speck_max_voxels.setToolTip(
+            "Largest isolated blob (in voxels) treated as a speck.\n"
+            "Connected components smaller than this are wiped from both channels;\n"
+            "larger structures (vessels, somas, branches) are kept."
+        )
+        wipe_form.addRow("Speck size <", self.wipe_speck_max_voxels)
+        action_panel_layout.addLayout(wipe_form)
+
+        # "Automatic on load" toggles — read every time a dataset finishes
+        # loading (including each dataset in a multi-stack project set). They are
+        # always enabled so they can be set before loading anything.
+        auto_header = QLabel("Automatic on load")
+        auto_header.setObjectName("sectionSubheading")
+        auto_header.setToolTip(
+            "Steps run automatically each time a dataset loads. Default thresholds "
+            "are always applied; the two toggles below control the cleanup passes."
+        )
+        action_panel_layout.addWidget(auto_header)
+
+        self.auto_enhance_on_load = QCheckBox("Enhance microglia (clean) on load")
+        self.auto_enhance_on_load.setChecked(True)
+        self.auto_enhance_on_load.setToolTip(
+            "Automatically run the selected microglia enhancement (default:\n"
+            "Microscopy clean soma/branch) on the green channel right after load.\n"
+            "Skipped when the dataset already has a cached enhancement."
+        )
+        action_panel_layout.addWidget(self.auto_enhance_on_load)
+
+        self.auto_wipe_on_load = QCheckBox("Wipe specks on load")
+        self.auto_wipe_on_load.setChecked(True)
+        self.auto_wipe_on_load.setToolTip(
+            "Automatically remove specks (below the size above) from both channels\n"
+            "right after a dataset finishes loading. Uncheck to load the raw stacks\n"
+            "and wipe manually with the button below."
+        )
+        action_panel_layout.addWidget(self.auto_wipe_on_load)
+
+        self.wipe_specks_btn = QPushButton("  Wipe Specks")
+        self.wipe_specks_btn.setObjectName("workbenchSecondaryAction")
+        self.wipe_specks_btn.setIcon(icon("trash", ICON_SM, COLOR.accent))
+        self.wipe_specks_btn.setEnabled(False)
+        self.wipe_specks_btn.setToolTip(
+            "Remove small isolated specks from both the microglia (green) and "
+            "vasculature (red) channels. Larger structures are preserved."
+        )
+        self.wipe_specks_btn.clicked.connect(self.wipe_specks_requested.emit)
+        primary_row.addWidget(self.wipe_specks_btn)
+        action_panel_layout.addLayout(primary_row)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
 
         self.run_microglia_segmentation_btn = QPushButton("Run Segmentation")
+        self.run_microglia_segmentation_btn.setObjectName("workbenchSecondaryAction")
         self.run_microglia_segmentation_btn.setEnabled(False)
         self.run_microglia_segmentation_btn.setToolTip(
             "Separate visible microglia into individual components using the current green threshold."
@@ -538,6 +603,7 @@ class ControlPanel(QWidget):
         action_row.addWidget(self.run_microglia_segmentation_btn)
 
         self.run_microglia_analysis_btn = QPushButton("Run Analysis")
+        self.run_microglia_analysis_btn.setObjectName("workbenchPrimaryAction")
         self.run_microglia_analysis_btn.setEnabled(False)
         self.run_microglia_analysis_btn.setToolTip(
             "Analyze the current visible microglia and vasculature view and open Analytics."
@@ -547,7 +613,8 @@ class ControlPanel(QWidget):
         )
         action_row.addWidget(self.run_microglia_analysis_btn)
 
-        sec.add_layout(action_row)
+        action_panel_layout.addLayout(action_row)
+        sec.add_widget(action_panel)
 
         return sec
 
@@ -621,6 +688,15 @@ class ControlPanel(QWidget):
         csv_btn.setToolTip("Export metrics to CSV file (Ctrl+E)")
         csv_btn.clicked.connect(self.export_metrics_requested.emit)
         exp_row.addWidget(csv_btn)
+
+        project_btn = QPushButton("  Project CSV")
+        project_btn.setIcon(icon("bar-chart", ICON_SM, COLOR.text_secondary))
+        project_btn.setToolTip(
+            "For project sets: apply this sample's thresholds/cleanup to every sample, "
+            "then export individual and cumulative analytics."
+        )
+        project_btn.clicked.connect(self.export_project_analytics_requested.emit)
+        exp_row.addWidget(project_btn)
 
         png_btn = QPushButton("  Snapshot")
         png_btn.setIcon(icon("camera", ICON_SM, COLOR.text_secondary))
@@ -788,6 +864,7 @@ class ControlPanel(QWidget):
             self.microglia_debug_soma,
             self.microglia_debug_tips,
             self.microglia_debug_tip_distance,
+            self.microglia_debug_soma_distance,
             self.microglia_debug_cell_distance,
         ):
             checkbox.setEnabled(active)
@@ -870,6 +947,8 @@ class ControlPanel(QWidget):
             layers.add("tips")
         if self.microglia_debug_tip_distance.isChecked():
             layers.add("tip_distance")
+        if self.microglia_debug_soma_distance.isChecked():
+            layers.add("soma_distance")
         if self.microglia_debug_cell_distance.isChecked():
             layers.add("cell_distance")
         return layers
@@ -904,6 +983,16 @@ class ControlPanel(QWidget):
 
     def set_microglia_enhancement_enabled(self, enabled: bool) -> None:
         self.enhance_microglia_btn.setEnabled(bool(enabled))
+        self.wipe_specks_btn.setEnabled(bool(enabled))
+
+    def current_wipe_speck_max_voxels(self) -> int:
+        return int(self.wipe_speck_max_voxels.value())
+
+    def auto_wipe_specks_on_load_enabled(self) -> bool:
+        return bool(self.auto_wipe_on_load.isChecked())
+
+    def auto_enhance_microglia_on_load_enabled(self) -> bool:
+        return bool(self.auto_enhance_on_load.isChecked())
 
     def set_microglia_workflow_enabled(self, enabled: bool) -> None:
         workflow_enabled = bool(enabled)

@@ -52,10 +52,3 @@ def get_executor(workers: int, prefix: str = "nvap-pre") -> _ExecutorHandle:
     return _ExecutorHandle(_executor)
 
 
-def shutdown_executor() -> None:
-    """Shut down the shared executor if running."""
-    global _executor, _executor_workers
-    if _executor is not None:
-        _executor.shutdown(wait=False)
-        _executor = None
-        _executor_workers = 0

@@ -3,9 +3,14 @@ from __future__ import annotations
 import pytest
 import numpy as np
 
+import scipy.ndimage as ndi
+
 from nvap.analysis.microglia_analysis import (
+    _HAS_GEODESIC_TIPS,
     _gate_and_cluster_tips,
+    _nearest_segment_between_masks,
     _spacing_zyx,
+    _voxel_tip_coords_geodesic,
     analyze_microglia_cells,
     build_microglia_cell_debug,
     microglia_analysis_to_csv_rows,
@@ -69,6 +74,35 @@ def test_gate_and_cluster_tips_drops_endpoints_below_visibility_floor() -> None:
     assert int(out[0, 2]) == 5
 
 
+def test_gate_and_cluster_tips_requires_component_support() -> None:
+    spacing = _spacing_zyx((1.0, 1.0, 1.0))
+    dist = np.full((3, 20, 20), 0.5, dtype=np.float32)
+    soma = np.zeros((3, 20, 20), dtype=bool)
+    soma[1, 1, 1] = True
+    support = np.zeros((3, 20, 20), dtype=bool)
+    support[1, 10, 5] = True
+
+    tips = np.array(
+        [
+            [1, 10, 6],  # tiny graph miss: snaps back onto the real component voxel
+            [1, 10, 15],  # unsupported floater: too far from any component voxel
+        ],
+        dtype=np.int32,
+    )
+
+    out = _gate_and_cluster_tips(
+        tips,
+        dist_local=dist,
+        soma_local=soma,
+        spacing_zyx=spacing,
+        branch_sensitivity=1.0,
+        support_mask=support,
+    )
+
+    assert out.tolist() == [[1, 10, 5]]
+    assert support[tuple(out[0])]
+
+
 def test_gate_and_cluster_tips_radius_scales_with_sensitivity() -> None:
     spacing = _spacing_zyx((1.0, 1.0, 1.0))
     dist = np.full((3, 20, 20), 0.5, dtype=np.float32)
@@ -87,6 +121,105 @@ def test_gate_and_cluster_tips_radius_scales_with_sensitivity() -> None:
     assert high.shape[0] == 2  # small merge radius keeps them distinct
 
 
+@pytest.mark.skipif(not _HAS_GEODESIC_TIPS, reason="skimage.graph unavailable")
+def test_voxel_tip_coords_geodesic_finds_one_tip_per_process() -> None:
+    spacing = _spacing_zyx((1.0, 1.0, 1.0))
+    # Soma blob with two thin processes reaching out along +x and -x; the
+    # geodesic field from the soma peaks once at each distal end.
+    mask = np.zeros((5, 21, 21), dtype=bool)
+    mask[2, 8:13, 8:13] = True   # soma blob
+    mask[2, 10, 13:19] = True    # process +x, distal end at x=18
+    mask[2, 10, 2:8] = True      # process -x, distal end at x=2
+    soma = np.zeros_like(mask)
+    soma[2, 9:12, 9:12] = True   # soma core (subset of the blob)
+    dist = ndi.distance_transform_edt(mask, sampling=(1.0, 1.0, 1.0))
+
+    tips = _voxel_tip_coords_geodesic(
+        mask,
+        soma_local=soma,
+        dist_local=dist,
+        spacing_zyx=spacing,
+        min_process_length_um=3.0,
+        branch_sensitivity=1.0,
+    )
+
+    assert tips.shape[0] == 2
+    assert sorted(int(t[2]) for t in tips) == [2, 18]
+    assert all(mask[tuple(t)] for t in tips)  # tips always land on the voxel cloud
+
+
+@pytest.mark.skipif(not _HAS_GEODESIC_TIPS, reason="skimage.graph unavailable")
+def test_voxel_tip_coords_geodesic_length_threshold_gates_short_processes() -> None:
+    spacing = _spacing_zyx((1.0, 1.0, 1.0))
+    # A soma with one short process (~3 um geodesic from the soma core). The
+    # minimum-process-length knob decides whether it survives.
+    mask = np.zeros((5, 15, 15), dtype=bool)
+    mask[2, 5:10, 5:10] = True
+    mask[2, 7, 10:12] = True  # short stub, distal end at x=11
+    soma = np.zeros_like(mask)
+    soma[2, 6:9, 6:9] = True
+    dist = ndi.distance_transform_edt(mask, sampling=(1.0, 1.0, 1.0))
+
+    def _tips(min_len: float) -> np.ndarray:
+        return _voxel_tip_coords_geodesic(
+            mask,
+            soma_local=soma,
+            dist_local=dist,
+            spacing_zyx=spacing,
+            min_process_length_um=min_len,
+            branch_sensitivity=1.0,
+        )
+
+    assert _tips(7.0).shape[0] == 0  # threshold well above the stub length -> dropped
+    kept = _tips(1.0)
+    assert kept.shape[0] == 1  # threshold below the stub length -> kept
+    assert int(kept[0, 2]) == 11  # at the distal end
+
+
+@pytest.mark.skipif(not _HAS_GEODESIC_TIPS, reason="skimage.graph unavailable")
+def test_voxel_tip_coords_geodesic_keeps_short_visible_terminal_by_default() -> None:
+    spacing = _spacing_zyx((1.0, 1.0, 1.0))
+    mask = np.zeros((5, 15, 15), dtype=bool)
+    mask[2, 5:10, 5:10] = True
+    mask[2, 7, 10:12] = True
+    soma = np.zeros_like(mask)
+    soma[2, 6:9, 6:9] = True
+    dist = ndi.distance_transform_edt(mask, sampling=(1.0, 1.0, 1.0))
+
+    tips = _voxel_tip_coords_geodesic(
+        mask,
+        soma_local=soma,
+        dist_local=dist,
+        spacing_zyx=spacing,
+        min_process_length_um=3.0,
+        branch_sensitivity=1.0,
+    )
+
+    assert tips.shape[0] == 1
+    assert tuple(int(v) for v in tips[0]) == (2, 7, 11)
+
+
+def test_nearest_segment_between_masks_prefers_positive_distance_pair() -> None:
+    spacing = _spacing_zyx((1.0, 1.0, 1.0))
+    sample = np.zeros((1, 1, 6), dtype=bool)
+    sample[0, 0, 2] = True
+    sample[0, 0, 5] = True
+    vessel = np.zeros_like(sample)
+    vessel[0, 0, 0] = True
+    vessel[0, 0, 5] = True
+
+    segment = _nearest_segment_between_masks(
+        sample,
+        vessel,
+        spacing_zyx=spacing,
+        known_distance_um=2.0,
+    )
+
+    assert segment is not None
+    assert tuple(int(v) for v in segment[0]) == (0, 0, 2)
+    assert tuple(int(v) for v in segment[1]) == (0, 0, 0)
+
+
 def test_microglia_analysis_counts_branches_and_vessel_distances() -> None:
     green = np.zeros((9, 21, 21), dtype=np.float32)
     green[3:6, 8:13, 8:13] = 1.0
@@ -97,6 +230,7 @@ def test_microglia_analysis_counts_branches_and_vessel_distances() -> None:
     labels[green > 0.5] = 1
 
     red = np.zeros_like(green)
+    red[4, 10, 2] = 1.0
     red[4, 10, 18] = 1.0
 
     result = analyze_microglia_cells(
@@ -125,6 +259,14 @@ def test_microglia_analysis_counts_branches_and_vessel_distances() -> None:
     assert cell.soma_voxel_count < cell.voxel_count
     assert cell.nearest_tip_to_vessel_um == pytest.approx(1.0)
     assert cell.nearest_cell_to_vessel_um == pytest.approx(1.0)
+    assert cell.soma_centroid_to_vessel_um is not None
+    assert cell.soma_centroid_to_vessel_um > cell.nearest_cell_to_vessel_um
+    assert cell.soma_equivalent_diameter_um > 0.0
+    assert 0.0 < cell.soma_roundness <= 1.0
+    assert cell.mean_branch_tortuosity >= 1.0
+    assert cell.tip_near_vessel_component_count == 2
+    assert cell.tips_near_multiple_vessels is True
+    assert result.cells_with_tips_near_multiple_vessels == 1
 
 
 def test_microglia_analysis_counts_component_owned_low_threshold_voxels() -> None:
@@ -310,6 +452,10 @@ def test_microglia_analysis_csv_rows_follow_cell_metrics() -> None:
     assert len(rows) == 1
     assert rows[0]["component_id"] == 1
     assert rows[0]["voxel_count"] == result.cells[0].voxel_count
+    assert "soma_centroid_to_vessel_um" in rows[0]
+    assert "soma_roundness" in rows[0]
+    assert "mean_branch_tortuosity" in rows[0]
+    assert "tip_near_vessel_component_count" in rows[0]
 
 
 def test_microglia_cell_debug_returns_soma_tips_and_vessel_segments() -> None:
@@ -335,6 +481,7 @@ def test_microglia_cell_debug_returns_soma_tips_and_vessel_segments() -> None:
             trim_last_slices=0,
         ),
         known_tip_distance_um=1.0,
+        known_soma_distance_um=1.0,
         known_cell_distance_um=1.0,
     )
 
@@ -345,6 +492,7 @@ def test_microglia_cell_debug_returns_soma_tips_and_vessel_segments() -> None:
     assert debug.soma_sample_coords_zyx.shape[0] > 0
     assert debug.tip_coords_zyx.shape[0] == 2
     assert debug.nearest_tip_segment_zyx is not None
+    assert debug.nearest_soma_segment_zyx is not None
     assert debug.nearest_cell_segment_zyx is not None
 
 

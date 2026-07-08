@@ -3,9 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from nvap.analysis.microglia_components import compute_component_labels
-from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig, VoxelSpacing
 from nvap.pipeline import default_green_threshold
-from nvap.ui.main_window import MainWindow
 
 
 def _make_dim_microglia_volume() -> np.ndarray:
@@ -50,20 +48,3 @@ def test_default_green_threshold_is_branch_aware_for_dim_microglia() -> None:
     assert len(order_fixed) == 0
 
 
-def test_reprocess_result_recomputes_thresholds_from_processed_green_volume() -> None:
-    spacing = VoxelSpacing()
-    green = _make_dim_microglia_volume()
-    red = np.zeros_like(green, dtype=np.float32)
-    dataset = DatasetVolume(
-        green=ChannelVolume("green", green, list(range(green.shape[0])), spacing),
-        red=ChannelVolume("red", red, list(range(red.shape[0])), spacing),
-        shared_z_range=(0, green.shape[0] - 1),
-    )
-
-    result = MainWindow._build_process_task_result(dataset, PreprocessConfig())
-
-    assert result.processed_dataset is dataset
-    assert result.visual_dataset.green.data.shape == dataset.green.data.shape
-    assert result.visual_dataset.red.data.shape == dataset.red.data.shape
-    assert 0.03 <= result.threshold_green < 0.5
-    assert 0.0 <= result.threshold_red <= 1.0

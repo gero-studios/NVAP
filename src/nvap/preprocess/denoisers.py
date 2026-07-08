@@ -17,22 +17,24 @@ from typing import Callable
 
 import numpy as np
 import scipy.ndimage as ndi
-from skimage.restoration import denoise_nl_means, denoise_wavelet
+from skimage.restoration import denoise_wavelet
 
 from nvap.config.types import PreprocessConfig
+from nvap.accelerate import torch_gaussian_filter
 from nvap.preprocess._executor import get_executor
+from nvap.runtime_optimization import configured_cpu_workers
 
 logger = logging.getLogger(__name__)
 _CHUNK_NLM_VOXEL_THRESHOLD = 64 * 1024 * 1024
 _FAST_CLASSICAL_VOXEL_THRESHOLD = 96 * 1024 * 1024
+_GPU_FILTER_MIN_VOXELS = 4 * 1024 * 1024
 
 
 def _resolve_worker_threads(config: PreprocessConfig) -> int:
     requested = int(config.cpu_worker_threads)
     if requested > 0:
         return max(1, requested)
-    cpus = os.cpu_count() or 1
-    return max(1, min(8, cpus))
+    return max(1, min(32, configured_cpu_workers(os.cpu_count() or 1)))
 
 
 def _detect_gpu_backend() -> str:
@@ -51,6 +53,26 @@ def _detect_gpu_backend() -> str:
     return "cpu"
 
 
+def _gaussian_filter_fast(
+    volume: np.ndarray,
+    sigma: tuple[float, ...],
+    *,
+    mode: str = "nearest",
+    output: np.ndarray | None = None,
+) -> np.ndarray:
+    arr = np.asarray(volume, dtype=np.float32)
+    accelerated = None
+    if mode == "nearest" and arr.size >= _GPU_FILTER_MIN_VOXELS:
+        accelerated = torch_gaussian_filter(arr, sigma=sigma)
+    if accelerated is None:
+        result = ndi.gaussian_filter(arr, sigma=sigma, mode=mode, output=output)
+        return np.asarray(result if output is None else output, dtype=np.float32)
+    if output is not None:
+        output[...] = accelerated
+        return output
+    return np.asarray(accelerated, dtype=np.float32)
+
+
 class BackendUnavailableError(RuntimeError):
     """Raised when an optional denoising backend cannot run."""
 
@@ -65,7 +87,7 @@ def estimate_noise_sigma(volume: np.ndarray) -> float:
         sample = arr[::step][:target_slices]
         sample = sample[:, ::2, ::2]
         arr = sample
-    smooth = ndi.gaussian_filter(arr, sigma=(0.0, 1.2, 1.2), mode="nearest")
+    smooth = _gaussian_filter_fast(arr, sigma=(0.0, 1.2, 1.2), mode="nearest")
     residual = arr - smooth
     median = float(np.median(residual))
     mad = float(np.median(np.abs(residual - median)))
@@ -149,7 +171,7 @@ def denoise_wavelet_slicewise(
             out[z] = result
 
     # Light Z-axis smoothing for inter-slice continuity
-    out = ndi.gaussian_filter(out, sigma=(0.3, 0.0, 0.0), mode="nearest")
+    out = _gaussian_filter_fast(out, sigma=(0.3, 0.0, 0.0), mode="nearest")
     return out
 
 
@@ -160,7 +182,7 @@ def denoise_wavelet_slicewise(
 def denoise_legacy_anisotropic(volume: np.ndarray, denoise_strength: float) -> np.ndarray:
     sigma_xy = float(max(denoise_strength * 24.0, 0.15))
     sigma_z = sigma_xy * 0.55
-    out = ndi.gaussian_filter(
+    out = _gaussian_filter_fast(
         np.asarray(volume, dtype=np.float32),
         sigma=(sigma_z, sigma_xy, sigma_xy),
         mode="nearest",
@@ -280,7 +302,7 @@ def denoise_classical_branch_aware(
         blended = anscombe_inverse(blended)
 
     # Very light post-smoothing for residual wavelet artifacts
-    post = ndi.gaussian_filter(
+    post = _gaussian_filter_fast(
         np.asarray(blended, dtype=np.float32),
         sigma=(0.08, 0.15, 0.15),
         mode="nearest",
@@ -320,12 +342,12 @@ def denoise_pixel2voxel_no_psf(
     slicewise = denoise_wavelet_slicewise(arr, noise_sigma, config, strength=slice_strength, workers=workers)
     volumetric = denoise_wavelet_3d(arr, noise_sigma, config, strength=voxel_strength)
     # Apply axial smoothing in-place to volumetric (reuse buffer).
-    ndi.gaussian_filter(volumetric, sigma=(0.65, 0.0, 0.0), mode="nearest", output=volumetric)
+    _gaussian_filter_fast(volumetric, sigma=(0.65, 0.0, 0.0), mode="nearest", output=volumetric)
 
     # Estimate how coherent signal is across neighboring slices.
     z_delta = np.abs(np.diff(arr, axis=0, prepend=arr[:1]))
     np.exp(-z_delta / float(max(noise_sigma * 2.5, 1.0e-4)), out=z_delta)  # reuse as z_consistency
-    ndi.gaussian_filter(z_delta, sigma=(0.45, 0.7, 0.7), mode="nearest", output=z_delta)
+    _gaussian_filter_fast(z_delta, sigma=(0.45, 0.7, 0.7), mode="nearest", output=z_delta)
 
     # Protect branch-like structures with higher slice-wise contribution.
     # Compute slice_weight in-place reusing z_delta buffer.

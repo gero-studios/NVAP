@@ -133,7 +133,34 @@ def test_scene_builds_surface_pipeline_only_when_surface_mode_is_enabled() -> No
     assert actor.marching is not None
     assert actor.volume_actor.GetVisibility() == 0
     assert actor.iso_actor.GetVisibility() == 1
+    assert actor.iso_actor.GetMapper().GetScalarVisibility() == 0
 
+    scene.widget().close()
+    app.processEvents()
+
+
+@pytest.mark.integration
+def test_scene_renders_distance_debug_on_overlay_layer() -> None:
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    pytest.importorskip("vtkmodules")
+
+    from nvap.render.vtk_scene import MicrogliaDebugOverlay, VTKScene
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scene = VTKScene()
+    overlay = MicrogliaDebugOverlay(
+        tip_segments_xyz=np.asarray([[[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]]], dtype=np.float32),
+        soma_segments_xyz=np.asarray([[[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]], dtype=np.float32),
+        cell_segments_xyz=np.asarray([[[0.0, 2.0, 0.0], [0.0, 5.0, 0.0]]], dtype=np.float32),
+    )
+
+    scene.set_microglia_analysis_debug(overlay)
+
+    assert scene._overlay_renderer.GetLayer() == 1
+    assert scene._overlay_renderer.GetActors().GetNumberOfItems() >= 3
+    assert scene._overlay_renderer.GetActors().GetNumberOfItems() == len(scene._microglia_debug_actors)
+
+    scene.cleanup()
     scene.widget().close()
     app.processEvents()
 

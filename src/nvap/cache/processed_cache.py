@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +30,7 @@ def clear_processed_cache(base_dir: str | Path | None = None) -> tuple[int, Path
     Safety rules:
     - Never traverses outside ``<base_dir>/.nvap_cache``.
     - Never deletes directories.
-    - Deletes only files matching ``processed_*.npz``.
+    - Deletes only files matching ``processed_*.npz`` or ``processed_*.json``.
     - Skips symlinks.
     """
     root = Path(base_dir).resolve() if base_dir is not None else Path.cwd()
@@ -47,7 +49,11 @@ def clear_processed_cache(base_dir: str | Path | None = None) -> tuple[int, Path
     for child in target.iterdir():
         if child.is_symlink():
             continue
-        if child.is_file() and child.suffix.lower() == ".npz" and child.name.startswith("processed_"):
+        if (
+            child.is_file()
+            and child.suffix.lower() in {".npz", ".json"}
+            and child.name.startswith("processed_")
+        ):
             child.unlink()
             removed += 1
     logger.info("Cleared processed cache files: removed=%d path=%s", removed, target)
@@ -152,6 +158,23 @@ def _cache_file_path(cache_key: str, base_dir: str | Path | None = None) -> Path
     return cache_dir(base_dir) / f"processed_{cache_key}.npz"
 
 
+def _cache_metadata_path(cache_key: str, base_dir: str | Path | None = None) -> Path:
+    return cache_dir(base_dir) / f"processed_{cache_key}.json"
+
+
+def _save_npz_fast(path: Path, **arrays: object) -> None:
+    compress = os.environ.get("NVAP_CACHE_COMPRESS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if compress:
+        np.savez_compressed(path, **arrays)
+    else:
+        np.savez(path, **arrays)
+
+
 def has_processed_cache(cache_key: str, base_dir: str | Path | None = None) -> bool:
     return _cache_file_path(cache_key, base_dir=base_dir).exists()
 
@@ -162,7 +185,7 @@ def save_processed_dataset(
     base_dir: str | Path | None = None,
 ) -> Path:
     path = _cache_file_path(cache_key, base_dir=base_dir)
-    np.savez_compressed(
+    _save_npz_fast(
         path,
         cache_version=np.int32(CACHE_VERSION),
         green_data=dataset.green.data.astype(np.float32, copy=False),
@@ -173,6 +196,46 @@ def save_processed_dataset(
     )
     logger.info("Saved processed dataset cache: %s", path)
     return path
+
+
+def save_processed_metadata(
+    cache_key: str,
+    *,
+    threshold_green: float | None = None,
+    threshold_red: float | None = None,
+    base_dir: str | Path | None = None,
+) -> Path:
+    path = _cache_metadata_path(cache_key, base_dir=base_dir)
+    payload = {
+        "cache_version": CACHE_VERSION,
+        "threshold_green": None if threshold_green is None else float(threshold_green),
+        "threshold_red": None if threshold_red is None else float(threshold_red),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("Saved processed metadata cache: %s", path)
+    return path
+
+
+def load_processed_thresholds(
+    cache_key: str,
+    base_dir: str | Path | None = None,
+) -> tuple[float, float] | None:
+    path = _cache_metadata_path(cache_key, base_dir=base_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if int(payload.get("cache_version", -1)) != CACHE_VERSION:
+            logger.info("Ignoring stale processed metadata version in %s", path)
+            return None
+        green = payload.get("threshold_green")
+        red = payload.get("threshold_red")
+        if green is None or red is None:
+            return None
+        return float(green), float(red)
+    except Exception as exc:
+        logger.warning("Failed to load processed metadata %s: %s", path, exc)
+        return None
 
 
 def load_processed_dataset(
@@ -213,4 +276,47 @@ def load_processed_dataset(
             return result
     except Exception as exc:
         logger.warning("Failed to load cache %s: %s", path, exc)
+        return None
+
+
+def _enhanced_cache_file_path(base_cache_key: str, method: str, base_dir: str | Path | None = None) -> Path:
+    return cache_dir(base_dir) / f"enhanced_{base_cache_key}_{method}.npz"
+
+
+
+def save_enhanced_dataset(
+    base_cache_key: str,
+    method: str,
+    enhanced_green_data: np.ndarray,
+    base_dir: str | Path | None = None,
+) -> Path:
+    path = _enhanced_cache_file_path(base_cache_key, method, base_dir=base_dir)
+    _save_npz_fast(
+        path,
+        cache_version=np.int32(CACHE_VERSION),
+        green_data=enhanced_green_data.astype(np.float32, copy=False),
+    )
+    logger.info("Saved enhanced green cache: %s", path)
+    return path
+
+
+def load_enhanced_green(
+    base_cache_key: str,
+    method: str,
+    base_dir: str | Path | None = None,
+) -> np.ndarray | None:
+    path = _enhanced_cache_file_path(base_cache_key, method, base_dir=base_dir)
+    if not path.exists():
+        return None
+    try:
+        with np.load(path) as data:
+            version = int(data["cache_version"])
+            if version != CACHE_VERSION:
+                logger.info("Ignoring stale enhanced cache version in %s", path)
+                return None
+            result = np.asarray(data["green_data"], dtype=np.float32)
+            logger.info("Loaded enhanced green cache: %s", path)
+            return result
+    except Exception as exc:
+        logger.warning("Failed to load enhanced cache %s: %s", path, exc)
         return None

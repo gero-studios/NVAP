@@ -38,6 +38,7 @@ def save_project_state(
     psf_config: PSFConfig,
     preprocess_config: PreprocessConfig,
     cache_key: str | None = None,
+    enhancement_method: str | None = None,
 ) -> Path:
     """Write a small project descriptor next to the dataset."""
     root_path = Path(root).resolve()
@@ -53,6 +54,7 @@ def save_project_state(
         },
         "dataset_signature": dataset_signature,
         "processed_cache_key": cache_key,
+        "microglia_enhancement_method": enhancement_method,
         "spacing": _dataclass_payload(spacing),
         "psf_config": _dataclass_payload(psf_config),
         "preprocess_config": _dataclass_payload(preprocess_config),
