@@ -1,6 +1,10 @@
 /.nvap_cache
 /Input
 
+# Build output — released via GitHub Releases, not committed to git.
+/build/
+/dist/
+
 # Generated processed-volume caches and per-dataset project state, wherever they
 # appear (e.g. under samples/ when a bundled dataset is loaded). The raw sample
 # images are tracked; their regenerated caches are not.

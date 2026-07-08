@@ -38,15 +38,18 @@ Invoke-Checked { & $PythonExe --version } "Python version check"
 Write-Host "Installing NVAP and packaging dependencies..."
 Invoke-Checked { & $PythonExe -m pip install --upgrade pip } "pip upgrade"
 $extras = "dev"
+$resolvedMode = "cpu"
 $pyVersion = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
 $isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )
 if ($Acceleration -eq "directml" -or ($Acceleration -eq "auto" -and $isWindows -and [version]$pyVersion -lt [version]"3.13")) {
     $extras = "dev,directml"
+    $resolvedMode = "directml"
     Write-Host "DirectML acceleration will be included when wheels are available for Python $pyVersion."
 } elseif ($Acceleration -eq "torch") {
     $extras = "dev,denoise_torch"
+    $resolvedMode = "torch"
     Write-Host "Torch acceleration dependencies will be included."
 } else {
     Write-Host "Building CPU-safe package. Runtime still auto-detects any bundled GPU backend."
@@ -58,6 +61,11 @@ $pyInstallerArgs = @(
     "--clean",
     "--$PackageMode",
     "--name", "NVAP",
+    # UPX-packed, unsigned PyInstaller binaries are a classic false-positive
+    # trigger for Windows Defender / SmartScreen and other AV heuristics.
+    # Disabling UPX regardless of whether it happens to be on PATH keeps the
+    # packaged exe from tripping that heuristic.
+    "--noupx",
     "--collect-submodules", "vtkmodules",
     "--collect-submodules", "PySide6",
     "--copy-metadata", "imageio",
@@ -79,17 +87,25 @@ if (Test-Path "samples") {
     $pyInstallerArgs += @("--add-data", "samples;samples")
 }
 
-if (Test-PythonImport "torch") {
+# Only bundle torch / torch-directml when the requested acceleration mode
+# actually calls for them. Probing "is it importable" instead of the resolved
+# mode would sweep a stray torch install (e.g. left over from a different
+# build) into a "CPU-safe" package, silently bloating it and defeating the
+# whole point of the CPU-safe build.
+if ($resolvedMode -eq "torch" -and (Test-PythonImport "torch")) {
     Write-Host "Including torch modules in executable."
     $pyInstallerArgs += @("--collect-submodules", "torch")
 }
-if (Test-PythonImport "torch_directml") {
+if ($resolvedMode -eq "directml" -and (Test-PythonImport "torch_directml")) {
     Write-Host "Including torch-directml modules in executable."
     $pyInstallerArgs += @(
         "--collect-submodules", "torch_directml",
         "--collect-binaries", "torch_directml",
         "--copy-metadata", "torch-directml"
     )
+}
+if ($resolvedMode -eq "cpu") {
+    $pyInstallerArgs += @("--exclude-module", "torch", "--exclude-module", "torch_directml")
 }
 $pyInstallerArgs += "src\nvap\app.py"
 
