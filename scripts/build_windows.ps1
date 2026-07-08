@@ -32,6 +32,32 @@ function Remove-IntermediateBuildExe {
     Write-Host "Removed non-runnable PyInstaller intermediate: build\NVAP\NVAP.exe"
 }
 
+$buildMetadataPath = Join-Path (Get-Location) "src\nvap\_build_metadata.py"
+$buildMetadataOriginal = $null
+
+function Write-BuildMetadata {
+    param([string]$Variant)
+    $script:buildMetadataOriginal = Get-Content -LiteralPath $buildMetadataPath -Raw
+    $commit = (git rev-parse --short HEAD).Trim()
+    $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    @"
+"""Build identity used only by the update-check. Auto-generated for this
+build by scripts/build_windows.ps1; restored to dev defaults afterward."""
+
+BUILD_COMMIT = "$commit"
+BUILD_VARIANT = "$Variant"
+BUILT_AT = "$builtAt"
+"@ | Set-Content -LiteralPath $buildMetadataPath -Encoding utf8
+    Write-Host "Baked build metadata: commit=$commit variant=$Variant built_at=$builtAt"
+}
+
+function Restore-BuildMetadata {
+    if ($null -ne $script:buildMetadataOriginal) {
+        Set-Content -LiteralPath $buildMetadataPath -Value $script:buildMetadataOriginal -Encoding utf8 -NoNewline
+        Write-Host "Restored dev build metadata stub."
+    }
+}
+
 Write-Host "Using Python executable: $PythonExe"
 Invoke-Checked { & $PythonExe --version } "Python version check"
 
@@ -116,10 +142,12 @@ if ($PackageMode -eq "onefile") {
     $packagedExe = "dist\NVAP\NVAP.exe"
     Write-Host "Building one-folder executable with PyInstaller..."
 }
+Write-BuildMetadata -Variant $resolvedMode
 try {
     Invoke-Checked { & $PythonExe -m PyInstaller @pyInstallerArgs } "PyInstaller build"
 }
 finally {
+    Restore-BuildMetadata
     if (-not $KeepBuildExe) {
         Remove-IntermediateBuildExe
     }

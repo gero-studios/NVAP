@@ -13,8 +13,8 @@ from typing import Callable
 
 import numpy as np
 import scipy.ndimage as ndi
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QObject, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -115,6 +115,7 @@ from nvap.ui.services.project_files import (
     save_project_state,
 )
 from nvap.ui.services.system_status import SystemStatus, gpu_status, memory_status
+from nvap.update_check import UpdateInfo, check_for_update_async
 from nvap.ui.sidebar_pages import SettingsPage
 
 logger = logging.getLogger(__name__)
@@ -280,6 +281,10 @@ class _FunctionThread(QThread):
 
 
 class MainWindow(QMainWindow):
+    # Emitted from the background update-check thread; Qt marshals delivery
+    # onto this (GUI) thread automatically since emitter and receiver differ.
+    _update_available = Signal(object)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("NVAP — NeuroVascular Analytics Program")
@@ -464,6 +469,25 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Load a dataset to begin. Preprocessing is ON by default.")
         self._log_info("NVAP UI initialized: green pass-through mode active.")
         self._refresh_section_state()
+        self._update_available.connect(self._on_update_available)
+        check_for_update_async(self._update_available.emit)
+
+    def _on_update_available(self, info: object) -> None:
+        if not isinstance(info, UpdateInfo):
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Update available")
+        box.setText(
+            "A newer NVAP build is available:\n"
+            f"{info.build_description}\n\n"
+            "This does not update automatically — open the download page to get it."
+        )
+        open_btn = box.addButton("Open Download Page", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl(info.download_url))
 
     def closeEvent(self, event) -> None:
         try:

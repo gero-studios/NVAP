@@ -1,11 +1,13 @@
 README.md
 pyproject.toml
 src/nvap/__init__.py
+src/nvap/_build_metadata.py
 src/nvap/accelerate.py
 src/nvap/app.py
 src/nvap/pipeline.py
 src/nvap/runtime_optimization.py
 src/nvap/samples.py
+src/nvap/update_check.py
 src/nvap.egg-info/PKG-INFO
 src/nvap.egg-info/SOURCES.txt
 src/nvap.egg-info/dependency_links.txt
