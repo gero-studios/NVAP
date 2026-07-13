@@ -218,3 +218,25 @@ def default_green_threshold(volume: np.ndarray, fallback: float = 0.15) -> float
     result = suggest_green_threshold(volume, fallback=fallback)
     logger.debug("Computed branch-aware green threshold=%.5f fallback=%.5f", result, fallback)
     return result
+
+
+def automatic_thresholds(
+    dataset: DatasetVolume,
+    *,
+    green_fallback: float = 0.80,
+    red_fallback: float = 0.60,
+) -> tuple[float, float]:
+    """Return data-driven render thresholds for the green and red channels.
+
+    Green uses the branch-aware microglia threshold suggestion, while red uses
+    Otsu's intensity threshold. Fallbacks are retained for empty or degenerate
+    channels so automatic thresholding remains safe on blank stacks.
+    """
+    green_values = np.asarray(dataset.green.data, dtype=np.float32)
+    finite_green = green_values[np.isfinite(green_values)]
+    if finite_green.size == 0 or float(finite_green.max()) <= 0.0:
+        green = float(green_fallback)
+    else:
+        green = default_green_threshold(green_values, fallback=green_fallback)
+    red = default_threshold(dataset.red.data, fallback=red_fallback)
+    return float(green), float(red)

@@ -11,12 +11,13 @@ import imageio.v3 as iio
 import numpy as np
 
 from nvap.config.types import DEFAULT_SPACING, ChannelVolume, DatasetVolume, VoxelSpacing
+from nvap.io.czi_loader import load_czi_channels, read_czi_shape
 from nvap.preprocess._executor import get_executor
 from nvap.runtime_optimization import configured_cpu_workers
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_IMAGE_EXTENSIONS = (".png", ".tif", ".tiff")
+SUPPORTED_IMAGE_EXTENSIONS = (".png", ".tif", ".tiff", ".czi")
 FILE_PATTERN = re.compile(
     r"_z(?P<z>\d+)(?P<channel>c[12])(?:\.png|\.tif|\.tiff)$",
     re.IGNORECASE,
@@ -617,6 +618,22 @@ def _shared_z_range(green: ChannelVolume, red: ChannelVolume) -> tuple[int, int]
 
 
 def _channel_stack_stats(channel_name: str, channel_source: Path) -> ChannelStackStats:
+    if channel_source.is_file() and channel_source.suffix.lower() == ".czi":
+        channels, depth, height, width = read_czi_shape(channel_source)
+        if channels < 2:
+            raise ValueError(
+                f"NVAP requires at least two CZI channels; {channel_source.name} contains {channels}."
+            )
+        return ChannelStackStats(
+            name=channel_name,
+            slice_count=int(depth),
+            z_min=1,
+            z_max=int(depth),
+            full_slice_count=int(depth),
+            missing_count=0,
+            width=int(width),
+            height=int(height),
+        )
     try:
         z_and_files = _list_channel_files(channel_source, channel_name)
         z_values = [z for z, _ in z_and_files]
@@ -660,7 +677,7 @@ def _channel_stack_stats(channel_name: str, channel_source: Path) -> ChannelStac
 
 def load_dataset(
     input_root: str | Path,
-    spacing: VoxelSpacing = DEFAULT_SPACING,
+    spacing: VoxelSpacing | None = None,
     channel_overrides: dict[str, str | Path] | None = None,
 ) -> DatasetVolume:
     root = Path(input_root).resolve()
@@ -669,14 +686,21 @@ def load_dataset(
 
     green_source = channel_dirs["green"]
     red_source = channel_dirs["red"]
+    if green_source == red_source and green_source.suffix.lower() == ".czi":
+        green, red, _ = load_czi_channels(green_source, spacing=spacing)
+        shared = _shared_z_range(green, red)
+        logger.info("Shared z range: %s", shared)
+        return DatasetVolume(green=green, red=red, shared_z_range=shared)
+
+    effective_spacing = spacing or DEFAULT_SPACING
     combined = None
     if green_source == red_source and not _has_exact_channel_sequence(green_source):
-        combined = _load_combined_channels(green_source, spacing)
+        combined = _load_combined_channels(green_source, effective_spacing)
     if combined is not None:
         green, red = combined
     else:
-        green = _load_channel("green", green_source, spacing)
-        red = _load_channel("red", red_source, spacing)
+        green = _load_channel("green", green_source, effective_spacing)
+        red = _load_channel("red", red_source, effective_spacing)
     shared = _shared_z_range(green, red)
     logger.info("Shared z range: %s", shared)
     return DatasetVolume(green=green, red=red, shared_z_range=shared)
@@ -740,6 +764,11 @@ def resolve_channel_dirs(
             # Also allow a single combined RGB stack TIFF/PNG file.
             image_files = _iter_image_files(candidate)
             if len(image_files) == 1:
+                if image_files[0].suffix.lower() == ".czi":
+                    channel_dirs["green"] = image_files[0]
+                    channel_dirs["red"] = image_files[0]
+                    logger.info("Auto-detected CZI stack under: %s", candidate)
+                    return channel_dirs
                 try:
                     img = iio.imread(image_files[0])
                 except Exception:

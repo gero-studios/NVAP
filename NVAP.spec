@@ -6,6 +6,8 @@ from PyInstaller.utils.hooks import copy_metadata
 datas = [('samples', 'samples')]
 binaries = []
 hiddenimports = ['skimage._shared.geometry', 'imageio.v3']
+hiddenimports += collect_submodules('aicspylibczi')
+datas += copy_metadata('aicspylibczi')
 datas += copy_metadata('imageio')
 datas += copy_metadata('nvap')
 datas += copy_metadata('torch-directml')

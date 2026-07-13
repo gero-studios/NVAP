@@ -59,14 +59,12 @@ from nvap.cache.processed_cache import (
     has_processed_cache,
     load_enhanced_green,
     load_processed_dataset,
-    load_processed_thresholds,
     save_enhanced_dataset,
     save_processed_dataset,
     save_processed_metadata,
 )
 from nvap.config.types import (
     ChannelVolume,
-    DEFAULT_SPACING,
     DatasetVolume,
     MeshExportConfig,
     MetricsComputation,
@@ -84,8 +82,10 @@ from nvap.io.stack_loader import (
     load_dataset,
     resolve_channel_dirs,
 )
+from nvap.io.czi_loader import read_czi_spacing
 from nvap.pipeline import (
     apply_psf_to_dataset,
+    automatic_thresholds,
     fill_and_sync_dataset,
     prepare_dataset_for_mesh,
 )
@@ -373,7 +373,7 @@ class MainWindow(QMainWindow):
         self._nav_to(0)
         self._home_page.refresh_projects()
 
-        self.spacing = DEFAULT_SPACING
+        self.spacing = self.controls.current_voxel_spacing()
         self.preprocess_config = PreprocessConfig(enabled=True)
         self.synced_dataset: DatasetVolume | None = None
         self.raw_dataset: DatasetVolume | None = None
@@ -444,6 +444,7 @@ class MainWindow(QMainWindow):
         self.controls.load_requested.connect(self._on_load_requested)
         self.controls.apply_psf_requested.connect(self._on_apply_psf_requested)
         self.controls.psf_config_changed.connect(self._on_psf_config_changed)
+        self.controls.spacing_changed.connect(self._on_spacing_changed)
         self.controls.render_config_changed.connect(self._on_render_config_changed)
         self.controls.microglia_view_changed.connect(self._on_microglia_view_changed)
         self.controls.run_microglia_segmentation_requested.connect(
@@ -453,6 +454,7 @@ class MainWindow(QMainWindow):
             self._on_run_microglia_analysis_requested
         )
         self.controls.enhance_microglia_requested.connect(self._on_enhance_microglia_requested)
+        self.controls.auto_thresholds_requested.connect(self._on_auto_thresholds_requested)
         self.controls.wipe_specks_requested.connect(self._on_wipe_specks_requested)
         self.controls.export_metrics_requested.connect(self._on_export_metrics_requested)
         self.controls.export_project_analytics_requested.connect(
@@ -1519,11 +1521,23 @@ class MainWindow(QMainWindow):
         self._clear_project_set()
         self.dataset_root = p.resolve()
         self._nav_to(1)
+        saved_spacing = None
+        if state is not None and isinstance(state.get("spacing"), dict):
+            try:
+                payload = state["spacing"]
+                saved_spacing = VoxelSpacing(
+                    x_um=float(payload["x_um"]),
+                    y_um=float(payload["y_um"]),
+                    z_um=float(payload["z_um"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                saved_spacing = None
         self._start_dataset_load(
             self.dataset_root,
             channel_overrides=channel_overrides,
             channel_dirs=channel_dirs,
             load_mode=str(state.get("load_mode", "project")) if state is not None else "project",
+            spacing_override=saved_spacing,
         )
 
     def _pin_recent_project(self, path: str, pinned: bool) -> None:
@@ -2483,7 +2497,7 @@ class MainWindow(QMainWindow):
         chooser.setWindowTitle("Select Channel Source Type")
         chooser.setText(f"Choose source type for {channel_label}.")
         chooser.setInformativeText(
-            "Use a single TIFF/PNG stack file, or a folder of sequenced images."
+            "Use a single TIFF/PNG/CZI stack file, or a folder of sequenced images."
         )
         file_btn = chooser.addButton("Single Stack File", QMessageBox.ButtonRole.AcceptRole)
         chooser.addButton("Image Sequence Folder", QMessageBox.ButtonRole.ActionRole)
@@ -2498,7 +2512,7 @@ class MainWindow(QMainWindow):
                 self,
                 f"Select {channel_label} Stack File",
                 str(start_dir),
-                "Image files (*.tif *.tiff *.png);;All files (*.*)",
+                "Image files (*.tif *.tiff *.png *.czi);;CZI files (*.czi);;All files (*.*)",
             )
             return file_path or None
 
@@ -2518,7 +2532,7 @@ class MainWindow(QMainWindow):
                 "1. Vasculature (Red)\n"
                 "2. Microglia (Green)\n\n"
                 "Each channel can be either:\n"
-                "- a single TIFF/PNG stack file, or\n"
+                "- a single TIFF/PNG/CZI stack file, or\n"
                 "- a folder of sequenced images."
             ),
         )
@@ -2541,11 +2555,12 @@ class MainWindow(QMainWindow):
         chooser.setText("Choose how to load images.")
         chooser.setInformativeText(
             "Open one auto-detected dataset folder, a parent folder containing multiple datasets, "
-            "or select individual red/green TIFF files or sequence folders."
+            "a Zeiss CZI file, or individual red/green image sources."
         )
         folder_btn = chooser.addButton("Folder Process", QMessageBox.ButtonRole.AcceptRole)
         set_btn = chooser.addButton("Project Set Folder", QMessageBox.ButtonRole.ActionRole)
-        manual_btn = chooser.addButton("Individual TIFF/Sequence", QMessageBox.ButtonRole.ActionRole)
+        czi_btn = chooser.addButton("Zeiss CZI File", QMessageBox.ButtonRole.ActionRole)
+        manual_btn = chooser.addButton("Individual Images/Sequence", QMessageBox.ButtonRole.ActionRole)
         cancel_btn = chooser.addButton(QMessageBox.StandardButton.Cancel)
         chooser.exec()
 
@@ -2556,6 +2571,8 @@ class MainWindow(QMainWindow):
             return "project_set"
         if clicked == manual_btn:
             return "manual"
+        if clicked == czi_btn:
+            return "czi"
         if clicked == folder_btn:
             return "folder"
         return None
@@ -2567,9 +2584,40 @@ class MainWindow(QMainWindow):
         channel_overrides: dict[str, str | Path] | None,
         channel_dirs: dict[str, Path],
         load_mode: str,
+        spacing_override: VoxelSpacing | None = None,
     ) -> None:
         root = root.resolve()
         self.dataset_root = root
+        shared_source = channel_dirs["green"].resolve()
+        if spacing_override is not None:
+            self.controls.set_voxel_spacing(
+                spacing_override,
+                source="Saved project spacing",
+                emit=False,
+            )
+            self.spacing = self.controls.current_voxel_spacing()
+        elif shared_source == channel_dirs["red"].resolve() and shared_source.suffix.lower() == ".czi":
+            try:
+                metadata_spacing = read_czi_spacing(shared_source)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._log_info(f"CZI spacing metadata unavailable: {exc}")
+                self.statusBar().showMessage(
+                    "CZI spacing metadata was unavailable; check the manual voxel spacing values.",
+                    8000,
+                )
+            else:
+                self.controls.set_voxel_spacing(
+                    metadata_spacing,
+                    source=f"CZI metadata: {shared_source.name}",
+                    emit=False,
+                )
+                self.spacing = self.controls.current_voxel_spacing()
+                self._log_info(
+                    "CZI voxel spacing: "
+                    f"x={metadata_spacing.x_um:.6g} µm, "
+                    f"y={metadata_spacing.y_um:.6g} µm, "
+                    f"z={metadata_spacing.z_um:.6g} µm"
+                )
         self._current_load_mode = str(load_mode or "folder")
         self._current_channel_sources = {
             "green": str(channel_dirs["green"].resolve()),
@@ -2641,6 +2689,31 @@ class MainWindow(QMainWindow):
                 8000,
             )
             self._set_project_set(root, entries, selected_index=0)
+            return
+
+        if load_mode == "czi":
+            selected, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Zeiss CZI File",
+                str(base),
+                "Zeiss CZI files (*.czi);;All files (*.*)",
+            )
+            if not selected:
+                return
+            czi_path = Path(selected).resolve()
+            self._clear_project_set()
+            self.dataset_root = czi_path.parent
+            channel_overrides = {"red": str(czi_path), "green": str(czi_path)}
+            channel_dirs = resolve_channel_dirs(
+                self.dataset_root,
+                channel_overrides=channel_overrides,
+            )
+            self._start_dataset_load(
+                self.dataset_root,
+                channel_overrides=channel_overrides,
+                channel_dirs=channel_dirs,
+                load_mode="czi",
+            )
             return
 
         self._clear_project_set()
@@ -2782,36 +2855,28 @@ class MainWindow(QMainWindow):
         self._log_info("Load step 4/5: preparing mesh dataset...")
         visual_dataset = prepare_dataset_for_mesh(processed_dataset, preprocess_cfg)
         self._log_info("Load step 4/5 complete.")
-        self._publish_busy_progress(percent=86.0, message="Computing default thresholds...")
+        self._publish_busy_progress(percent=86.0, message="Computing automatic thresholds...")
 
         self._log_info("Load step 5/5: computing thresholds...")
-        cached_thresholds = (
-            load_processed_thresholds(
-                self._last_processed_cache_key,
-                base_dir=self._project_cache_base_dir(),
-            )
-            if self._last_processed_cache_key
-            else None
+        threshold_green, threshold_red = automatic_thresholds(
+            processed_dataset,
+            green_fallback=_DEFAULT_GREEN_THRESHOLD,
+            red_fallback=_DEFAULT_RED_THRESHOLD,
         )
-        if cached_thresholds is not None and enhancement_method is None:
-            threshold_green, threshold_red = cached_thresholds
-            self._log_info(
-                "Load step 5/5: using cached thresholds "
-                f"(green={threshold_green:.4f}, red={threshold_red:.4f})."
-            )
-        else:
-            threshold_green = _DEFAULT_GREEN_THRESHOLD
-            threshold_red = cached_thresholds[1] if cached_thresholds is not None else _DEFAULT_RED_THRESHOLD
-            if self._last_processed_cache_key and enhancement_method is None:
-                try:
-                    save_processed_metadata(
-                        self._last_processed_cache_key,
-                        threshold_green=threshold_green,
-                        threshold_red=threshold_red,
-                        base_dir=self._project_cache_base_dir(),
-                    )
-                except OSError as exc:
-                    self._log_info(f"Processed metadata save failed: {exc}")
+        self._log_info(
+            "Load step 5/5: automatic thresholds "
+            f"(green={threshold_green:.4f}, red={threshold_red:.4f})."
+        )
+        if self._last_processed_cache_key:
+            try:
+                save_processed_metadata(
+                    self._last_processed_cache_key,
+                    threshold_green=threshold_green,
+                    threshold_red=threshold_red,
+                    base_dir=self._project_cache_base_dir(),
+                )
+            except OSError as exc:
+                self._log_info(f"Processed metadata save failed: {exc}")
         self._publish_busy_progress(percent=92.0, message="Finalizing load...")
         self._log_info(
             "Load complete. "
@@ -3114,6 +3179,49 @@ class MainWindow(QMainWindow):
                 4000,
             )
 
+    @staticmethod
+    def _dataset_with_spacing(dataset: DatasetVolume, spacing: VoxelSpacing) -> DatasetVolume:
+        return DatasetVolume(
+            green=ChannelVolume(
+                "green",
+                dataset.green.data,
+                list(dataset.green.z_indices),
+                spacing,
+            ),
+            red=ChannelVolume(
+                "red",
+                dataset.red.data,
+                list(dataset.red.z_indices),
+                spacing,
+            ),
+            shared_z_range=dataset.shared_z_range,
+        )
+
+    def _on_spacing_changed(self, spacing: VoxelSpacing) -> None:
+        self.spacing = spacing
+        if self.raw_dataset is None:
+            return
+
+        if self.synced_dataset is not None:
+            self.synced_dataset = self._dataset_with_spacing(self.synced_dataset, spacing)
+        self.raw_dataset = self._dataset_with_spacing(self.raw_dataset, spacing)
+        if self.processed_dataset is not None:
+            self.processed_dataset = self._dataset_with_spacing(self.processed_dataset, spacing)
+            self.visual_dataset = prepare_dataset_for_mesh(
+                self.processed_dataset,
+                self.preprocess_config,
+            )
+        self._last_processed_cache_key = None
+        self._mark_metrics_dirty()
+        self._invalidate_microglia_components()
+        self._push_scene_channels()
+        self._refresh_metrics()
+        self._save_current_project_state()
+        self.statusBar().showMessage(
+            "Voxel spacing updated for rendering, metrics, and future processing.",
+            5000,
+        )
+
     def _on_apply_psf_requested(self) -> None:
         if self.synced_dataset is None:
             self._show_error("No dataset", "Load a dataset before reprocessing.")
@@ -3317,13 +3425,6 @@ class MainWindow(QMainWindow):
         self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
         self._invalidate_microglia_components()
         self._push_scene_channels()
-        threshold_green = _DEFAULT_GREEN_THRESHOLD
-        threshold_red = _DEFAULT_RED_THRESHOLD
-        # Block signals so set_threshold_defaults doesn't trigger _refresh_metrics
-        # synchronously and freeze the progress dialog before it can show 100%.
-        self.controls.blockSignals(True)
-        self.controls.set_threshold_defaults(threshold_green, threshold_red)
-        self.controls.blockSignals(False)
         self.current_render = self.controls.current_render_config()
         self._publish_busy_progress(percent=96.0, message="Refreshing enhanced render...")
         self.scene.apply_render_config(self.current_render)
@@ -3342,10 +3443,56 @@ class MainWindow(QMainWindow):
         self._publish_busy_progress(percent=100.0, message="Microglia enhancement complete.")
         self._log_info(
             "Microglia enhancement applied: "
-            f"green_shape={result.green.data.shape} thresholds=(green={threshold_green:.4f}, red={threshold_red:.4f})"
+            f"green_shape={result.green.data.shape}; automatic threshold refresh queued"
         )
         self._save_current_project_state()
-        QTimer.singleShot(0, self._refresh_metrics)
+        # Threshold estimation includes branch-aware green-channel analysis;
+        # run it in a second background task after this task has cleaned up.
+        QTimer.singleShot(0, self._on_auto_thresholds_requested)
+
+    def _on_auto_thresholds_requested(self) -> None:
+        if self.processed_dataset is None:
+            self._show_error("No dataset", "Load and render a dataset before estimating thresholds.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+
+        dataset = self.processed_dataset
+
+        def _threshold_task() -> tuple[float, float]:
+            self._publish_busy_progress(percent=20.0, message="Estimating channel thresholds...")
+            return automatic_thresholds(
+                dataset,
+                green_fallback=_DEFAULT_GREEN_THRESHOLD,
+                red_fallback=_DEFAULT_RED_THRESHOLD,
+            )
+
+        def _on_threshold_success(result: object) -> None:
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise TypeError("Invalid automatic-threshold result payload.")
+            threshold_green, threshold_red = (float(result[0]), float(result[1]))
+            self.controls.blockSignals(True)
+            self.controls.set_threshold_defaults(threshold_green, threshold_red)
+            self.controls.blockSignals(False)
+            # Let the background-task cleanup finish before applying the render
+            # update; if automatic speck wiping is enabled, the render handler
+            # may start a second background task.
+            new_config = self.controls.current_render_config()
+            QTimer.singleShot(0, lambda: self._on_render_config_changed(new_config))
+            self._log_info(
+                "Automatic thresholds applied: "
+                f"green={threshold_green:.4f} red={threshold_red:.4f}"
+            )
+
+        self._start_background_task(
+            title="Automatic Thresholds",
+            message="Estimating thresholds from the loaded channels...",
+            fn=_threshold_task,
+            on_success=_on_threshold_success,
+            error_title="Automatic thresholding failed",
+            success_status="Automatic thresholds applied.",
+        )
 
     def _on_wipe_specks_requested(self) -> None:
         if self.processed_dataset is None:

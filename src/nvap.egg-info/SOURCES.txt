@@ -29,6 +29,7 @@ src/nvap/export/__init__.py
 src/nvap/export/exporters.py
 src/nvap/export/mesh_export.py
 src/nvap/io/__init__.py
+src/nvap/io/czi_loader.py
 src/nvap/io/stack_loader.py
 src/nvap/plugins/__init__.py
 src/nvap/plugins/contracts.py

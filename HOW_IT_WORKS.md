@@ -93,11 +93,12 @@ Exports are self-describing: alongside the metric CSVs, `metrics_provenance.csv`
 records the settings that produced them (thresholds, trim, offsets, spacing,
 compute backend, dataset identity, timestamp, and the on-load cleanup used).
 
-**Automatic on load.** When a dataset finishes loading — including each dataset in
-a multi-stack project set — NVAP applies the default thresholds and, unless turned
+**Automatic on load.** When a dataset finishes loading, NVAP estimates a
+branch-aware green threshold and an Otsu red threshold. It then, unless turned
 off, runs the microglia "clean" enhancement (skipped if a cached enhancement
-exists) and the speck wipe, so every dataset in a project is cleaned consistently
-before it is measured.
+exists) and the speck wipe before measurement. Blank channels fall back to
+Green 0.80 / Red 0.60. The **Auto Thresholds** action can recalculate both
+values for the current dataset at any time.
 
 ### 4.1 Basic per-channel metrics — `metrics.py`
 

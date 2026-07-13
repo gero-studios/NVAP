@@ -85,8 +85,8 @@ def test_render_trim_defaults_and_updates(qtbot) -> None:
     assert cfg.opacity_green == 0.40
     assert cfg.opacity_red == 0.80
     assert cfg.display_z_scale == 0.70
-    assert cfg.trim_first_slices == 20
-    assert cfg.trim_last_slices == 20
+    assert cfg.trim_first_slices == 0
+    assert cfg.trim_last_slices == 0
     assert panel.microglia_branch_sensitivity.isHidden()
 
     panel.trim_first_slices.setValue(7)

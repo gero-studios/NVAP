@@ -103,8 +103,8 @@ class RenderConfig:
     iso_green: float = 0.25
     iso_red: float = 0.25
     display_z_scale: float = 0.70
-    trim_first_slices: int = 20
-    trim_last_slices: int = 20
+    trim_first_slices: int = 0
+    trim_last_slices: int = 0
     offset_x_um: float = 0.0
     offset_y_um: float = 0.0
     offset_z_um: float = 0.0

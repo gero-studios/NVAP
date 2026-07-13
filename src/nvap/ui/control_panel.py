@@ -26,7 +26,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from nvap.config.types import MeshExportConfig, PSFConfig, PreprocessConfig, RenderConfig
+from nvap.config.types import (
+    DEFAULT_SPACING,
+    MeshExportConfig,
+    PSFConfig,
+    PreprocessConfig,
+    RenderConfig,
+    VoxelSpacing,
+)
 from nvap.ui.design import COLOR, ICON_MD, ICON_SM
 from nvap.ui.icons import icon, icon_pixmap
 
@@ -142,10 +149,12 @@ class ControlPanel(QWidget):
     apply_psf_requested               = Signal()
     render_config_changed             = Signal(object)
     psf_config_changed                = Signal(object)
+    spacing_changed                   = Signal(object)
     microglia_view_changed            = Signal()
     run_microglia_segmentation_requested = Signal()
     run_microglia_analysis_requested  = Signal()
     enhance_microglia_requested       = Signal()
+    auto_thresholds_requested         = Signal()
     wipe_specks_requested             = Signal()
     export_metrics_requested          = Signal()
     export_project_analytics_requested = Signal()
@@ -194,6 +203,7 @@ class ControlPanel(QWidget):
         slo.setContentsMargins(8, 8, 8, 16)
         slo.setSpacing(4)
 
+        self._build_voxel_spacing_section(slo)
         self._build_rendering_section(slo)
         self._build_microglia_viewer_section(slo)
         self._processing_section = self._build_processing_section(slo)
@@ -281,6 +291,36 @@ class ControlPanel(QWidget):
     # Section builders
     # ══════════════════════════════════════════════════════════════════════════
 
+    def _build_voxel_spacing_section(self, parent_lo: QVBoxLayout) -> _CollapsibleSection:
+        sec = _CollapsibleSection("Voxel Spacing", "ruler", expanded=True, parent=self)
+        parent_lo.addWidget(sec)
+
+        help_text = QLabel(
+            "Physical pixel/voxel size used by metrics and 3D rendering. "
+            "CZI values are read from file metadata and remain editable."
+        )
+        help_text.setWordWrap(True)
+        help_text.setObjectName("sectionHint")
+        sec.add_widget(help_text)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+        self.spacing_x_um = self._make_spacing_spinbox(DEFAULT_SPACING.x_um)
+        self.spacing_y_um = self._make_spacing_spinbox(DEFAULT_SPACING.y_um)
+        self.spacing_z_um = self._make_spacing_spinbox(DEFAULT_SPACING.z_um)
+        form.addRow("X spacing", self.spacing_x_um)
+        form.addRow("Y spacing", self.spacing_y_um)
+        form.addRow("Z spacing", self.spacing_z_um)
+        sec.add_layout(form)
+
+        self.spacing_source_label = QLabel("Manual values (fallback defaults shown)")
+        self.spacing_source_label.setWordWrap(True)
+        self.spacing_source_label.setObjectName("modeHint")
+        sec.add_widget(self.spacing_source_label)
+        for spin in (self.spacing_x_um, self.spacing_y_um, self.spacing_z_um):
+            spin.valueChanged.connect(self._emit_spacing_changed)
+        return sec
+
     def _build_rendering_section(self, parent_lo: QVBoxLayout) -> _CollapsibleSection:
         sec = _CollapsibleSection("Channels & Rendering", "sliders", expanded=True, parent=self)
         parent_lo.addWidget(sec)
@@ -321,6 +361,16 @@ class ControlPanel(QWidget):
         _r = QLabel("Threshold R")
         _r.setObjectName("channelRed")
         form.addRow(_r, self.threshold_red)
+
+        self.auto_thresholds_btn = QPushButton("Auto Thresholds")
+        self.auto_thresholds_btn.setObjectName("workbenchSecondaryAction")
+        self.auto_thresholds_btn.setIcon(icon("sparkles", ICON_SM, COLOR.accent))
+        self.auto_thresholds_btn.setEnabled(False)
+        self.auto_thresholds_btn.setToolTip(
+            "Estimate green and red thresholds from the currently loaded dataset."
+        )
+        self.auto_thresholds_btn.clicked.connect(self.auto_thresholds_requested.emit)
+        form.addRow("Automatic", self.auto_thresholds_btn)
 
         # Opacity
         self.opacity_green = self._make_unit_spinbox(0.0, 1.0, 0.01, 0.40)
@@ -370,13 +420,13 @@ class ControlPanel(QWidget):
 
         self.trim_first_slices = QSpinBox()
         self.trim_first_slices.setRange(0, 9999)
-        self.trim_first_slices.setValue(20)
+        self.trim_first_slices.setValue(0)
         self.trim_first_slices.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Trim first Z", self.trim_first_slices)
 
         self.trim_last_slices = QSpinBox()
         self.trim_last_slices.setRange(0, 9999)
-        self.trim_last_slices.setValue(20)
+        self.trim_last_slices.setValue(0)
         self.trim_last_slices.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Trim last Z", self.trim_last_slices)
 
@@ -778,6 +828,18 @@ class ControlPanel(QWidget):
         return spin
 
     @staticmethod
+    def _make_spacing_spinbox(value: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.000001, 10000.0)
+        spin.setSingleStep(0.01)
+        spin.setDecimals(6)
+        spin.setSuffix(" µm")
+        spin.setValue(value)
+        spin.setKeyboardTracking(False)
+        spin.setToolTip("Enter a positive physical spacing in micrometres.")
+        return spin
+
+    @staticmethod
     def _make_offset_spinbox() -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
         spin.setRange(-1000.0, 1000.0)
@@ -798,6 +860,10 @@ class ControlPanel(QWidget):
 
     def _emit_psf_config(self) -> None:
         self.psf_config_changed.emit(self.current_psf_config())
+
+    def _emit_spacing_changed(self) -> None:
+        self.spacing_source_label.setText("Manual override")
+        self.spacing_changed.emit(self.current_voxel_spacing())
 
     def _emit_microglia_view_change(self) -> None:
         self.microglia_view_changed.emit()
@@ -925,6 +991,13 @@ class ControlPanel(QWidget):
             show_iso_red=self.show_iso_red.isChecked(),
         )
 
+    def current_voxel_spacing(self) -> VoxelSpacing:
+        return VoxelSpacing(
+            x_um=float(self.spacing_x_um.value()),
+            y_um=float(self.spacing_y_um.value()),
+            z_um=float(self.spacing_z_um.value()),
+        )
+
     def current_psf_config(self) -> PSFConfig:
         return PSFConfig(enabled=False, iterations=0, tv_regularization=False)
 
@@ -1003,6 +1076,7 @@ class ControlPanel(QWidget):
 
     def set_microglia_enhancement_enabled(self, enabled: bool) -> None:
         self.enhance_microglia_btn.setEnabled(bool(enabled))
+        self.auto_thresholds_btn.setEnabled(bool(enabled))
         self.wipe_specks_btn.setEnabled(bool(enabled))
 
     def current_wipe_speck_max_voxels(self) -> int:
@@ -1063,3 +1137,24 @@ class ControlPanel(QWidget):
         self._pending_render_update   = False
         self._pending_microglia_update = False
         self._update_pending_label()
+
+
+    def set_voxel_spacing(
+        self,
+        spacing: VoxelSpacing,
+        *,
+        source: str = "Manual override",
+        emit: bool = True,
+    ) -> None:
+        spins_and_values = (
+            (self.spacing_x_um, spacing.x_um),
+            (self.spacing_y_um, spacing.y_um),
+            (self.spacing_z_um, spacing.z_um),
+        )
+        for spin, value in spins_and_values:
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
+        self.spacing_source_label.setText(source)
+        if emit:
+            self.spacing_changed.emit(self.current_voxel_spacing())

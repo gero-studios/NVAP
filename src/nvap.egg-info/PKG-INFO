@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: nvap
-Version: 0.1.0
+Version: 0.1.1
 Summary: NeuroVascular Analytics Program (NVAP)
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
@@ -10,6 +10,7 @@ Requires-Dist: scikit-image>=0.22
 Requires-Dist: skan>=0.11
 Requires-Dist: pandas>=2.1
 Requires-Dist: imageio>=2.33
+Requires-Dist: aicspylibczi>=3.3.1
 Requires-Dist: PySide6>=6.6
 Requires-Dist: vtk>=9.2
 Requires-Dist: PyWavelets>=1.5
@@ -67,8 +68,11 @@ metric, see **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
 
 ## Voxel spacing
 
-Metrics are physically calibrated using voxel spacing in micrometres. The
-default spacing is:
+Metrics are physically calibrated using voxel spacing in micrometres. X, Y,
+and Z spacing are editable in the **Voxel Spacing** section of the workbench.
+For CZI files, NVAP reads these values from Zeiss metadata and fills the controls
+automatically; users can still override any axis manually. Other formats begin
+with these fallback values:
 
 | Axis | Spacing |
 |------|---------|
@@ -123,18 +127,21 @@ python -m pip install -e ".[denoise_torch]"
 python -m pip install -e ".[directml]"
 ```
 
-**AMD GPUs on Windows:** the DirectML wheel is published only for Python ≤ 3.12,
-so a Python 3.13 environment runs on CPU even when the GPU is present. A
-project-local Python 3.12 setup:
+**AMD GPUs on Windows:** the DirectML extra is supported on Windows, but the
+current dependency stack installs most reliably with Python 3.11. A
+project-local Python 3.11 setup:
 
 ```powershell
 winget install --id astral-sh.uv -e
-uv python install 3.12
-uv venv --python 3.12 .venv-gpu
+uv python install 3.11
+uv venv --python 3.11 --seed .venv-gpu
 .\.venv-gpu\Scripts\Activate.ps1
-python -m pip install -e ".[dev,directml]"
+uv pip install -e ".[dev,directml]"
 nvap --debug
 ```
+
+If `pip` is missing in a uv-created environment, recreate the venv with
+`--seed` or install dependencies with `uv pip` as shown above.
 
 Force CPU (for troubleshooting) or inspect the runtime decision:
 
@@ -167,6 +174,11 @@ Input/Segmented/Red/*.(png|tif|tiff)
 
 **Single stack files.** Each `Green` or `Red` folder may instead contain one
 multi-page TIFF holding all z-slices (e.g. `green_stack.tif`, `red_stack.tif`).
+
+NVAP also accepts a two-or-more-channel Zeiss CZI file directly. It reads the
+first acquisition volume, maps C0 to red/vasculature and C1 to green/microglia,
+and imports the X/Y/Z physical scaling metadata. If a CZI contains more than two
+channels, additional channels are ignored with a log warning.
 
 **RGB slice folders.** A single folder of RGB PNG/TIFF slices is also accepted
 when filenames include `_z###` and pixels are red/green-only (black background
@@ -206,7 +218,7 @@ preprocessing, and denoising settings.
 - **Isosurface toggles:** show a solid surface at the threshold instead of a
   translucent cloud.
 - **Trim first/last Z:** exclude edge slices from both the view and all metrics
-  (default: 20 slices at each end).
+  (default: 0 slices at each end).
 - **Offset (x/y/z):** shift the green channel relative to red to correct
   registration; applied identically to the view and the overlap metric.
 - **Z height scale:** a display-only depth scale (default `0.70`; `1.0` matches
@@ -227,7 +239,10 @@ Components are ranked by size (largest first) at the current green threshold.
 Every time a dataset finishes loading — including each dataset when you page
 through a multi-stack project set — NVAP cleans it up automatically:
 
-1. **Default thresholds** (Green 0.80, Red 0.60) are applied.
+1. **Automatic thresholds** are estimated from the processed channels: a
+   branch-aware threshold for green microglia and Otsu's intensity threshold
+   for red vasculature. Green 0.80 / Red 0.60 are used only as safe fallbacks
+   for blank or degenerate channels.
 2. **Enhance microglia (clean)** runs the selected enhancement (default
    *Microscopy clean soma/branch*) on the green channel. Skipped if the dataset
    already has a cached enhancement.
@@ -238,7 +253,8 @@ load** and **Wipe specks on load** checkboxes in the Microglia Workbench (both o
 by default). They are always available, so you can turn them off *before* loading
 anything. **Speck size** sets the largest connected component (in voxels) treated
 as a speck; larger structures are kept. You can also run **Enhance Microglia** and
-**Wipe Specks** manually at any time.
+**Wipe Specks** manually at any time. Use **Auto Thresholds** to recalculate
+both channel thresholds from the currently loaded dataset.
 
 ### Update mode
 
