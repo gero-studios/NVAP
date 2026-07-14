@@ -11,7 +11,9 @@ from nvap.preprocess.enhancement import (
     _rolling_ball_slicewise,
     _restore_soma_interiors_after_imagej_rolling_ball,
     enhance_microglia_background,
+    enhance_vasculature_background,
     preprocess_channel,
+    wipe_vasculature_blobs,
     wipe_small_specks,
 )
 
@@ -44,6 +46,27 @@ def test_wipe_small_specks_noop_when_nothing_small() -> None:
     vol[1:3, 4:16, 4:16] = 0.8  # one big blob, no specks
     out = wipe_small_specks(vol, threshold=0.5, min_voxels=8)
     assert np.array_equal(out, vol)
+
+
+def test_wipe_vasculature_blobs_clears_compact_dim_halo() -> None:
+    vol = np.zeros((3, 40, 40), dtype=np.float32)
+    vol[1, 8:15, 8:15] = 0.35  # visible halo at the mesh isovalue
+    vol[1, 10:13, 10:13] = 0.85  # compact blob at the stricter red threshold
+
+    out = wipe_vasculature_blobs(vol, threshold=0.6, max_voxels=128)
+
+    assert not np.any(out[1, 8:15, 8:15])
+
+
+def test_vasculature_enhancement_reduces_uniform_background_and_keeps_vessel() -> None:
+    arr = np.full((3, 64, 64), 0.20, dtype=np.float32)
+    arr[:, 32, 8:56] = 0.90
+
+    out = enhance_vasculature_background(arr, PreprocessConfig(flatfield_sigma_xy=12.0))
+
+    assert out.shape == arr.shape
+    assert out.dtype == np.float32
+    assert float(out[:, 32, 8:56].mean()) > float(out[:, :8, :8].mean()) * 3.0
 
 
 def test_reconnect_and_denoise_bridges_near_and_drops_far() -> None:

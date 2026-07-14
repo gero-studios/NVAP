@@ -96,8 +96,10 @@ from nvap.analysis.microglia_components import (
 )
 from nvap.preprocess.enhancement import (
     enhance_microglia_background,
+    enhance_vasculature_background,
     preprocess_dataset,
     wipe_small_specks,
+    wipe_vasculature_blobs,
 )
 from nvap.plugins.registry import discover_plugins
 from nvap.render.vtk_scene import MicrogliaDebugOverlay, VTKScene
@@ -168,6 +170,7 @@ class _ProjectAnalyticsConfig:
     enhancement_method: str
     apply_wipe: bool
     wipe_max_voxels: int
+    vascular_wipe_max_voxels: int
     branch_sensitivity: float
 
 
@@ -297,6 +300,8 @@ class MainWindow(QMainWindow):
         self.controls_scroll.setObjectName("controlPanelScrollArea")
         self.controls_scroll.setWidgetResizable(True)
         self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.controls_scroll.setMinimumWidth(260)
+        self.controls_scroll.setMaximumWidth(360)
         self.controls_scroll.setWidget(self.controls)
 
         self._metrics_panel = MetricsPanel()
@@ -319,7 +324,7 @@ class MainWindow(QMainWindow):
         self._workspace_splitter.setStretchFactor(0, 0)
         self._workspace_splitter.setStretchFactor(1, 1)
         self._workspace_splitter.setStretchFactor(2, 0)
-        self._workspace_splitter.setSizes([320, 980, 260])
+        self._workspace_splitter.setSizes([300, 1000, 260])
 
         # ── Project store + pages ────────────────────────────────────────
         self._project_store = RecentProjectsStore()
@@ -454,8 +459,10 @@ class MainWindow(QMainWindow):
             self._on_run_microglia_analysis_requested
         )
         self.controls.enhance_microglia_requested.connect(self._on_enhance_microglia_requested)
+        self.controls.enhance_vasculature_requested.connect(self._on_enhance_vasculature_requested)
         self.controls.auto_thresholds_requested.connect(self._on_auto_thresholds_requested)
         self.controls.wipe_specks_requested.connect(self._on_wipe_specks_requested)
+        self.controls.wipe_vasculature_blobs_requested.connect(self._on_wipe_vasculature_blobs_requested)
         self.controls.export_metrics_requested.connect(self._on_export_metrics_requested)
         self.controls.export_project_analytics_requested.connect(
             self._on_export_project_analytics_requested
@@ -2965,13 +2972,20 @@ class MainWindow(QMainWindow):
         preprocess_cfg = self.preprocess_config
         method = self.controls.current_microglia_enhancement_method()
         max_voxels = int(self.controls.current_wipe_speck_max_voxels())
+        vascular_max_voxels = int(self.controls.current_vascular_blob_max_voxels())
         threshold_green = float(self.current_render.threshold_green)
         threshold_red = float(self.current_render.threshold_red)
+        # Detect blobs at exactly the level the red isosurface is drawn at
+        # (threshold_red). The retired iso_red control sits at threshold_red +
+        # 0.05, so max(threshold_red, iso_red) used to build the mask a notch
+        # above the visible surface: dim specks rendered but were never captured
+        # as components, so they could not be wiped.
+        vascular_cleanup_threshold = threshold_red
         steps = [name for name, on in (("enhance", want_enhance), ("wipe", want_wipe)) if on]
         self._log_info(
             "Auto on-load pipeline: "
             f"{' + '.join(steps)} (method={method if want_enhance else '-'}, "
-            f"speck<{max_voxels} vox)."
+            f"speck<{max_voxels} vox, vascular_blob<{vascular_max_voxels} vox)."
         )
 
         def _report_auto_enhance_progress(completed: int, total: int) -> None:
@@ -3010,8 +3024,12 @@ class MainWindow(QMainWindow):
             if want_wipe:
                 self._publish_busy_progress(percent=60.0, message="Wiping microglia specks...")
                 green = wipe_small_specks(green, threshold=threshold_green, min_voxels=max_voxels)
-                self._publish_busy_progress(percent=80.0, message="Wiping vasculature specks...")
-                red = wipe_small_specks(red, threshold=threshold_red, min_voxels=max_voxels)
+                self._publish_busy_progress(percent=80.0, message="Wiping vascular blobs...")
+                red = wipe_vasculature_blobs(
+                    red,
+                    threshold=vascular_cleanup_threshold,
+                    max_voxels=vascular_max_voxels,
+                )
             self._publish_busy_progress(percent=92.0, message="Updating dataset...")
             return DatasetVolume(
                 green=ChannelVolume(
@@ -3450,6 +3468,58 @@ class MainWindow(QMainWindow):
         # run it in a second background task after this task has cleaned up.
         QTimer.singleShot(0, self._on_auto_thresholds_requested)
 
+    def _on_enhance_vasculature_requested(self) -> None:
+        if self.processed_dataset is None:
+            self._show_error("No dataset", "Load and render a dataset before enhancing vasculature.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+
+        dataset = self.processed_dataset
+        preprocess_cfg = self.preprocess_config
+
+        def _enhance_task() -> DatasetVolume:
+            self._publish_busy_progress(percent=8.0, message="Estimating red background...")
+            enhanced_red = enhance_vasculature_background(dataset.red.data, preprocess_cfg)
+            self._publish_busy_progress(percent=86.0, message="Updating enhanced dataset...")
+            return DatasetVolume(
+                green=dataset.green,
+                red=ChannelVolume(
+                    name="red",
+                    data=enhanced_red,
+                    z_indices=list(dataset.red.z_indices),
+                    spacing=dataset.red.spacing,
+                ),
+                shared_z_range=dataset.shared_z_range,
+            )
+
+        self._start_background_task(
+            title="Enhance Vasculature",
+            message="Enhancing vasculature...",
+            fn=_enhance_task,
+            on_success=self._on_enhance_vasculature_success,
+            error_title="Vasculature enhancement failed",
+            success_status="Vasculature enhancement complete.",
+        )
+
+    def _on_enhance_vasculature_success(self, result: object) -> None:
+        if not isinstance(result, DatasetVolume):
+            raise TypeError("Invalid vasculature enhancement result payload.")
+        self._publish_busy_progress(percent=90.0, message="Preparing enhanced render...")
+        self.processed_dataset = result
+        self._mark_metrics_dirty()
+        self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
+        self._invalidate_microglia_components()
+        self._push_scene_channels()
+        self.current_render = self.controls.current_render_config()
+        self.scene.apply_render_config(self.current_render)
+        self._refresh_microglia_analysis_debug()
+        self._publish_busy_progress(percent=100.0, message="Vasculature enhancement complete.")
+        self._log_info(f"Vasculature enhancement applied: red_shape={result.red.data.shape}")
+        self._save_current_project_state()
+        QTimer.singleShot(0, self._refresh_metrics)
+
     def _on_auto_thresholds_requested(self) -> None:
         if self.processed_dataset is None:
             self._show_error("No dataset", "Load and render a dataset before estimating thresholds.")
@@ -3504,10 +3574,14 @@ class MainWindow(QMainWindow):
 
         dataset = self.processed_dataset
         max_voxels = int(self.controls.current_wipe_speck_max_voxels())
+        vascular_max_voxels = int(self.controls.current_vascular_blob_max_voxels())
         # Detect specks among the voxels that are currently visible, so the wipe
         # removes exactly the small dots the user sees in each channel.
         threshold_green = float(self.current_render.threshold_green)
         threshold_red = float(self.current_render.threshold_red)
+        # Match the visible red isosurface level (threshold_red) so the wipe
+        # removes exactly the dots the user sees, not a stricter subset.
+        vascular_cleanup_threshold = threshold_red
 
         def _wipe_task() -> DatasetVolume:
             self._publish_busy_progress(percent=10.0, message="Wiping microglia specks...")
@@ -3516,11 +3590,11 @@ class MainWindow(QMainWindow):
                 threshold=threshold_green,
                 min_voxels=max_voxels,
             )
-            self._publish_busy_progress(percent=55.0, message="Wiping vasculature specks...")
-            red = wipe_small_specks(
+            self._publish_busy_progress(percent=55.0, message="Wiping vascular blobs...")
+            red = wipe_vasculature_blobs(
                 dataset.red.data,
-                threshold=threshold_red,
-                min_voxels=max_voxels,
+                threshold=vascular_cleanup_threshold,
+                max_voxels=vascular_max_voxels,
             )
             self._publish_busy_progress(percent=85.0, message="Updating dataset...")
             return DatasetVolume(
@@ -3541,11 +3615,56 @@ class MainWindow(QMainWindow):
 
         self._start_background_task(
             title="Wipe Specks",
-            message=f"Removing isolated specks smaller than {max_voxels} voxels...",
+            message=(
+                f"Removing green specks < {max_voxels} voxels and compact vascular "
+                f"blobs < {vascular_max_voxels} voxels..."
+            ),
             fn=_wipe_task,
             on_success=self._on_wipe_specks_success,
             error_title="Speck wipe failed",
             success_status="Speck wipe complete.",
+        )
+
+    def _on_wipe_vasculature_blobs_requested(self) -> None:
+        if self.processed_dataset is None:
+            self._show_error("No dataset", "Load and render a dataset before wiping vascular blobs.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
+            return
+
+        dataset = self.processed_dataset
+        max_voxels = int(self.controls.current_vascular_blob_max_voxels())
+        # Wipe at the level the red isosurface is drawn at (threshold_red) so the
+        # mask matches the visible surface exactly.
+        threshold = float(self.current_render.threshold_red)
+
+        def _wipe_task() -> DatasetVolume:
+            self._publish_busy_progress(percent=10.0, message="Wiping vascular blobs...")
+            red = wipe_vasculature_blobs(
+                dataset.red.data,
+                threshold=threshold,
+                max_voxels=max_voxels,
+            )
+            self._publish_busy_progress(percent=85.0, message="Updating dataset...")
+            return DatasetVolume(
+                green=dataset.green,
+                red=ChannelVolume(
+                    name="red",
+                    data=red,
+                    z_indices=list(dataset.red.z_indices),
+                    spacing=dataset.red.spacing,
+                ),
+                shared_z_range=dataset.shared_z_range,
+            )
+
+        self._start_background_task(
+            title="Wipe Vascular Blobs",
+            message=f"Removing compact vascular blobs up to {max_voxels} voxels...",
+            fn=_wipe_task,
+            on_success=self._on_wipe_specks_success,
+            error_title="Vascular blob wipe failed",
+            success_status="Vascular blob wipe complete.",
         )
 
     def _on_wipe_specks_success(self, result: object) -> None:
@@ -3714,6 +3833,7 @@ class MainWindow(QMainWindow):
                 or self.controls.auto_wipe_specks_on_load_enabled()
             ),
             wipe_max_voxels=int(self.controls.current_wipe_speck_max_voxels()),
+            vascular_wipe_max_voxels=int(self.controls.current_vascular_blob_max_voxels()),
             branch_sensitivity=float(self.controls.current_microglia_branch_sensitivity()),
         )
         entries = list(self._project_set_entries)
@@ -3728,7 +3848,7 @@ class MainWindow(QMainWindow):
                 f"Green threshold: {config.render.threshold_green:.3f}\n"
                 f"Red threshold: {config.render.threshold_red:.3f}\n"
                 f"Clean: {'yes (' + config.enhancement_method + ')' if config.apply_enhancement else 'no'}\n"
-                f"Wipe specks: {'yes (< ' + str(config.wipe_max_voxels) + ' vox)' if config.apply_wipe else 'no'}"
+                f"Wipe specks: {'yes (green < ' + str(config.wipe_max_voxels) + ' vox; vascular blobs < ' + str(config.vascular_wipe_max_voxels) + ' vox)' if config.apply_wipe else 'no'}"
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
@@ -3811,10 +3931,10 @@ class MainWindow(QMainWindow):
                     threshold=float(config.render.threshold_green),
                     min_voxels=int(config.wipe_max_voxels),
                 )
-                red = wipe_small_specks(
+                red = wipe_vasculature_blobs(
                     red,
                     threshold=float(config.render.threshold_red),
-                    min_voxels=int(config.wipe_max_voxels),
+                    max_voxels=int(config.vascular_wipe_max_voxels),
                 )
             processed = DatasetVolume(
                 green=ChannelVolume(
@@ -3987,6 +4107,7 @@ class MainWindow(QMainWindow):
             "microglia_enhancement_method": config.enhancement_method if config.apply_enhancement else "",
             "wipe_specks_applied": bool(config.apply_wipe),
             "speck_max_voxels": int(config.wipe_max_voxels),
+            "vascular_blob_max_voxels": int(config.vascular_wipe_max_voxels),
             "branch_sensitivity": float(config.branch_sensitivity),
             "spacing_x_um": float(spacing.x_um),
             "spacing_y_um": float(spacing.y_um),
@@ -4277,6 +4398,7 @@ class MainWindow(QMainWindow):
                 self.controls.auto_wipe_specks_on_threshold_edit_enabled()
             ),
             "speck_max_voxels": int(self.controls.current_wipe_speck_max_voxels()),
+            "vascular_blob_max_voxels": int(self.controls.current_vascular_blob_max_voxels()),
         }
         if spacing is not None:
             values.update(

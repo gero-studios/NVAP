@@ -373,6 +373,41 @@ def test_hysteresis_preserves_connected_low_intensity_branches() -> None:
     assert int(labels[1, 4, 4]) == 0
 
 
+def test_visible_raw_branches_survive_dense_smoothed_growth_mask() -> None:
+    arr = np.zeros((5, 96, 96), dtype=np.float32)
+    z = 2
+    yy, xx = np.ogrid[:96, :96]
+    soma = (yy - 68) ** 2 + (xx - 55) ** 2 <= 10**2
+    for zz in (1, 2, 3):
+        arr[zz, soma] = 0.98
+
+    # These one-voxel processes are visible at the render threshold, but XY
+    # smoothing pushes them below the dense-scene growth floor.
+    arr[z, 68, 15:45] = 0.317
+    for i in range(1, 20):
+        arr[z, 68 - i, 55 + i] = 0.317
+
+    # Unrelated dense signal raises the data-driven growth floor above the
+    # render threshold. It must not make visible processes disappear.
+    arr[1:4, 5:23, 5:23] = 0.64
+
+    labels, order, _ = compute_component_labels(
+        arr,
+        threshold=0.316,
+        min_voxels=8,
+        max_components=16,
+        smooth_sigma=(0.2, 0.45, 0.45),
+        branch_sensitivity=1.0,
+        spacing=(0.4, 0.331, 0.331),
+    )
+
+    component_id = int(labels[z, 68, 55])
+    assert len(order) >= 2
+    assert component_id > 0
+    assert int(labels[z, 68, 15]) == component_id
+    assert int(labels[z, 49, 74]) == component_id
+
+
 def test_branch_sensitivity_slider_affects_branch_retention() -> None:
     arr = np.zeros((4, 40, 40), dtype=np.float32)
     arr[1, 20, 20] = 0.35
@@ -517,6 +552,77 @@ def test_single_soma_with_two_close_lobes_stays_one_component() -> None:
     assert int(labels[z, 35, 39]) == comp_id
 
 
+def test_bright_terminal_bulbs_are_not_mistaken_for_somas() -> None:
+    shape = (25, 128, 128)
+    spacing = np.asarray((0.331, 0.198467, 0.198467), dtype=np.float32)
+    zz, yy, xx = np.indices(shape, dtype=np.float32)
+    points_zyx_um = np.stack(
+        (
+            (zz - 12) * spacing[0],
+            (yy - 64) * spacing[1],
+            (xx - 64) * spacing[2],
+        ),
+        axis=-1,
+    )
+    directions_yx = [
+        np.asarray((1.0, 0.0)),
+        np.asarray((-1.0, 0.0)),
+        np.asarray((0.0, 1.0)),
+        np.asarray((0.0, -1.0)),
+        np.asarray((0.707, 0.707)),
+        np.asarray((-0.707, 0.707)),
+    ]
+
+    arr = np.zeros(shape, dtype=np.float32)
+    soma_radius_um = 1.8
+    branch_radius_um = 0.25
+    tip_radius_um = 0.75
+    arr[np.linalg.norm(points_zyx_um, axis=-1) <= soma_radius_um] = 0.86
+
+    points_yx_um = points_zyx_um[..., 1:]
+    for direction_yx in directions_yx:
+        start_yx_um = direction_yx * (soma_radius_um * 0.78)
+        end_yx_um = direction_yx * 7.0
+        segment_yx_um = end_yx_um - start_yx_um
+        projection = np.clip(
+            np.sum((points_yx_um - start_yx_um) * segment_yx_um, axis=-1)
+            / np.sum(segment_yx_um * segment_yx_um),
+            0.0,
+            1.0,
+        )
+        closest_yx_um = start_yx_um + projection[..., None] * segment_yx_um
+        branch_distance_um = np.sqrt(
+            points_zyx_um[..., 0] ** 2
+            + np.sum((points_yx_um - closest_yx_um) ** 2, axis=-1)
+        )
+        branch = branch_distance_um <= branch_radius_um
+        arr[branch] = np.maximum(arr[branch], 0.56)
+
+        tip_center_zyx_um = np.concatenate(([0.0], end_yx_um))
+        tip_distance_um = np.linalg.norm(points_zyx_um - tip_center_zyx_um, axis=-1)
+        tip = tip_distance_um <= tip_radius_um
+        arr[tip] = np.maximum(arr[tip], 0.94)
+
+    labels, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.316,
+        min_voxels=53,
+        max_components=32,
+        smooth_sigma=(0.2, 0.45, 0.45),
+        branch_sensitivity=1.0,
+        spacing=tuple(float(value) for value in spacing),
+    )
+
+    soma_id = int(labels[12, 64, 64])
+    assert len(order) == 1
+    assert soma_id > 0
+    assert int(sizes[soma_id]) == int(np.count_nonzero(arr)) == 3041
+    for direction_yx in directions_yx:
+        tip_y = int(round(64 + direction_yx[0] * 7.0 / spacing[1]))
+        tip_x = int(round(64 + direction_yx[1] * 7.0 / spacing[2]))
+        assert int(labels[12, tip_y, tip_x]) == soma_id
+
+
 def test_nearby_somas_connected_by_dim_bridge_stay_separate() -> None:
     arr = np.zeros((5, 80, 80), dtype=np.float32)
     z = 2
@@ -645,6 +751,32 @@ def test_somas_separate_along_z_axis_in_true_3d() -> None:
     assert top_id > 0
     assert bottom_id > 0
     assert top_id != bottom_id
+
+
+def test_coarse_z_spacing_keeps_diagonal_in_plane_branches_connected() -> None:
+    arr = np.zeros((3, 64, 64), dtype=np.float32)
+    z = 1
+    arr[z, 28:37, 28:37] = 0.75
+    for i in range(1, 23):
+        arr[z, 28 - i, 28 - i] = 0.36
+        arr[z, 36 + i, 36 + i] = 0.36
+
+    labels, order, sizes = compute_component_labels(
+        arr,
+        threshold=0.316,
+        min_voxels=16,
+        max_components=8,
+        smooth_sigma=(0.0, 0.0, 0.0),
+        branch_sensitivity=1.0,
+        spacing=(2.0, 0.3, 0.3),
+    )
+
+    assert len(order) == 1
+    component_id = int(labels[z, 32, 32])
+    assert component_id > 0
+    assert int(labels[z, 6, 6]) == component_id
+    assert int(labels[z, 58, 58]) == component_id
+    assert int(sizes[component_id]) == 125
 
 
 def test_faint_bridge_branch_gets_single_soma_owner() -> None:

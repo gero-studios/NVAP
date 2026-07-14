@@ -1357,6 +1357,41 @@ def enhance_microglia_background(
     return _enhance_microglia_core(arr, cfg, method, progress_callback=progress_callback)
 
 
+def enhance_vasculature_background(
+    volume: np.ndarray,
+    config: PreprocessConfig | None = None,
+) -> np.ndarray:
+    """Suppress red-channel background while retaining vessel-like detail.
+
+    This deliberately avoids the soma/branch restoration used for microglia.
+    A broad, per-slice background estimate removes uneven red fluorescence and
+    a light tubeness-weighted blend keeps elongated vessel signal prominent
+    without amplifying compact debris.
+    """
+    cfg = config or PreprocessConfig()
+    arr = np.clip(np.asarray(volume, dtype=np.float32), 0.0, 1.0)
+    if arr.ndim != 3:
+        raise ValueError(f"Vasculature volume must be 3D (z, y, x), got {arr.shape}")
+    if arr.size == 0:
+        return arr.copy()
+
+    sigma_xy = float(max(12.0, cfg.flatfield_sigma_xy))
+    background = _gaussian_filter_fast(arr, sigma=(0.0, sigma_xy, sigma_xy), mode="nearest")
+    detail = _normalize_positive_detail(np.maximum(arr - (0.90 * background), 0.0))
+    vesselness = _tubeness_slicewise(
+        detail,
+        sigmas=[1.0, 1.8, 3.0, 4.5],
+        workers=_resolve_worker_threads(cfg),
+        progress_tag="vasculature enhancement",
+    )
+    vesselness = _normalize_branch_map(vesselness)
+    # Keep broad, bright vessel trunks while making non-tubular background and
+    # compact debris much less prominent. The dedicated blob wipe can then
+    # remove those residual components deterministically.
+    enhanced = detail * (0.30 + (0.70 * vesselness))
+    return np.clip(enhanced, 0.0, 1.0).astype(np.float32, copy=False)
+
+
 def wipe_small_specks(
     volume: np.ndarray,
     *,
@@ -1406,6 +1441,132 @@ def wipe_small_specks(
         int(count),
         t,
         int(np.count_nonzero(speck_mask)),
+    )
+    return out
+
+
+def wipe_vasculature_blobs(
+    volume: np.ndarray,
+    *,
+    threshold: float,
+    max_voxels: int,
+    max_aspect_ratio: float = float("inf"),
+    min_solid_voxels: int = 64,
+    connectivity: int = 3,
+) -> np.ndarray:
+    """Remove isolated red-channel debris while preserving the vessel network.
+
+    Every connected component no larger than ``max_voxels`` is removed. Real
+    vasculature forms a large connected network that far exceeds this limit, so
+    any isolated island below it is debris regardless of shape — this is why the
+    default is a pure size filter and the control reads "remove red blobs up to
+    N voxels".
+
+    ``max_aspect_ratio`` is an opt-in vessel-fragment guard: pass a finite value
+    to *keep* elongated components (aspect ratio above the cutoff) that would
+    otherwise be removed, so disconnected but visibly tubular stubs survive.
+    Because that ratio is meaningless for a handful of voxels (a 3-voxel diagonal
+    reads as highly "elongated"), the guard never protects components at or below
+    ``min_solid_voxels`` — those are always removed as noise.
+    """
+    arr = np.asarray(volume, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Vasculature blob-wipe volume must be 3D (z, y, x), got {arr.shape}")
+    if arr.size == 0:
+        return arr.copy()
+
+    t = float(np.clip(threshold, 0.0, 1.0))
+    limit = max(1, int(max_voxels))
+    solid_floor = max(0, int(min_solid_voxels))
+    # Finite ratio => keep elongated fragments; inf (default) => pure size wipe.
+    size_only = not np.isfinite(float(max_aspect_ratio))
+    mask = arr >= t
+    if not np.any(mask):
+        return arr.copy()
+
+    structure = ndi.generate_binary_structure(3, int(np.clip(connectivity, 1, 3)))
+    labels, count = ndi.label(mask, structure=structure)
+    if count <= 0:
+        return arr.copy()
+
+    def _aspect_ratio(component: np.ndarray) -> float:
+        coords = np.argwhere(component).astype(np.float32, copy=False)
+        if coords.shape[0] < 3:
+            return 1.0
+        centered = coords - np.mean(coords, axis=0, keepdims=True)
+        eigenvalues = np.linalg.eigvalsh(centered.T @ centered)
+        eigenvalues.sort()
+        return float(np.sqrt(eigenvalues[-1] / max(float(eigenvalues[-2]), 0.25)))
+
+    # Size per component in one pass so large structures (vessels) are rejected
+    # by the cheap size test before the eigen solve or any per-voxel slicing.
+    sizes = np.bincount(labels.ravel())
+    remove_labels: list[int] = []
+    objects = ndi.find_objects(labels)
+    for label_id, component_slice in enumerate(objects, start=1):
+        if component_slice is None:
+            continue
+        size = int(sizes[label_id])
+        if not (0 < size <= limit):
+            continue
+        if size_only or size <= solid_floor:
+            # Size-only wipe, or too small for shape to mean anything: noise.
+            remove_labels.append(label_id)
+            continue
+        component = labels[component_slice] == label_id
+        if _aspect_ratio(component) <= float(max_aspect_ratio):
+            remove_labels.append(label_id)
+
+    if not remove_labels:
+        return arr.copy()
+
+    blob_mask = np.isin(labels, np.asarray(remove_labels, dtype=labels.dtype))
+
+    # The strict cutoff separates blobs from vessels. Once selected, remove a
+    # compact, dimmer halo too, otherwise a high-intensity blob leaves a visible
+    # low-intensity shell in the mesh. A halo that connects to an elongated
+    # vessel is retained rather than risking a vessel break.
+    support_threshold = max(0.01, t * 0.5)
+    support_labels, support_count = ndi.label(arr >= support_threshold, structure=structure)
+    if support_count > 0:
+        # Collect every support component that a removed blob sits inside in a
+        # single pass. The previous per-blob `labels == label_id` mask was
+        # O(n_blobs x voxels) and stalled on noisy channels with thousands of
+        # blobs; this is O(voxels) plus a bounded per-component check.
+        touched = np.unique(support_labels[blob_mask])
+        touched = touched[touched != 0]
+        if touched.size:
+            support_sizes = np.bincount(support_labels.ravel())
+            support_objects = ndi.find_objects(support_labels)
+            support_remove: list[int] = []
+            for support_id in touched.tolist():
+                support_size = int(support_sizes[support_id])
+                if not (0 < support_size <= limit):
+                    continue
+                if size_only or support_size <= solid_floor:
+                    support_remove.append(support_id)
+                    continue
+                component_slice = support_objects[support_id - 1]
+                if component_slice is None:
+                    continue
+                component = support_labels[component_slice] == support_id
+                if _aspect_ratio(component) <= float(max_aspect_ratio):
+                    support_remove.append(support_id)
+            if support_remove:
+                blob_mask |= np.isin(
+                    support_labels,
+                    np.asarray(support_remove, dtype=support_labels.dtype),
+                )
+    out = arr.copy()
+    out[blob_mask] = 0.0
+    logger.info(
+        "Wiped %d compact vascular blobs (<=%d voxels, aspect<=%.2f) of %d components at threshold %.3f (%d voxels cleared)",
+        len(remove_labels),
+        limit,
+        float(max_aspect_ratio),
+        int(count),
+        t,
+        int(np.count_nonzero(blob_mask)),
     )
     return out
 

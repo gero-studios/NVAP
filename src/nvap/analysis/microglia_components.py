@@ -12,6 +12,17 @@ logger = logging.getLogger(__name__)
 _CC_STRUCTURE = ndi.generate_binary_structure(3, 2).astype(np.uint8, copy=False)
 _CUBIC_STRUCTURE = np.ones((3, 3, 3), dtype=np.uint8)
 _AXIAL_STRUCTURE = ndi.generate_binary_structure(3, 1).astype(np.uint8, copy=False)
+# Full 8-connectivity *within* each z-plane, but only the direct axial neighbour
+# across planes. Used for strongly anisotropic stacks (large z-step): the lateral
+# (y, x) sampling is isotropic, so in-plane processes — including the thin ones
+# that run diagonally — must stay 8-connected or the watershed fragments them and
+# drops the branch voxels. Pure 6-connectivity (``_AXIAL_STRUCTURE``) only keeps 4
+# in-plane neighbours, which erodes those diagonal branches; this keeps all 8
+# while still refusing to bridge cells across the coarse z axis.
+_INPLANE_AXIAL_STRUCTURE = np.zeros((3, 3, 3), dtype=np.uint8)
+_INPLANE_AXIAL_STRUCTURE[1] = 1
+_INPLANE_AXIAL_STRUCTURE[0, 1, 1] = 1
+_INPLANE_AXIAL_STRUCTURE[2, 1, 1] = 1
 _MAX_PEAK_CENTER_CANDIDATES = 16384
 _MAX_DISTANCE_EDT_VOXELS = 24_000_000
 _MAX_DISTANCE_COMPONENT_LABEL_VOXELS = 96_000_000
@@ -26,6 +37,10 @@ _MAX_SOMA_EDT_VOXELS = 72_000_000
 _MAX_SOMA_CORE_LABEL_VOXELS = 120_000_000
 _MAX_BRANCH_REASSIGN_VOXELS = 120_000_000
 _MAX_BRANCH_REASSIGN_LABELS = 2048
+# A marker core thinner than this is much more likely to be a bright branch
+# knot or terminal bulb than a microglial soma.  Keeping this in physical units
+# makes the decision stable across voxel sizes and z-resampling factors.
+_MIN_CREDIBLE_SOMA_RADIUS_UM = 1.0
 
 
 def _empty_labels(shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -102,7 +117,9 @@ def _spacing_aware_structure(spacing_zyx: np.ndarray) -> np.ndarray:
         return _CUBIC_STRUCTURE
     if z_ratio <= 2.2:
         return _CC_STRUCTURE
-    return _AXIAL_STRUCTURE
+    # Strong z-anisotropy: keep full 8-connectivity in-plane (isotropic y, x) so
+    # thin diagonal branches are preserved, but only bridge planes axially.
+    return _INPLANE_AXIAL_STRUCTURE
 
 
 def _local_contrast_response(
@@ -877,7 +894,7 @@ def _segment_soma_markers_from_reduced_threshold(
         if n_core > 0:
             core_sizes = np.bincount(core_labels.ravel(), minlength=n_core + 1)
             min_core_voxels = max(2, int(min_keep // 3))
-            min_core_radius_um = float(np.clip(0.56 - (0.06 * (sensitivity - 1.0)), 0.40, 0.70))
+            min_core_radius_um = float(_MIN_CREDIBLE_SOMA_RADIUS_UM)
             valid_ids = [
                 i
                 for i in range(1, n_core + 1)
@@ -1379,7 +1396,10 @@ def compute_component_labels(
     merge_scale = float(np.clip(0.72 - (0.08 * (branch_sense - 1.0)), 0.56, 0.80))
     merge_t = float(np.clip(max(low_t, high_t * merge_scale), 0.0, max(high_t, low_t)))
 
-    active_bounds = _mask_bounds(finite & (working >= low_t))
+    # Include user-visible voxels (raw >= t) in the working ROI so dim branch
+    # ends that extend past the smoothed low_t extent are not clipped by the
+    # bounding box before the growth mask is even built.
+    active_bounds = _mask_bounds(finite & ((working >= low_t) | (arr >= t)))
     if active_bounds is None:
         active_bounds = _mask_bounds(seed)
     if active_bounds is None:
@@ -1443,13 +1463,23 @@ def compute_component_labels(
     support_min = 1 if min_keep <= 8 else (2 if branch_sense >= 1.30 else 1)
     if dense_mode:
         support_min = max(2, int(support_min))
-    candidate = finite_roi & (working_roi >= low_t)
+    # The growth mask must include every voxel the user can actually see, i.e.
+    # every voxel at/above their render threshold ``t`` on the *raw* intensity.
+    # ``low_t`` is a smoothed, data-driven floor (5th-percentile of positive
+    # values, bumped further in dense scenes) and can drift *above* ``t`` on
+    # signal-heavy images — which silently trims the dim branches the user sees.
+    # OR-ing in ``arr_roi >= t`` guarantees the separation never uses a stricter
+    # threshold than the one the user set, while ``low_t`` still lets the
+    # watershed grow a little past the visible edge when it sits below ``t``.
+    visible_roi = finite_roi & (arr_roi >= t)
+    candidate = (finite_roi & (working_roi >= low_t)) | visible_roi
     if np.any(candidate):
         support = ndi.convolve(
             candidate.astype(np.uint8), structure, mode="constant", cval=0
         )
-        # Seeds are always included regardless of neighbour support.
-        candidate = (candidate & (support >= support_min)) | (seed_labels > 0)
+        # Seeds and user-visible voxels are always kept, regardless of neighbour
+        # support (support only prunes isolated speckle noise, not real signal).
+        candidate = (candidate & (support >= support_min)) | (seed_labels > 0) | visible_roi
     else:
         candidate = seed_labels > 0
 

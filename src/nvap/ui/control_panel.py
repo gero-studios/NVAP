@@ -154,8 +154,10 @@ class ControlPanel(QWidget):
     run_microglia_segmentation_requested = Signal()
     run_microglia_analysis_requested  = Signal()
     enhance_microglia_requested       = Signal()
+    enhance_vasculature_requested     = Signal()
     auto_thresholds_requested         = Signal()
     wipe_specks_requested             = Signal()
+    wipe_vasculature_blobs_requested  = Signal()
     export_metrics_requested          = Signal()
     export_project_analytics_requested = Signal()
     export_snapshot_requested         = Signal()
@@ -564,8 +566,10 @@ class ControlPanel(QWidget):
         action_panel_layout.setContentsMargins(8, 8, 8, 8)
         action_panel_layout.setSpacing(6)
 
-        primary_row = QHBoxLayout()
-        primary_row.setSpacing(6)
+        action_grid = QGridLayout()
+        action_grid.setContentsMargins(0, 0, 0, 0)
+        action_grid.setHorizontalSpacing(6)
+        action_grid.setVerticalSpacing(6)
 
         self.enhance_microglia_btn = QPushButton("  Enhance Microglia")
         self.enhance_microglia_btn.setObjectName("workbenchPrimaryAction")
@@ -575,7 +579,17 @@ class ControlPanel(QWidget):
             "Remove green-channel background after loading while preserving somas and branches."
         )
         self.enhance_microglia_btn.clicked.connect(self.enhance_microglia_requested.emit)
-        primary_row.addWidget(self.enhance_microglia_btn)
+        action_grid.addWidget(self.enhance_microglia_btn, 0, 0)
+
+        self.enhance_vasculature_btn = QPushButton("  Enhance Vasculature")
+        self.enhance_vasculature_btn.setObjectName("workbenchPrimaryAction")
+        self.enhance_vasculature_btn.setIcon(icon("sparkles", ICON_SM, COLOR.accent))
+        self.enhance_vasculature_btn.setEnabled(False)
+        self.enhance_vasculature_btn.setToolTip(
+            "Remove uneven red-channel background while preserving vessel-like detail."
+        )
+        self.enhance_vasculature_btn.clicked.connect(self.enhance_vasculature_requested.emit)
+        action_grid.addWidget(self.enhance_vasculature_btn, 0, 1)
 
         # Speck wipe — remove tiny isolated blobs from both channels.
         wipe_form = QFormLayout()
@@ -595,6 +609,21 @@ class ControlPanel(QWidget):
             "larger structures (vessels, somas, branches) are kept."
         )
         wipe_form.addRow("Speck size <", self.wipe_speck_max_voxels)
+
+        self.vascular_blob_max_voxels = QSpinBox()
+        # Values below 64 only clear isolated one- or two-pixel noise, which
+        # is not useful for the visibly persistent vascular blobs this control
+        # is meant to target.
+        self.vascular_blob_max_voxels.setRange(64, 1_000_000)
+        self.vascular_blob_max_voxels.setSingleStep(64)
+        self.vascular_blob_max_voxels.setValue(2_048)
+        self.vascular_blob_max_voxels.setSuffix(" vox")
+        self.vascular_blob_max_voxels.setKeyboardTracking(False)
+        self.vascular_blob_max_voxels.setToolTip(
+            "Largest compact red-channel component treated as vascular debris.\n"
+            "Elongated vessel segments are retained, even below this size."
+        )
+        wipe_form.addRow("Remove red blobs up to", self.vascular_blob_max_voxels)
         action_panel_layout.addLayout(wipe_form)
 
         # "Automatic on load" toggles — read every time a dataset finishes
@@ -655,8 +684,19 @@ class ControlPanel(QWidget):
             "vasculature (red) channels. Larger structures are preserved."
         )
         self.wipe_specks_btn.clicked.connect(self.wipe_specks_requested.emit)
-        primary_row.addWidget(self.wipe_specks_btn)
-        action_panel_layout.addLayout(primary_row)
+        action_grid.addWidget(self.wipe_specks_btn, 1, 0)
+
+        self.wipe_vasculature_blobs_btn = QPushButton("  Wipe Vascular Blobs")
+        self.wipe_vasculature_blobs_btn.setObjectName("workbenchSecondaryAction")
+        self.wipe_vasculature_blobs_btn.setIcon(icon("trash", ICON_SM, COLOR.accent))
+        self.wipe_vasculature_blobs_btn.setEnabled(False)
+        self.wipe_vasculature_blobs_btn.setToolTip(
+            "Remove compact red-channel blobs using the dedicated vascular size limit. "
+            "Elongated vessel fragments are kept."
+        )
+        self.wipe_vasculature_blobs_btn.clicked.connect(self.wipe_vasculature_blobs_requested.emit)
+        action_grid.addWidget(self.wipe_vasculature_blobs_btn, 1, 1)
+        action_panel_layout.addLayout(action_grid)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
@@ -1076,11 +1116,16 @@ class ControlPanel(QWidget):
 
     def set_microglia_enhancement_enabled(self, enabled: bool) -> None:
         self.enhance_microglia_btn.setEnabled(bool(enabled))
+        self.enhance_vasculature_btn.setEnabled(bool(enabled))
         self.auto_thresholds_btn.setEnabled(bool(enabled))
         self.wipe_specks_btn.setEnabled(bool(enabled))
+        self.wipe_vasculature_blobs_btn.setEnabled(bool(enabled))
 
     def current_wipe_speck_max_voxels(self) -> int:
         return int(self.wipe_speck_max_voxels.value())
+
+    def current_vascular_blob_max_voxels(self) -> int:
+        return int(self.vascular_blob_max_voxels.value())
 
     def auto_wipe_specks_on_load_enabled(self) -> bool:
         return bool(self.auto_wipe_on_load.isChecked())

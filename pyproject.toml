@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nvap"
-version = "0.1.1"
+version = "0.1.2"
 description = "NeuroVascular Analytics Program (NVAP)"
 readme = "README.md"
 requires-python = ">=3.11"
