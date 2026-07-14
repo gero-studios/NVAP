@@ -1,25 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('samples', 'samples')]
+binaries = []
 hiddenimports = ['skimage._shared.geometry', 'imageio.v3']
 datas += copy_metadata('imageio')
 datas += copy_metadata('nvap')
+datas += copy_metadata('torch-directml')
+binaries += collect_dynamic_libs('torch_directml')
 hiddenimports += collect_submodules('vtkmodules')
 hiddenimports += collect_submodules('PySide6')
+hiddenimports += collect_submodules('torch_directml')
 
 
 a = Analysis(
     ['src\\nvap\\app.py'],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'torch_directml'],
+    excludes=[],
     noarchive=False,
     optimize=0,
 )
