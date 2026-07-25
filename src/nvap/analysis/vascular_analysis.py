@@ -7,7 +7,12 @@ the spatial structure microglia organise around, yet none of its geometry was
 quantified.
 
 This module computes anisotropy-aware, physically-calibrated vascular
-morphometry from a thresholded red volume:
+morphometry from a thresholded red volume. Red fluorescence is treated as a
+vessel-wall signal, so the analysis keeps two masks:
+
+* a cleaned wall mask for staining coverage and vessel-contact distances
+* a reconstructed solid vessel mask for anatomical volume, centerline length,
+  radius/diameter, topology, tortuosity, decussation candidates, and surface
 
 * vascular volume fraction (fraction of imaged tissue occupied by vessels)
 * total vessel (centreline) length and length density (mm vessel / mm^3 tissue)
@@ -47,9 +52,29 @@ except Exception:  # pragma: no cover - skan is a hard dependency, guarded anywa
     _HAS_SKAN = False
 
 _FULL_STRUCTURE = ndi.generate_binary_structure(3, 3).astype(np.uint8, copy=False)
-# Interior cavities below this many voxels are filled before skeletonising so a
-# noisy lumen does not seed spurious skeleton loops/branch points.
-_FILL_CAVITY_VOXELS = 64
+_WALL_MIN_COMPONENT_VOLUME_UM3 = 0.10
+_SOLID_MIN_COMPONENT_VOLUME_UM3 = 1.0
+# Wall/lumen reconstruction tolerance. Two micrometres closes small acquisition
+# gaps in the supplied vascular-wall stacks without the component loss and
+# centreline shortening observed with a 2.5 um pass.
+_SOLID_CLOSE_RADIUS_UM = 2.00
+_SOLID_3D_CLOSE_RADIUS_UM = 1.50
+_SOLID_STACKED_CROSSING_SAFE_CLOSE_UM = 1.99
+_TERMINAL_SPUR_PRUNE_LENGTH_UM = 2.0
+_MIN_LUMEN_FILL_FRACTION = 0.20
+_MIN_RADIUS_ESTIMATOR_RATIO = 0.75
+_MAX_RADIUS_ESTIMATOR_RATIO = 1.25
+_SHEET_GLOBAL_FRACTION = 0.10
+_MAX_ACQUISITION_SLICE_FRACTION = 0.50
+_RADIUS_RIDGE_SEARCH_UM = 1.50
+
+
+@dataclass(frozen=True)
+class VascularMasks:
+    """Analysis masks derived from red-channel vessel-wall fluorescence."""
+
+    wall_mask: np.ndarray
+    solid_mask: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -82,6 +107,43 @@ class VascularAnalysisResult:
     surface_to_volume_ratio_per_um: float
     decussation_candidate_count: int
     mean_decussation_z_separation_um: float
+
+    wall_voxel_count: int = 0
+    wall_volume_um3: float = 0.0
+    wall_volume_fraction: float = 0.0
+    wall_component_count: int = 0
+    wall_surface_area_um2: float = 0.0
+    red_positive_voxel_count: int = 0
+    red_positive_volume_um3: float = 0.0
+    red_positive_volume_fraction: float = 0.0
+    solid_vessel_voxel_count: int = 0
+    solid_vessel_volume_um3: float = 0.0
+    solid_vessel_volume_fraction: float = 0.0
+    solid_component_count: int = 0
+    solid_surface_area_um2: float = 0.0
+    terminal_spur_prune_length_um: float = _TERMINAL_SPUR_PRUNE_LENGTH_UM
+    mean_reconstructed_mask_radius_um: float = 0.0
+    median_reconstructed_mask_radius_um: float = 0.0
+    max_reconstructed_mask_radius_um: float = 0.0
+    mean_reconstructed_mask_diameter_um: float = 0.0
+    radius_p10_um: float = 0.0
+    radius_p25_um: float = 0.0
+    radius_p75_um: float = 0.0
+    radius_p90_um: float = 0.0
+    diameter_p10_um: float = 0.0
+    diameter_p90_um: float = 0.0
+    volume_length_equivalent_radius_um: float = 0.0
+    volume_length_equivalent_diameter_um: float = 0.0
+    radius_estimator_ratio: float = 0.0
+    max_principal_slice_fraction: float = 0.0
+    sheet_like_mask: bool = False
+    radius_ridge_search_um: float = _RADIUS_RIDGE_SEARCH_UM
+    mean_wall_distance_um: float = 0.0
+    median_wall_distance_um: float = 0.0
+    max_wall_distance_um: float = 0.0
+    solid_to_wall_volume_ratio: float = 0.0
+    reconstructed_lumen_fill_fraction: float = 0.0
+    anatomical_radius_reliable: bool = False
 
 
 def _spacing_zyx(spacing: VoxelSpacing | tuple[float, float, float]) -> np.ndarray:
@@ -138,6 +200,61 @@ def _empty_result(tissue_volume_um3: float) -> VascularAnalysisResult:
     )
 
 
+def build_vascular_masks(
+    red_volume: np.ndarray,
+    *,
+    threshold: float,
+    spacing: VoxelSpacing | tuple[float, float, float],
+    render: RenderConfig | None = None,
+    reconstruct_solid: bool = True,
+    closing_radius_um: float = _SOLID_CLOSE_RADIUS_UM,
+    wall_min_component_volume_um3: float = _WALL_MIN_COMPONENT_VOLUME_UM3,
+    solid_min_component_volume_um3: float = _SOLID_MIN_COMPONENT_VOLUME_UM3,
+) -> VascularMasks:
+    """Build separate red wall and reconstructed solid-vessel masks.
+
+    ``wall_mask`` preserves the thresholded fluorescent vessel wall after small
+    component cleanup. ``solid_mask`` closes small wall gaps and fills 2D lumen
+    cross-sections in all three orientations before 3D reconciliation, so
+    centerline and radius metrics are computed from a solid vessel volume rather
+    than from the hollow wall shell.
+    """
+    red = np.asarray(red_volume, dtype=np.float32)
+    if red.ndim != 3:
+        raise ValueError("red_volume must be 3D in (z, y, x) order.")
+
+    spacing_zyx = _spacing_zyx(spacing)
+    if render is not None:
+        wall = _apply_render_trim(
+            red >= float(threshold),
+            max(0, int(render.trim_first_slices)),
+            max(0, int(render.trim_last_slices)),
+        )
+    else:
+        wall = np.asarray(red >= float(threshold), dtype=bool)
+
+    wall_min_voxels = _volume_um3_to_voxels(
+        wall_min_component_volume_um3,
+        spacing_zyx,
+        minimum=1,
+    )
+    wall = _remove_small_components(wall, wall_min_voxels)
+    solid = (
+        _reconstruct_solid_vessel_mask(
+            wall,
+            spacing_zyx,
+            closing_radius_um=closing_radius_um,
+            min_component_volume_um3=solid_min_component_volume_um3,
+        )
+        if reconstruct_solid
+        else wall.copy()
+    )
+    return VascularMasks(
+        wall_mask=np.asarray(wall, dtype=bool),
+        solid_mask=np.asarray(solid, dtype=bool),
+    )
+
+
 def analyze_vasculature(
     red_volume: np.ndarray,
     *,
@@ -145,6 +262,7 @@ def analyze_vasculature(
     spacing: VoxelSpacing | tuple[float, float, float],
     render: RenderConfig | None = None,
     fill_cavities: bool = True,
+    prune_terminal_spurs_um: float = _TERMINAL_SPUR_PRUNE_LENGTH_UM,
 ) -> VascularAnalysisResult:
     """Compute vascular morphometry from a red volume and a threshold.
 
@@ -160,6 +278,10 @@ def analyze_vasculature(
         Optional render config; only ``trim_first_slices`` / ``trim_last_slices``
         are honoured so the metrics match the trimmed 3D view and microglia
         analytics.
+    fill_cavities:
+        When true, reconstruct a solid anatomical vessel mask from the hollow
+        fluorescent wall signal before skeleton, radius, topology and surface
+        measurements. Wall/staining metrics are reported separately either way.
     """
     red = np.asarray(red_volume, dtype=np.float32)
     if red.ndim != 3:
@@ -167,14 +289,21 @@ def analyze_vasculature(
     spacing_zyx = _spacing_zyx(spacing)
     voxel_volume = float(np.prod(spacing_zyx))
 
+    trim_first = max(0, int(render.trim_first_slices)) if render is not None else 0
+    trim_last = max(0, int(render.trim_last_slices)) if render is not None else 0
     if render is not None:
-        trim_first = max(0, int(render.trim_first_slices))
-        trim_last = max(0, int(render.trim_last_slices))
-        mask = _apply_render_trim(red >= float(threshold), trim_first, trim_last)
+        raw_wall_mask = _apply_render_trim(red >= float(threshold), trim_first, trim_last)
     else:
-        trim_first = 0
-        trim_last = 0
-        mask = np.asarray(red >= float(threshold), dtype=bool)
+        raw_wall_mask = np.asarray(red >= float(threshold), dtype=bool)
+    masks = build_vascular_masks(
+        red,
+        threshold=float(threshold),
+        spacing=spacing_zyx,
+        render=render,
+        reconstruct_solid=bool(fill_cavities),
+    )
+    wall_mask = masks.wall_mask
+    mask = masks.solid_mask
 
     # Tissue volume is the *retained* field of view. Trimmed slices are zeroed in
     # the mask (so they never contribute vessel voxels); counting them in the
@@ -186,37 +315,90 @@ def analyze_vasculature(
     else:
         tissue_voxels = int(mask.size)
     tissue_volume_um3 = float(tissue_voxels) * voxel_volume
-    vessel_voxels = int(np.count_nonzero(mask))
-    if vessel_voxels == 0:
+    red_positive_voxels = int(np.count_nonzero(raw_wall_mask))
+    red_positive_volume_um3 = float(red_positive_voxels) * voxel_volume
+    red_positive_volume_fraction = (
+        float(red_positive_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
+    )
+    wall_voxels = int(np.count_nonzero(wall_mask))
+    if wall_voxels == 0:
         logger.info("Vascular analysis: no vasculature above threshold=%.4f", float(threshold))
-        return _empty_result(tissue_volume_um3)
-
-    if fill_cavities:
-        mask = _fill_small_cavities(mask, _FILL_CAVITY_VOXELS)
+        data = asdict(_empty_result(tissue_volume_um3))
+        data.update(
+            {
+                "red_positive_voxel_count": red_positive_voxels,
+                "red_positive_volume_um3": red_positive_volume_um3,
+                "red_positive_volume_fraction": red_positive_volume_fraction,
+                "terminal_spur_prune_length_um": float(prune_terminal_spurs_um),
+            }
+        )
+        return VascularAnalysisResult(**data)
 
     _, component_count = ndi.label(mask, structure=_FULL_STRUCTURE)
+    _, wall_component_count = ndi.label(wall_mask, structure=_FULL_STRUCTURE)
+    vessel_voxels = int(np.count_nonzero(mask))
+    if vessel_voxels == 0:
+        logger.info(
+            "Vascular analysis: all red wall components were removed during solid-mask cleanup."
+        )
+        base = _empty_result(tissue_volume_um3)
+        wall_volume_um3 = float(wall_voxels) * voxel_volume
+        wall_surface = _surface_area_um2(wall_mask, spacing_zyx)
+        data = asdict(base)
+        data.update(
+            {
+                "wall_voxel_count": wall_voxels,
+                "wall_volume_um3": wall_volume_um3,
+                "wall_volume_fraction": (
+                    float(wall_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
+                ),
+                "wall_component_count": int(wall_component_count),
+                "wall_surface_area_um2": float(wall_surface),
+                "red_positive_voxel_count": red_positive_voxels,
+                "red_positive_volume_um3": red_positive_volume_um3,
+                "red_positive_volume_fraction": red_positive_volume_fraction,
+                "terminal_spur_prune_length_um": float(prune_terminal_spurs_um),
+            }
+        )
+        return VascularAnalysisResult(**data)
 
     # Radius field: distance from each vessel voxel to the nearest background,
     # in physical units. Sampled along the medial axis it gives vessel radius.
     dist_um = ndi.distance_transform_edt(mask, sampling=tuple(spacing_zyx))
-    # skeletonize's centreline does not always land exactly on the EDT ridge, so
-    # sampling the raw EDT there under-reads the radius. Take the local maximum in
-    # a 1-voxel neighbourhood so each skeleton voxel picks up the true ridge value.
-    ridge_um = ndi.maximum_filter(dist_um, size=3, mode="nearest")
+    # Lee skeletonisation preserves topology but, on hollow/irregular anisotropic
+    # masks, its centreline can sit several fine XY voxels away from the true EDT
+    # ridge. A fixed 3-voxel filter represented only ~0.2 um in common datasets
+    # and systematically under-read vessel radius. Search a physical (micron)
+    # neighbourhood instead, while keeping the radius itself spacing-correct.
+    ridge_um = _physical_maximum_filter(
+        dist_um,
+        spacing_zyx,
+        radius_um=_RADIUS_RIDGE_SEARCH_UM,
+    )
 
     skeleton = np.asarray(skeletonize(mask), dtype=bool)
+    skeleton = _prune_terminal_spurs(
+        skeleton,
+        spacing_zyx,
+        min_length_um=float(prune_terminal_spurs_um),
+    )
     skel_coords = np.argwhere(skeleton)
     if skel_coords.shape[0] == 0:
         # Blob too small / flat to skeletonise: report density + radius only.
         radii = _correct_edt_radius(ridge_um[mask], spacing_zyx)
         return _radius_only_result(
             mask=mask,
+            wall_mask=wall_mask,
+            raw_wall_mask=raw_wall_mask,
             radii=radii,
             spacing_zyx=spacing_zyx,
             voxel_volume=voxel_volume,
             tissue_volume_um3=tissue_volume_um3,
             tissue_voxels=tissue_voxels,
             component_count=component_count,
+            wall_component_count=wall_component_count,
+            prune_terminal_spurs_um=float(prune_terminal_spurs_um),
+            reconstructed_solid=bool(fill_cavities),
         )
 
     radii = _correct_edt_radius(
@@ -233,8 +415,12 @@ def analyze_vasculature(
     )
 
     vessel_volume_um3 = float(vessel_voxels) * voxel_volume
+    wall_volume_um3 = float(wall_voxels) * voxel_volume
     vessel_volume_fraction = (
         float(vessel_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
+    )
+    wall_volume_fraction = (
+        float(wall_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
     )
     # Length density expressed as mm of centreline per mm^3 of tissue.
     tissue_volume_mm3 = tissue_volume_um3 / 1.0e9
@@ -247,7 +433,43 @@ def analyze_vasculature(
     )
 
     surface_area = _surface_area_um2(mask, spacing_zyx)
+    wall_surface_area = _surface_area_um2(wall_mask, spacing_zyx)
     s2v = surface_area / vessel_volume_um3 if vessel_volume_um3 > 0.0 else 0.0
+    wall_distance = _wall_distance_values(wall_mask, spacing_zyx)
+    solid_to_wall_ratio = float(vessel_voxels) / float(wall_voxels) if wall_voxels else 0.0
+    lumen_fill_fraction = (
+        float(max(0, vessel_voxels - wall_voxels)) / float(vessel_voxels)
+        if vessel_voxels
+        else 0.0
+    )
+    mean_reconstructed_radius = float(np.mean(radii))
+    median_reconstructed_radius = float(np.median(radii))
+    max_reconstructed_radius = float(np.max(radii))
+    radius_percentiles = np.percentile(radii, [10.0, 25.0, 75.0, 90.0])
+    equivalent_radius = (
+        float(np.sqrt(vessel_volume_um3 / (np.pi * topo.total_length_um)))
+        if topo.total_length_um > 0.0 and vessel_volume_um3 > 0.0
+        else 0.0
+    )
+    radius_estimator_ratio = (
+        mean_reconstructed_radius / equivalent_radius
+        if equivalent_radius > 0.0
+        else 0.0
+    )
+    max_slice_fraction = _max_principal_slice_fraction(mask)
+    sheet_like_mask = _is_sheet_like_mask(mask)
+    anatomical_radius_reliable = _anatomical_radius_is_reliable(
+        radii,
+        lumen_fill_fraction=lumen_fill_fraction,
+        reconstructed_solid=bool(fill_cavities),
+        equivalent_radius_um=equivalent_radius,
+        solid_mask=mask,
+    )
+    mean_radius = mean_reconstructed_radius if anatomical_radius_reliable else float("nan")
+    median_radius = (
+        median_reconstructed_radius if anatomical_radius_reliable else float("nan")
+    )
+    max_radius = max_reconstructed_radius if anatomical_radius_reliable else float("nan")
 
     result = VascularAnalysisResult(
         vessel_voxel_count=vessel_voxels,
@@ -257,10 +479,10 @@ def analyze_vasculature(
         component_count=int(component_count),
         total_length_um=float(topo.total_length_um),
         length_density_mm_per_mm3=float(length_density),
-        mean_radius_um=float(np.mean(radii)),
-        median_radius_um=float(np.median(radii)),
-        max_radius_um=float(np.max(radii)),
-        mean_diameter_um=float(2.0 * np.mean(radii)),
+        mean_radius_um=float(mean_radius),
+        median_radius_um=float(median_radius),
+        max_radius_um=float(max_radius),
+        mean_diameter_um=float(2.0 * mean_radius),
         junction_count=int(topo.junction_count),
         junction_density_per_mm3=float(junction_density),
         endpoint_count=int(topo.endpoint_count),
@@ -271,6 +493,44 @@ def analyze_vasculature(
         surface_to_volume_ratio_per_um=float(s2v),
         decussation_candidate_count=int(decussation_count),
         mean_decussation_z_separation_um=float(decussation_z_sep),
+        wall_voxel_count=wall_voxels,
+        wall_volume_um3=wall_volume_um3,
+        wall_volume_fraction=wall_volume_fraction,
+        wall_component_count=int(wall_component_count),
+        wall_surface_area_um2=float(wall_surface_area),
+        red_positive_voxel_count=red_positive_voxels,
+        red_positive_volume_um3=red_positive_volume_um3,
+        red_positive_volume_fraction=red_positive_volume_fraction,
+        solid_vessel_voxel_count=vessel_voxels,
+        solid_vessel_volume_um3=vessel_volume_um3,
+        solid_vessel_volume_fraction=vessel_volume_fraction,
+        solid_component_count=int(component_count),
+        solid_surface_area_um2=float(surface_area),
+        terminal_spur_prune_length_um=float(prune_terminal_spurs_um),
+        mean_reconstructed_mask_radius_um=mean_reconstructed_radius,
+        median_reconstructed_mask_radius_um=median_reconstructed_radius,
+        max_reconstructed_mask_radius_um=max_reconstructed_radius,
+        mean_reconstructed_mask_diameter_um=float(2.0 * mean_reconstructed_radius),
+        radius_p10_um=float(radius_percentiles[0]),
+        radius_p25_um=float(radius_percentiles[1]),
+        radius_p75_um=float(radius_percentiles[2]),
+        radius_p90_um=float(radius_percentiles[3]),
+        diameter_p10_um=float(2.0 * radius_percentiles[0]),
+        diameter_p90_um=float(2.0 * radius_percentiles[3]),
+        volume_length_equivalent_radius_um=equivalent_radius,
+        volume_length_equivalent_diameter_um=float(2.0 * equivalent_radius),
+        radius_estimator_ratio=float(radius_estimator_ratio),
+        max_principal_slice_fraction=float(max_slice_fraction),
+        sheet_like_mask=bool(sheet_like_mask),
+        radius_ridge_search_um=float(_RADIUS_RIDGE_SEARCH_UM),
+        mean_wall_distance_um=float(np.mean(wall_distance)) if wall_distance.size else 0.0,
+        median_wall_distance_um=(
+            float(np.median(wall_distance)) if wall_distance.size else 0.0
+        ),
+        max_wall_distance_um=float(np.max(wall_distance)) if wall_distance.size else 0.0,
+        solid_to_wall_volume_ratio=solid_to_wall_ratio,
+        reconstructed_lumen_fill_fraction=lumen_fill_fraction,
+        anatomical_radius_reliable=bool(anatomical_radius_reliable),
     )
     logger.info(
         "Vascular analysis: vol_frac=%.4f length=%.1fum density=%.2f mm/mm3 "
@@ -399,6 +659,36 @@ def _skeleton_topology_fallback(
     )
 
 
+def _prune_terminal_spurs(
+    skeleton: np.ndarray,
+    spacing_zyx: np.ndarray,
+    *,
+    min_length_um: float,
+) -> np.ndarray:
+    """Remove short endpoint-to-junction paths from a skeleton."""
+    skel = np.asarray(skeleton, dtype=bool)
+    min_len = float(min_length_um)
+    if not np.any(skel) or min_len <= 0.0 or not _HAS_SKAN:
+        return skel
+    sampling = tuple(float(v) for v in spacing_zyx)
+    current = skel
+    for _ in range(8):
+        try:
+            skan_skel = _SkanSkeleton(current, spacing=sampling)
+            if skan_skel.n_paths <= 0:
+                return current
+            summary = _skan_summarize(skan_skel, separator="-")
+            branch_dist = np.asarray(summary["branch-distance"].to_numpy(), dtype=np.float64)
+            branch_type = np.asarray(summary["branch-type"].to_numpy(), dtype=np.int64)
+            prune_ids = np.flatnonzero((branch_type == 1) & (branch_dist < min_len)).tolist()
+            if not prune_ids:
+                return current
+            current = np.asarray(skan_skel.prune_paths(prune_ids).skeleton_image, dtype=bool)
+        except Exception:
+            return current
+    return current
+
+
 def _correct_edt_radius(radii: np.ndarray, spacing_zyx: np.ndarray) -> np.ndarray:
     """Correct the systematic half-voxel underestimate of the Euclidean EDT.
 
@@ -416,24 +706,143 @@ def _correct_edt_radius(radii: np.ndarray, spacing_zyx: np.ndarray) -> np.ndarra
     return arr + half_voxel
 
 
+def _physical_maximum_filter(
+    values: np.ndarray,
+    spacing_zyx: np.ndarray,
+    *,
+    radius_um: float,
+) -> np.ndarray:
+    """Return a local maximum field using a physically sized 3D footprint."""
+    radius = float(max(0.0, radius_um))
+    if radius <= 0.0:
+        return np.asarray(values)
+    footprint = _ellipsoid_structure(radius, spacing_zyx)
+    return ndi.maximum_filter(values, footprint=footprint, mode="nearest")
+
+
+def _wall_distance_values(wall_mask: np.ndarray, spacing_zyx: np.ndarray) -> np.ndarray:
+    """Return diagnostic EDT distances inside the red-positive wall mask."""
+    wall = np.asarray(wall_mask, dtype=bool)
+    if not np.any(wall):
+        return np.asarray([], dtype=np.float64)
+    dist_um = ndi.distance_transform_edt(wall, sampling=tuple(spacing_zyx))
+    ridge_um = ndi.maximum_filter(dist_um, size=3, mode="nearest")
+    skeleton = np.asarray(skeletonize(wall), dtype=bool)
+    values = ridge_um[skeleton] if np.any(skeleton) else ridge_um[wall]
+    values = np.asarray(values, dtype=np.float64)
+    return values[np.isfinite(values) & (values > 0.0)]
+
+
+def _max_principal_slice_fraction(mask: np.ndarray) -> float:
+    binary = np.asarray(mask, dtype=bool)
+    if binary.ndim != 3 or binary.size == 0:
+        return 0.0
+    maximum = 0.0
+    for axis in (0, 1, 2):
+        other_axes = tuple(index for index in (0, 1, 2) if index != axis)
+        slice_area = float(np.prod([binary.shape[index] for index in other_axes]))
+        if slice_area <= 0.0:
+            continue
+        occupancy = np.sum(binary, axis=other_axes, dtype=np.int64) / slice_area
+        maximum = max(maximum, float(np.max(occupancy, initial=0.0)))
+    return float(maximum)
+
+
+def _is_sheet_like_mask(mask: np.ndarray) -> bool:
+    binary = np.asarray(mask, dtype=bool)
+    if binary.ndim != 3 or binary.size == 0:
+        return False
+    global_fraction = float(np.mean(binary))
+    xy_fraction = np.mean(binary, axis=(1, 2))
+    max_xy_fraction = float(np.max(xy_fraction, initial=0.0))
+    return bool(
+        global_fraction >= _SHEET_GLOBAL_FRACTION
+        and max_xy_fraction > _MAX_ACQUISITION_SLICE_FRACTION
+    )
+
+
+def _anatomical_radius_is_reliable(
+    reconstructed_radii_um: np.ndarray,
+    *,
+    lumen_fill_fraction: float,
+    reconstructed_solid: bool,
+    equivalent_radius_um: float = 0.0,
+    solid_mask: np.ndarray | None = None,
+) -> bool:
+    """Gate radius reporting using fill, estimator agreement, and anti-sheet QC."""
+    if not bool(reconstructed_solid):
+        return False
+    radii = np.asarray(reconstructed_radii_um, dtype=np.float64)
+    radii = radii[np.isfinite(radii) & (radii > 0.0)]
+    if radii.size == 0:
+        return False
+
+    if solid_mask is not None:
+        binary = np.asarray(solid_mask, dtype=bool)
+        if _is_sheet_like_mask(binary):
+            return False
+
+    fill_fraction = float(max(0.0, lumen_fill_fraction))
+    if fill_fraction >= _MIN_LUMEN_FILL_FRACTION or fill_fraction < 0.02:
+        return True
+
+    equivalent = float(equivalent_radius_um)
+    if not np.isfinite(equivalent) or equivalent <= 0.0:
+        return False
+    ratio = float(np.mean(radii)) / equivalent
+    return _MIN_RADIUS_ESTIMATOR_RATIO <= ratio <= _MAX_RADIUS_ESTIMATOR_RATIO
+
+
 def _radius_only_result(
     *,
     mask: np.ndarray,
+    wall_mask: np.ndarray,
+    raw_wall_mask: np.ndarray,
     radii: np.ndarray,
     spacing_zyx: np.ndarray,
     voxel_volume: float,
     tissue_volume_um3: float,
     tissue_voxels: int,
     component_count: int,
+    wall_component_count: int,
+    prune_terminal_spurs_um: float,
+    reconstructed_solid: bool,
 ) -> VascularAnalysisResult:
     radii = np.asarray(radii, dtype=np.float64)
     radii = radii[radii > 0.0]
     if radii.size == 0:
         radii = np.asarray([float(np.mean(spacing_zyx))], dtype=np.float64)
     vessel_voxels = int(np.count_nonzero(mask))
+    wall_voxels = int(np.count_nonzero(wall_mask))
+    red_positive_voxels = int(np.count_nonzero(raw_wall_mask))
     vessel_volume_um3 = float(vessel_voxels) * voxel_volume
+    wall_volume_um3 = float(wall_voxels) * voxel_volume
+    red_positive_volume_um3 = float(red_positive_voxels) * voxel_volume
     surface_area = _surface_area_um2(mask, spacing_zyx)
+    wall_surface_area = _surface_area_um2(wall_mask, spacing_zyx)
     s2v = surface_area / vessel_volume_um3 if vessel_volume_um3 > 0.0 else 0.0
+    wall_distance = _wall_distance_values(wall_mask, spacing_zyx)
+    solid_to_wall_ratio = float(vessel_voxels) / float(wall_voxels) if wall_voxels else 0.0
+    lumen_fill_fraction = (
+        float(max(0, vessel_voxels - wall_voxels)) / float(vessel_voxels)
+        if vessel_voxels
+        else 0.0
+    )
+    anatomical_radius_reliable = _anatomical_radius_is_reliable(
+        radii,
+        lumen_fill_fraction=lumen_fill_fraction,
+        reconstructed_solid=bool(reconstructed_solid),
+        solid_mask=mask,
+    )
+    mean_reconstructed_radius = float(np.mean(radii))
+    median_reconstructed_radius = float(np.median(radii))
+    max_reconstructed_radius = float(np.max(radii))
+    radius_percentiles = np.percentile(radii, [10.0, 25.0, 75.0, 90.0])
+    mean_radius = mean_reconstructed_radius if anatomical_radius_reliable else float("nan")
+    median_radius = (
+        median_reconstructed_radius if anatomical_radius_reliable else float("nan")
+    )
+    max_radius = max_reconstructed_radius if anatomical_radius_reliable else float("nan")
     return VascularAnalysisResult(
         vessel_voxel_count=vessel_voxels,
         vessel_volume_um3=vessel_volume_um3,
@@ -444,10 +853,10 @@ def _radius_only_result(
         component_count=int(component_count),
         total_length_um=0.0,
         length_density_mm_per_mm3=0.0,
-        mean_radius_um=float(np.mean(radii)),
-        median_radius_um=float(np.median(radii)),
-        max_radius_um=float(np.max(radii)),
-        mean_diameter_um=float(2.0 * np.mean(radii)),
+        mean_radius_um=float(mean_radius),
+        median_radius_um=float(median_radius),
+        max_radius_um=float(max_radius),
+        mean_diameter_um=float(2.0 * mean_radius),
         junction_count=0,
         junction_density_per_mm3=0.0,
         endpoint_count=0,
@@ -458,21 +867,182 @@ def _radius_only_result(
         surface_to_volume_ratio_per_um=float(s2v),
         decussation_candidate_count=0,
         mean_decussation_z_separation_um=0.0,
+        wall_voxel_count=wall_voxels,
+        wall_volume_um3=wall_volume_um3,
+        wall_volume_fraction=(
+            float(wall_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
+        ),
+        wall_component_count=int(wall_component_count),
+        wall_surface_area_um2=float(wall_surface_area),
+        red_positive_voxel_count=red_positive_voxels,
+        red_positive_volume_um3=red_positive_volume_um3,
+        red_positive_volume_fraction=(
+            float(red_positive_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
+        ),
+        solid_vessel_voxel_count=vessel_voxels,
+        solid_vessel_volume_um3=vessel_volume_um3,
+        solid_vessel_volume_fraction=(
+            float(vessel_voxels) / float(tissue_voxels) if tissue_voxels else 0.0
+        ),
+        solid_component_count=int(component_count),
+        solid_surface_area_um2=float(surface_area),
+        terminal_spur_prune_length_um=float(prune_terminal_spurs_um),
+        mean_reconstructed_mask_radius_um=mean_reconstructed_radius,
+        median_reconstructed_mask_radius_um=median_reconstructed_radius,
+        max_reconstructed_mask_radius_um=max_reconstructed_radius,
+        mean_reconstructed_mask_diameter_um=float(2.0 * mean_reconstructed_radius),
+        radius_p10_um=float(radius_percentiles[0]),
+        radius_p25_um=float(radius_percentiles[1]),
+        radius_p75_um=float(radius_percentiles[2]),
+        radius_p90_um=float(radius_percentiles[3]),
+        diameter_p10_um=float(2.0 * radius_percentiles[0]),
+        diameter_p90_um=float(2.0 * radius_percentiles[3]),
+        radius_ridge_search_um=float(_RADIUS_RIDGE_SEARCH_UM),
+        mean_wall_distance_um=float(np.mean(wall_distance)) if wall_distance.size else 0.0,
+        median_wall_distance_um=(
+            float(np.median(wall_distance)) if wall_distance.size else 0.0
+        ),
+        max_wall_distance_um=float(np.max(wall_distance)) if wall_distance.size else 0.0,
+        solid_to_wall_volume_ratio=solid_to_wall_ratio,
+        reconstructed_lumen_fill_fraction=lumen_fill_fraction,
+        anatomical_radius_reliable=bool(anatomical_radius_reliable),
     )
 
 
-def _fill_small_cavities(mask: np.ndarray, max_voxels: int) -> np.ndarray:
-    """Fill enclosed background pockets smaller than ``max_voxels``.
+def _volume_um3_to_voxels(volume_um3: float, spacing_zyx: np.ndarray, *, minimum: int) -> int:
+    voxel_volume = float(np.prod(np.asarray(spacing_zyx, dtype=np.float64)))
+    if voxel_volume <= 0.0:
+        return int(max(1, minimum))
+    return int(max(int(minimum), int(np.ceil(float(volume_um3) / voxel_volume))))
 
-    Removes lumen speckle that would otherwise fragment the medial axis without
-    materially changing the vessel surface.
+
+def _remove_small_components(mask: np.ndarray, min_voxels: int) -> np.ndarray:
+    binary = np.asarray(mask, dtype=bool)
+    floor = int(max(1, min_voxels))
+    if floor <= 1 or not np.any(binary):
+        return binary.copy()
+    labels, count = ndi.label(binary, structure=_FULL_STRUCTURE)
+    if count <= 0:
+        return binary.copy()
+    sizes = np.bincount(labels.ravel())
+    keep = np.flatnonzero(sizes >= floor)
+    keep = keep[keep != 0]
+    return np.isin(labels, keep) if keep.size > 0 else np.zeros_like(binary)
+
+
+def _ellipsoid_structure(radius_um: float, spacing_zyx: np.ndarray) -> np.ndarray:
+    radius = float(radius_um)
+    if radius <= 0.0:
+        return np.ones((1, 1, 1), dtype=bool)
+    spacing_arr = np.asarray(spacing_zyx, dtype=np.float64)
+    extents = np.maximum(1, np.ceil(radius / spacing_arr).astype(np.int64))
+    zz, yy, xx = np.indices(tuple((2 * extents + 1).tolist()))
+    center = extents.reshape(3, 1, 1, 1)
+    coords = np.asarray([zz, yy, xx], dtype=np.float64)
+    scaled = (coords - center) * spacing_arr.reshape(3, 1, 1, 1)
+    dist = np.sqrt(np.sum(scaled**2, axis=0))
+    return np.asarray(dist <= radius + 1.0e-9, dtype=bool)
+
+
+def _ellipse_structure_for_slice(
+    *,
+    sliced_axis: int,
+    radius_um: float,
+    spacing_zyx: np.ndarray,
+) -> np.ndarray:
+    """2D elliptical structuring element for a slice plane.
+
+    The volume is stored as (z, y, x), so a slice perpendicular to z is an
+    anisotropic y/x plane, while slices perpendicular to y or x are z/x and z/y
+    planes. Building the element from physical spacing lets one lumen-sealing
+    radius behave consistently across all orientations.
+    """
+    radius = float(radius_um)
+    if radius <= 0.0:
+        return np.ones((1, 1), dtype=bool)
+    axes = [axis for axis in (0, 1, 2) if axis != int(sliced_axis)]
+    spacing_arr = np.asarray(spacing_zyx, dtype=np.float64)[axes]
+    extents = np.maximum(1, np.ceil(radius / spacing_arr).astype(np.int64))
+    aa, bb = np.indices(tuple((2 * extents + 1).tolist()))
+    center = extents.reshape(2, 1, 1)
+    coords = np.asarray([aa, bb], dtype=np.float64)
+    scaled = (coords - center) * spacing_arr.reshape(2, 1, 1)
+    dist = np.sqrt(np.sum(scaled**2, axis=0))
+    return np.asarray(dist <= radius + 1.0e-9, dtype=bool)
+
+
+def _fill_lumen_slicewise_with_closing(
+    mask: np.ndarray,
+    spacing_zyx: np.ndarray,
+    *,
+    closing_radius_um: float,
+) -> np.ndarray:
+    """Seal broken wall cross-sections and fill the enclosed lumen.
+
+    Hollow vascular stains usually appear as rings or arcs in individual
+    cross-sections. A small 3D closing can miss those lumens because gaps and
+    field-of-view cuts keep the background connected in 3D. Filling after
+    physically calibrated 2D closing on all principal planes is deliberately
+    more aggressive about reconstructing tube interiors while still avoiding a
+    blanket dilation of the whole volume.
+    """
+    wall = np.asarray(mask, dtype=bool)
+    if not np.any(wall):
+        return wall.copy()
+    solid = wall.copy()
+    for axis in (0, 1, 2):
+        # In planes containing z, exclude the exact 2 um axial offset. This tiny
+        # cap keeps vessels separated by 4 um in z from closing into one another
+        # while retaining essentially the full tolerance for anisotropic data.
+        slice_close_radius = (
+            float(closing_radius_um)
+            if axis == 0
+            else min(
+                float(closing_radius_um),
+                _SOLID_STACKED_CROSSING_SAFE_CLOSE_UM,
+            )
+        )
+        structure = _ellipse_structure_for_slice(
+            sliced_axis=axis,
+            radius_um=slice_close_radius,
+            spacing_zyx=spacing_zyx,
+        )
+        moved = np.moveaxis(wall, axis, 0)
+        filled = np.empty_like(moved, dtype=bool)
+        for idx in range(moved.shape[0]):
+            closed = np.asarray(
+                ndi.binary_closing(moved[idx], structure=structure),
+                dtype=bool,
+            )
+            closed |= moved[idx]
+            filled[idx] = ndi.binary_fill_holes(closed)
+        solid |= np.moveaxis(filled, 0, axis)
+    return solid
+
+
+def _fill_holes_slicewise_all_axes(mask: np.ndarray) -> np.ndarray:
+    binary = np.asarray(mask, dtype=bool)
+    filled = binary.copy()
+    for axis in (0, 1, 2):
+        moved = np.moveaxis(binary, axis, 0)
+        axis_filled = np.empty_like(moved, dtype=bool)
+        for idx in range(moved.shape[0]):
+            axis_filled[idx] = ndi.binary_fill_holes(moved[idx])
+        filled |= np.moveaxis(axis_filled, 0, axis)
+    return filled
+
+
+def _fill_internal_cavities(mask: np.ndarray) -> np.ndarray:
+    """Fill enclosed background cavities without filling exterior background.
+
+    A reconstructed vessel mask should be solid. Background connected to the
+    field-of-view boundary remains exterior and is never filled.
     """
     binary = np.asarray(mask, dtype=bool)
     background = ~binary
     labels, count = ndi.label(background, structure=_FULL_STRUCTURE)
     if count == 0:
         return binary
-    sizes = np.bincount(labels.ravel())
     # Background component touching the border is the true exterior; never fill.
     border_ids = set(np.unique(np.concatenate([
         labels[0].ravel(), labels[-1].ravel(),
@@ -483,9 +1053,55 @@ def _fill_small_cavities(mask: np.ndarray, max_voxels: int) -> np.ndarray:
     for comp_id in range(1, count + 1):
         if comp_id in border_ids:
             continue
-        if int(sizes[comp_id]) <= int(max_voxels):
-            fill[labels == comp_id] = True
+        fill[labels == comp_id] = True
     return fill
+
+
+def _reconstruct_solid_vessel_mask(
+    wall_mask: np.ndarray,
+    spacing_zyx: np.ndarray,
+    *,
+    closing_radius_um: float,
+    min_component_volume_um3: float,
+) -> np.ndarray:
+    wall = np.asarray(wall_mask, dtype=bool)
+    if not np.any(wall):
+        return wall.copy()
+    solid = _fill_lumen_slicewise_with_closing(
+        wall,
+        spacing_zyx,
+        closing_radius_um=float(closing_radius_um),
+    )
+    # Principal-plane filling handles most tubes cheaply, but an oblique vessel
+    # can have a small wall opening in every XY/XZ/YZ section even when its 3D
+    # shell is nearly closed. Seal those orientation-dependent gaps in 3D and
+    # fill only cavities that are disconnected from the field-of-view exterior.
+    # Unioning this result with the slice reconstruction preserves open ends and
+    # avoids eroding the original thresholded wall.
+    # Keep the unrestricted estimate in the cross-sectional planes. In 3D, cap
+    # it below the separation of plausible stacked vessels so an over/under
+    # crossing is not fused into one object and lost as a decussation.
+    close_radius = min(
+        float(max(0.0, closing_radius_um)),
+        _SOLID_3D_CLOSE_RADIUS_UM,
+    )
+    if close_radius > 0.0:
+        closed_3d = np.asarray(
+            ndi.binary_closing(
+                wall,
+                structure=_ellipsoid_structure(close_radius, spacing_zyx),
+            ),
+            dtype=bool,
+        )
+        closed_3d |= wall
+        solid |= _fill_internal_cavities(closed_3d)
+    solid = _fill_internal_cavities(solid)
+    min_voxels = _volume_um3_to_voxels(
+        min_component_volume_um3,
+        spacing_zyx,
+        minimum=1,
+    )
+    return _remove_small_components(solid, min_voxels)
 
 
 def _surface_area_um2(mask: np.ndarray, spacing_zyx: np.ndarray) -> float:
@@ -530,8 +1146,8 @@ def _decussation_candidates(skeleton: np.ndarray, spacing_zyx: np.ndarray) -> tu
     for z, y, x in coords.tolist():
         by_yx.setdefault((int(y), int(x)), []).append(int(z))
 
-    separations: list[float] = []
-    for z_values in by_yx.values():
+    candidate_sep: dict[tuple[int, int], float] = {}
+    for yx, z_values in by_yx.items():
         unique_z = sorted(set(z_values))
         if len(unique_z) < 2:
             continue
@@ -545,8 +1161,20 @@ def _decussation_candidates(skeleton: np.ndarray, spacing_zyx: np.ndarray) -> tu
             continue
         centers = [0.5 * (g[0] + g[-1]) for g in groups]
         gaps = [abs(b - a) * z_spacing for a, b in zip(centers, centers[1:], strict=False)]
-        separations.append(float(max(gaps)))
+        candidate_sep[yx] = float(max(gaps))
 
+    if not candidate_sep:
+        return 0, 0.0
+    candidate_mask = np.zeros(skel.shape[1:], dtype=bool)
+    for y, x in candidate_sep:
+        candidate_mask[int(y), int(x)] = True
+    labels, count = ndi.label(candidate_mask, structure=np.ones((3, 3), dtype=np.uint8))
+    separations: list[float] = []
+    for label_id in range(1, int(count) + 1):
+        coords = np.argwhere(labels == label_id)
+        values = [candidate_sep[(int(y), int(x))] for y, x in coords.tolist()]
+        if values:
+            separations.append(float(np.max(values)))
     if not separations:
         return 0, 0.0
     return int(len(separations)), float(np.mean(separations))
@@ -561,4 +1189,29 @@ def vascular_analysis_to_csv_rows(
     the existing metrics export, regardless of how many fields evolve later.
     """
     data = asdict(result)
-    return [{"metric": key, "value": value} for key, value in data.items()]
+    rows: list[dict[str, float | int | str]] = [
+        {"metric": key, "value": value} for key, value in data.items()
+    ]
+    rows.append(
+        {
+            "metric": "vascular_wall_mask",
+            "value": "clean thresholded red fluorescence; used for wall/staining/contact metrics",
+        }
+    )
+    rows.append(
+        {
+            "metric": "vascular_solid_mask",
+            "value": "reconstructed filled vessel volume; anatomical morphometry only when reliability flag is true",
+        }
+    )
+    if not bool(result.anatomical_radius_reliable):
+        rows.append(
+            {
+                "metric": "vascular_radius_interpretation",
+                "value": (
+                    "mean_radius_um/mean_diameter_um withheld; reconstructed mask "
+                    "failed lumen-fill, independent-estimator, or anti-sheet QC"
+                ),
+            }
+        )
+    return rows

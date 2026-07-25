@@ -1450,21 +1450,16 @@ def wipe_vasculature_blobs(
     *,
     threshold: float,
     max_voxels: int,
-    max_aspect_ratio: float = float("inf"),
+    max_aspect_ratio: float = 4.0,
     min_solid_voxels: int = 64,
     connectivity: int = 3,
 ) -> np.ndarray:
     """Remove isolated red-channel debris while preserving the vessel network.
 
-    Every connected component no larger than ``max_voxels`` is removed. Real
-    vasculature forms a large connected network that far exceeds this limit, so
-    any isolated island below it is debris regardless of shape — this is why the
-    default is a pure size filter and the control reads "remove red blobs up to
-    N voxels".
-
-    ``max_aspect_ratio`` is an opt-in vessel-fragment guard: pass a finite value
-    to *keep* elongated components (aspect ratio above the cutoff) that would
-    otherwise be removed, so disconnected but visibly tubular stubs survive.
+    Compact connected components no larger than ``max_voxels`` are removed.
+    Elongated components with an aspect ratio above ``max_aspect_ratio`` are
+    kept as likely disconnected vessel fragments, matching the UI wording.
+    Passing ``float("inf")`` restores pure size-only wiping.
     Because that ratio is meaningless for a handful of voxels (a 3-voxel diagonal
     reads as highly "elongated"), the guard never protects components at or below
     ``min_solid_voxels`` — those are always removed as noise.

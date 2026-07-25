@@ -58,6 +58,14 @@ def parse_czi_spacing(metadata: ElementTree.Element | str | bytes) -> VoxelSpaci
         if raw_value is None:
             continue
         value = float(raw_value)
+        has_explicit_unit = any(
+            _local_name(child.tag).lower() == "unit" and bool(child.text)
+            for child in element.iter()
+        )
+        # DefaultUnitFormat is a display preference in standard CZI metadata.
+        # Values near 1e-7 remain metres even when that display tag says um.
+        if not has_explicit_unit and abs(value) < 1.0e-3:
+            raw_unit = "m"
         # Zeiss Scaling/Items/Distance values are metres when the unit is omitted.
         unit = (raw_unit or "m").strip().lower().replace("µ", "u").replace("μ", "u")
         factor = _UNIT_TO_UM.get(unit)
@@ -72,6 +80,127 @@ def parse_czi_spacing(metadata: ElementTree.Element | str | bytes) -> VoxelSpaci
     if missing:
         raise ValueError(f"CZI metadata is missing positive spacing for axis/axes: {', '.join(missing)}")
     return VoxelSpacing(x_um=values["X"], y_um=values["Y"], z_um=values["Z"])
+
+
+def _normalise_channel_text(value: str) -> str:
+    return " ".join(
+        str(value).strip().lower().replace("-", " ").replace("_", " ").split()
+    )
+
+
+def _channel_role_scores(channel: ElementTree.Element) -> tuple[float, float]:
+    """Return (green, red) evidence scores from one CZI channel element."""
+    parts = [str(value) for value in channel.attrib.values()]
+    color: str | None = None
+    excitation: float | None = None
+    emission: float | None = None
+    for child in channel.iter():
+        name = _local_name(child.tag).lower()
+        if child.text and name in {
+            "name",
+            "description",
+            "fluor",
+            "dyeid",
+            "dye",
+            "color",
+        }:
+            parts.append(child.text.strip())
+        if child.text and name == "color":
+            color = child.text.strip()
+        elif child.text and name == "excitationwavelength":
+            try:
+                excitation = float(child.text)
+            except ValueError:
+                pass
+        elif child.text and name == "emissionwavelength":
+            try:
+                emission = float(child.text)
+            except ValueError:
+                pass
+
+    text = _normalise_channel_text(" ".join(parts))
+    green = 0.0
+    red = 0.0
+    green_terms = ("egfp", "gfp", "fitc", "alexa 488", "af488", "green")
+    red_terms = (
+        "texas red",
+        "texre",
+        "tritc",
+        "alexa 555",
+        "alexa 568",
+        "alexa 594",
+        "red",
+    )
+    green += 5.0 * sum(term in text for term in green_terms)
+    red += 5.0 * sum(term in text for term in red_terms)
+    if excitation is not None:
+        if 450.0 <= excitation <= 520.0:
+            green += 2.0
+        elif 530.0 <= excitation <= 650.0:
+            red += 2.0
+    if emission is not None:
+        if 490.0 <= emission <= 550.0:
+            green += 2.0
+        elif 560.0 <= emission <= 700.0:
+            red += 2.0
+    if color:
+        raw = color.lstrip("#")
+        if len(raw) == 8:  # AARRGGBB
+            raw = raw[2:]
+        if len(raw) == 6:
+            try:
+                red_value = int(raw[0:2], 16)
+                green_value = int(raw[2:4], 16)
+            except ValueError:
+                pass
+            else:
+                if green_value > red_value * 1.25:
+                    green += 2.0
+                elif red_value > green_value * 1.25:
+                    red += 2.0
+    return green, red
+
+
+def infer_czi_channel_indices(
+    metadata: ElementTree.Element | str | bytes,
+    channel_count: int,
+) -> tuple[int, int]:
+    """Return (green_index, red_index), with legacy C1/C0 as fallback."""
+    if isinstance(metadata, ElementTree.Element):
+        root = metadata
+    else:
+        root = ElementTree.fromstring(metadata)
+    count = int(channel_count)
+    if count < 2:
+        raise ValueError("At least two CZI channels are required.")
+
+    candidates: list[tuple[float, int, int]] = []
+    for parent in root.iter():
+        if _local_name(parent.tag).lower() != "channels":
+            continue
+        channels = [
+            child
+            for child in list(parent)
+            if _local_name(child.tag).lower() == "channel"
+        ]
+        if len(channels) < count:
+            continue
+        scores = [_channel_role_scores(channel) for channel in channels[:count]]
+        for green_index, (green_score, _) in enumerate(scores):
+            for red_index, (_, red_score) in enumerate(scores):
+                if green_index != red_index:
+                    candidates.append(
+                        (float(green_score + red_score), green_index, red_index)
+                    )
+
+    if candidates:
+        confidence, green_index, red_index = max(candidates, key=lambda item: item[0])
+        if confidence >= 4.0:
+            return int(green_index), int(red_index)
+    logger.warning(
+        "Could not identify green/red CZI channels from metadata; using legacy C1/C0 order."
+    )
+    return 1, 0
 
 
 def _open_czi(path: Path):
@@ -150,7 +279,7 @@ def load_czi_channels(
     path: str | Path,
     spacing: VoxelSpacing | None = None,
 ) -> tuple[ChannelVolume, ChannelVolume, VoxelSpacing]:
-    """Load the first CZI acquisition as NVAP red (C0) and green (C1) volumes."""
+    """Load the first CZI acquisition and map green/red channels from metadata."""
     source = Path(path).resolve()
     czi = _open_czi(source)
     effective_spacing = spacing or parse_czi_spacing(czi.meta)
@@ -166,8 +295,15 @@ def load_czi_channels(
             source,
             czyx.shape[0],
         )
-    red_data = _normalize_volume(czyx[0])
-    green_data = _normalize_volume(czyx[1])
+    green_index, red_index = infer_czi_channel_indices(czi.meta, int(czyx.shape[0]))
+    logger.info(
+        "CZI channel mapping for %s: green=C%d red=C%d",
+        source.name,
+        green_index,
+        red_index,
+    )
+    red_data = _normalize_volume(czyx[red_index])
+    green_data = _normalize_volume(czyx[green_index])
     depth = int(red_data.shape[0])
     z_indices = list(range(1, depth + 1))
     return (

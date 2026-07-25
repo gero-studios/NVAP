@@ -124,25 +124,39 @@ correctly rather than dropped (`_shifted_overlap_voxels`).
 Computed on the red channel; exported as `metrics_vascular.csv` (long format:
 `metric,value`).
 
-Method: threshold red → fill enclosed background pockets smaller than 64 voxels
-(removes lumen speckle) → label components → build a physical Euclidean distance
-field → skeletonise (Lee 3D) → measure radius, topology, tortuosity, and surface.
+Method: threshold red → clean tiny wall specks → build two masks:
+
+- `vascular_wall_mask`: the thresholded fluorescent vessel-wall signal. This is
+  used for wall/staining coverage and microglia-to-vessel-wall contact/distance.
+- `vascular_solid_mask`: a reconstructed anatomical vessel volume. NVAP repairs
+  wall gaps up to the calibrated 2.0 µm reconstruction tolerance, fills lumen
+  cross-sections slice-by-slice in all three
+  orientations, applies a separately capped 1.5 µm 3D close for oblique wall gaps,
+  reconciles enclosed 3D cavities, removes tiny solid components, skeletonises
+  the filled mask, prunes short terminal skeleton spurs, and then measures
+  radius, topology, tortuosity, decussation candidates, and surface.
 
 | Metric | Definition |
 |--------|-----------|
-| `vessel_volume_fraction` | Vessel voxels ÷ **retained** tissue voxels. Trimmed slices are excluded from both numerator and denominator. |
-| `total_length_um` | Sum of skeleton branch lengths (spacing-correct, via `skan`). |
+| `red_positive_voxel_count` / `red_positive_volume_um3` / `red_positive_volume_fraction` | Raw threshold-positive red voxels before wall-speck cleanup. This is the direct fluorescent-mask count. |
+| `wall_volume_fraction` | Threshold-positive fluorescent wall voxels ÷ **retained** tissue voxels. This is staining/wall coverage, not anatomical vessel volume. |
+| `vessel_volume_fraction` / `solid_vessel_volume_fraction` | Reconstructed solid vessel voxels ÷ **retained** tissue voxels. Trimmed slices are excluded from both numerator and denominator. |
+| `total_length_um` | Sum of reconstructed solid-mask centerline branch lengths (spacing-correct, via `skan`) after short terminal-spur pruning. |
 | `length_density_mm_per_mm3` | Centreline length per unit tissue volume (mm/mm³), over the retained tissue. |
-| `mean_radius_um` / `median_radius_um` / `max_radius_um` | Vessel radius sampled along the medial axis. The distance field is ridge-corrected (local maximum in a 1-voxel neighbourhood, so an off-ridge skeleton voxel still reads the true radius) and offset by half a voxel to correct the systematic EDT boundary underestimate. |
+| `mean_radius_um` / `median_radius_um` / `max_radius_um` | Vessel radius sampled along the medial axis. The distance field is ridge-corrected in a 1.5 µm physical neighbourhood, so fine-voxel anisotropic data do not under-read an off-ridge skeleton, and offset by half an XY voxel to correct the systematic EDT boundary underestimate. |
 | `mean_diameter_um` | `2 × mean_radius_um`. |
+| `radius_p{10,25,75,90}_um` / `diameter_p{10,90}_um` | Length-sampled distribution ranges, which expose thin and thick vessel populations instead of reducing the network to one mean. |
+| `volume_length_equivalent_radius_um` / `...diameter_um` | Independent aggregate cross-check from the reconstructed solid volume and centreline length: `sqrt(volume / (π × length))`. |
+| `radius_ridge_search_um` | Physical EDT-ridge search radius used for the exported radius observations. |
 | `junction_count` | Branch points: skeleton nodes of degree ≥ 3, clustered by connectivity so adjacent junction voxels count once. |
 | `junction_density_per_mm3` | Junctions per mm³ of retained tissue. |
 | `endpoint_count` | Skeleton nodes of degree 1 (free ends). |
 | `segment_count` / `mean_segment_length_um` | Number of skeleton segments and their mean length. |
 | `mean_tortuosity` | Mean of geodesic ÷ straight-line length per segment, clamped to `[1, 50)`. |
-| `surface_area_um2` | Sum of vessel↔background voxel-face areas. Faces on the volume boundary are excluded, so vessels clipped by the field of view are not counted as real surface. |
+| `surface_area_um2` / `solid_surface_area_um2` | Sum of reconstructed solid vessel↔background voxel-face areas. Faces on the volume boundary are excluded, so vessels clipped by the field of view are not counted as real surface. |
+| `wall_surface_area_um2` | Surface area of the fluorescent wall mask; this includes inner lumen-facing wall surfaces and is a staining-mask surface metric. |
 | `surface_to_volume_ratio_per_um` | `surface_area_um2 ÷ vessel_volume_um3`. |
-| `decussation_candidate_count` / `mean_decussation_z_separation_um` | Conservative crossing detector: `(y, x)` centreline columns containing two or more z-separated runs, and their mean z-separation. |
+| `decussation_candidate_count` / `mean_decussation_z_separation_um` | Conservative crossing detector on the reconstructed solid centerline. Adjacent qualifying `(y, x)` columns are clustered into one candidate event. |
 
 Topology uses `skan` when available; a dependency-free fallback keeps the
 density and radius metrics available otherwise.
@@ -196,10 +210,21 @@ spectral bleed-through) are excluded so the reported distance is to the nearest
 | `sholl_enclosing_radius_um` | Farthest process distance from the soma centroid. |
 | `soma_equivalent_diameter_um` | Diameter of a sphere with the soma's volume. |
 | `soma_roundness`, `soma_elongation` | From the soma's covariance eigenvalues (min/max axis ratio, and its inverse). |
-| `nearest_cell_to_vessel_um` | Min distance from any cell voxel to a vessel. |
+| `nearest_cell_to_vessel_um` | Min distance from any cell voxel to the cleaned vessel wall mask. Contact/overlap remains `0.0`. |
+| `cell_contacts_vessel`, `nearest_nonoverlapping_gap_um` | Whether the cell contacts the wall mask, and the nearest positive outside-mask gap when one exists. |
 | `soma_to_vessel_um`, `soma_centroid_to_vessel_um` | Soma-body and soma-centre distances to a vessel. |
 | `nearest_tip_to_vessel_um` | Min distance from a process tip to a vessel. |
 | `tip_near_vessel_component_count`, `tips_near_multiple_vessels` | Distinct vessel components within ~5 µm of the cell's tips, and whether that is ≥ 2. |
+| `cell_centroid_{z,y,x}_vox`, `cell_centroid_{x,y,z}_um` | Cell centroid as zero-based source-volume voxel coordinates and physical coordinates. |
+| `soma_centroid_{z,y,x}_vox`, `soma_centroid_{x,y,z}_um` | Soma centroid in both coordinate systems. |
+| `tip_coordinates_zyx_vox_json`, `tip_coordinates_xyz_um_json` | Ordered coordinates for every detected tip; each JSON list has `tip_count` entries. |
+| `tip_distances_to_vessel_um_json`, `tip_nearest_vessel_coordinates_*_json` | Per-tip distance and matching nearest vessel-wall coordinate, preserving the same tip order. |
+| `nearest_{cell,soma,tip}_point_*`, `..._aligned_point_*`, `..._vessel_point_*` | Explicit source point, offset-aligned point in the red frame, and nearest vessel-wall point for each headline minimum distance, in voxel and µm coordinates. |
+
+Voxel coordinates are `(z, y, x)` and physical coordinates are `(x, y, z)` in
+micrometres. Physical coordinates use the source-volume voxel spacing and an
+origin of `(0, 0, 0)`; the same convention is repeated in each exported row's
+`coordinate_reference` field.
 
 ### 4.4 Neurovascular association — `neurovascular.py`
 

@@ -42,7 +42,7 @@ def test_generated_sample_stack_analytics_match_expected(tmp_path: Path) -> None
 
     assert by_channel["red"].voxel_count == expected["red_voxel_count"]
     assert by_channel["red"].component_count == expected["red_component_count"]
-    assert by_channel["red"].largest_component_voxels == 1
+    assert by_channel["red"].largest_component_voxels == 3
     assert by_channel["red"].volume_um3 == pytest.approx(expected["red_volume_um3"])
 
     assert metrics.overlap_voxel_count == expected["overlap_voxel_count"]
@@ -90,9 +90,14 @@ def test_generated_sample_stack_analytics_match_expected(tmp_path: Path) -> None
         spacing=DEFAULT_SPACING,
         render=render,
     )
-    assert vascular.vessel_voxel_count == expected["red_voxel_count"]
-    assert vascular.component_count == expected["red_component_count"]
-    assert vascular.vessel_volume_um3 == pytest.approx(expected["red_volume_um3"])
-    assert vascular.vessel_volume_fraction == pytest.approx(
+    assert vascular.red_positive_voxel_count == expected["red_voxel_count"]
+    assert vascular.red_positive_volume_um3 == pytest.approx(expected["red_volume_um3"])
+    assert vascular.red_positive_volume_fraction == pytest.approx(
         expected["red_voxel_count"] / float(np.prod(dataset.red.data.shape))
     )
+    # The synthetic red channel contains two tiny wall markers. They
+    # remain valid raw red-positive counts, but are rejected from anatomical
+    # solid-vessel morphometry as specks.
+    assert vascular.vessel_voxel_count == 0
+    assert vascular.component_count == 0
+    assert vascular.vessel_volume_um3 == pytest.approx(0.0)

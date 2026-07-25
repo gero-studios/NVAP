@@ -27,9 +27,11 @@ def build_sample_volumes() -> tuple[np.ndarray, np.ndarray]:
     green[8, 27, 32:48] = 1.0
     green[8, 27, 7:23] = 1.0
 
-    # Two one-voxel vessel markers, each one x-voxel from a process tip.
-    red[8, 27, 6] = 1.0
-    red[8, 27, 48] = 1.0
+    # Two tiny vessel-wall markers, each one x-voxel from a process tip. They
+    # span three z-slices so the cleaned wall-mask path keeps them as signal
+    # rather than treating them as isolated one-voxel red specks.
+    red[7:10, 27, 6] = 1.0
+    red[7:10, 27, 48] = 1.0
     return green, red
 
 

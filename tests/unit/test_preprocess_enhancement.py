@@ -58,6 +58,17 @@ def test_wipe_vasculature_blobs_clears_compact_dim_halo() -> None:
     assert not np.any(out[1, 8:15, 8:15])
 
 
+def test_wipe_vasculature_blobs_keeps_elongated_fragments_by_default() -> None:
+    vol = np.zeros((3, 120, 120), dtype=np.float32)
+    vol[1, 10:16, 10:16] = 0.85
+    vol[1, 60, 10:106] = 0.85
+
+    out = wipe_vasculature_blobs(vol, threshold=0.6, max_voxels=128)
+
+    assert float(out[1, 10:16, 10:16].max()) == 0.0
+    assert np.array_equal(out[1, 60, 10:106], vol[1, 60, 10:106])
+
+
 def test_vasculature_enhancement_reduces_uniform_background_and_keeps_vessel() -> None:
     arr = np.full((3, 64, 64), 0.20, dtype=np.float32)
     arr[:, 32, 8:56] = 0.90
