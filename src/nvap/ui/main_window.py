@@ -47,6 +47,7 @@ from nvap.analysis.microglia_analysis import (
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
 from nvap.analysis.vascular_analysis import (
     analyze_vasculature,
+    build_vascular_masks,
     vascular_analysis_to_csv_rows,
 )
 from nvap.analysis.neurovascular import (
@@ -212,10 +213,16 @@ def _compute_vascular_summary_line(
         )
     except Exception:  # pragma: no cover - defensive background path
         return None
+    diameter_label = (
+        f"mean_diameter_um={vascular.mean_diameter_um:.2f}"
+        if bool(getattr(vascular, "anatomical_radius_reliable", True))
+        and np.isfinite(float(vascular.mean_diameter_um))
+        else "mean_diameter_um=withheld"
+    )
     return (
         f"vasculature: vol_fraction={vascular.vessel_volume_fraction:.4f}, "
         f"length_density={vascular.length_density_mm_per_mm3:.2f} mm/mm3, "
-        f"mean_diameter_um={vascular.mean_diameter_um:.2f}, "
+        f"{diameter_label}, "
         f"junctions={vascular.junction_count}, "
         f"tortuosity={vascular.mean_tortuosity:.3f}"
     )
@@ -4350,6 +4357,19 @@ class MainWindow(QMainWindow):
                 vpath = base.with_name(f"{stem}_vascular.csv")
                 export_metrics_csv(vascular_analysis_to_csv_rows(vascular), vpath)
                 written.append(vpath)
+                masks = build_vascular_masks(
+                    dataset.red.data,
+                    threshold=float(self.current_render.threshold_red),
+                    spacing=dataset.red.spacing,
+                    render=self.current_render,
+                )
+                mpath = base.with_name(f"{stem}_vascular_masks.npz")
+                np.savez_compressed(
+                    mpath,
+                    vascular_wall_mask=masks.wall_mask.astype(np.uint8),
+                    vascular_solid_mask=masks.solid_mask.astype(np.uint8),
+                )
+                written.append(mpath)
             except Exception as exc:  # pragma: no cover - defensive UI path
                 self._log_info(f"Vascular metrics export skipped: {exc}")
 

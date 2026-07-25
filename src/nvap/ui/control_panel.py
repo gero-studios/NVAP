@@ -667,11 +667,11 @@ class ControlPanel(QWidget):
         action_panel_layout.addWidget(auto_edit_header)
 
         self.auto_wipe_on_threshold_edit = QCheckBox("Wipe specks when threshold changes")
-        self.auto_wipe_on_threshold_edit.setChecked(False)
+        self.auto_wipe_on_threshold_edit.setChecked(True)
         self.auto_wipe_on_threshold_edit.setToolTip(
             "Automatically re-run the speck wipe (using the size above) on both\n"
-            "channels whenever you change the green or red threshold. Off by\n"
-            "default since it re-wipes on every threshold edit, not just on load."
+            "channels whenever you change the green or red threshold. Turn it off\n"
+            "for large stacks if you prefer manual cleanup."
         )
         action_panel_layout.addWidget(self.auto_wipe_on_threshold_edit)
 

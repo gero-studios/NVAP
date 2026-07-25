@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import inspect
+import json
 import logging
 
 import numpy as np
@@ -9,6 +10,7 @@ import scipy.ndimage as ndi
 from scipy.spatial import cKDTree
 from skimage.morphology import remove_small_holes, skeletonize
 
+from nvap.analysis.vascular_analysis import build_vascular_masks
 from nvap.config.types import RenderConfig, VoxelSpacing
 
 logger = logging.getLogger(__name__)
@@ -113,12 +115,45 @@ class MicrogliaCellAnalysis:
     nearest_cell_to_vessel_um: float | None
     soma_to_vessel_um: float | None
     soma_centroid_to_vessel_um: float | None = None
+    cell_contacts_vessel: bool = False
+    nearest_nonoverlapping_gap_um: float | None = None
     soma_equivalent_diameter_um: float = 0.0
     soma_roundness: float = 0.0
     soma_elongation: float = 0.0
     mean_branch_tortuosity: float = 0.0
     tip_near_vessel_component_count: int = 0
     tips_near_multiple_vessels: bool = False
+    cell_centroid_zyx_vox: tuple[float, float, float] | None = None
+    cell_centroid_xyz_um: tuple[float, float, float] | None = None
+    soma_centroid_zyx_vox: tuple[float, float, float] | None = None
+    soma_centroid_xyz_um: tuple[float, float, float] | None = None
+    tip_coordinates_zyx_vox: tuple[tuple[int, int, int], ...] = ()
+    tip_coordinates_xyz_um: tuple[tuple[float, float, float], ...] = ()
+    tip_distances_to_vessel_um: tuple[float | None, ...] = ()
+    tip_nearest_vessel_coordinates_zyx_vox: tuple[
+        tuple[int, int, int] | None, ...
+    ] = ()
+    tip_nearest_vessel_coordinates_xyz_um: tuple[
+        tuple[float, float, float] | None, ...
+    ] = ()
+    nearest_cell_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_cell_point_xyz_um: tuple[float, float, float] | None = None
+    nearest_cell_aligned_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_cell_aligned_point_xyz_um: tuple[float, float, float] | None = None
+    nearest_cell_vessel_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_cell_vessel_point_xyz_um: tuple[float, float, float] | None = None
+    nearest_soma_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_soma_point_xyz_um: tuple[float, float, float] | None = None
+    nearest_soma_aligned_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_soma_aligned_point_xyz_um: tuple[float, float, float] | None = None
+    nearest_soma_vessel_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_soma_vessel_point_xyz_um: tuple[float, float, float] | None = None
+    nearest_tip_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_tip_point_xyz_um: tuple[float, float, float] | None = None
+    nearest_tip_aligned_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_tip_aligned_point_xyz_um: tuple[float, float, float] | None = None
+    nearest_tip_vessel_point_zyx_vox: tuple[int, int, int] | None = None
+    nearest_tip_vessel_point_xyz_um: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -217,11 +252,13 @@ def analyze_microglia_cells(
         int(render.trim_first_slices),
         int(render.trim_last_slices),
     )
-    vessel_mask = _apply_render_trim(
-        red >= float(render.threshold_red),
-        int(render.trim_first_slices),
-        int(render.trim_last_slices),
-    )
+    vessel_mask = build_vascular_masks(
+        red,
+        threshold=float(render.threshold_red),
+        spacing=spacing,
+        render=render,
+        reconstruct_solid=False,
+    ).wall_mask
 
     vessel_dist = _distance_to_vessel(vessel_mask, spacing_zyx)
     dz, dy, dx = _offset_shift_zyx(render, spacing_zyx)
@@ -229,8 +266,14 @@ def analyze_microglia_cells(
     vessel_voxels = int(np.count_nonzero(vessel_mask))
     vessel_occupancy = float(vessel_voxels) / float(max(1, vessel_mask.size))
     vessel_labels: np.ndarray | None = None
+    vessel_coords_zyx = np.empty((0, 3), dtype=np.int32)
+    vessel_tree: cKDTree | None = None
     if vessel_voxels > 0:
         vessel_labels, _ = ndi.label(vessel_mask, structure=_FULL_STRUCTURE)
+        vessel_coords_zyx = np.argwhere(vessel_mask).astype(np.int32, copy=False)
+        vessel_tree = cKDTree(
+            vessel_coords_zyx.astype(np.float64) * spacing_zyx.reshape(1, 3)
+        )
     if vessel_dist is None:
         logger.info(
             "Microglia vessel distance: no vasculature above threshold_red=%.4f "
@@ -286,31 +329,84 @@ def analyze_microglia_cells(
         tip_coords = shape_debug.tip_coords  # bbox-local frame
 
         comp_coords = np.argwhere(local_mask).astype(np.int64) + bbox_start
-        nearest_cell_to_vessel = _min_distance_at_coords(
-            vessel_dist, comp_coords, shift, full_shape
+        nearest_cell_to_vessel, nearest_cell_coord, nearest_cell_aligned = (
+            _nearest_distance_observation(
+                vessel_dist, comp_coords, shift, full_shape
+            )
+        )
+        nearest_cell_vessel_coord = _nearest_vessel_coordinate(
+            nearest_cell_aligned,
+            vessel_tree,
+            vessel_coords_zyx,
+            spacing_zyx,
+        )
+        nearest_nonoverlapping_gap = _min_positive_distance_at_coords(
+            vessel_dist,
+            comp_coords,
+            shift,
+            full_shape,
+        )
+        cell_contacts_vessel = (
+            nearest_cell_to_vessel is not None and float(nearest_cell_to_vessel) <= 1.0e-6
         )
 
         if np.any(soma_mask):
             soma_coords = np.argwhere(soma_mask).astype(np.int64) + bbox_start
-            soma_to_vessel = _min_distance_at_coords(vessel_dist, soma_coords, shift, full_shape)
+            soma_to_vessel, nearest_soma_coord, nearest_soma_aligned = (
+                _nearest_distance_observation(
+                    vessel_dist, soma_coords, shift, full_shape
+                )
+            )
+            nearest_soma_vessel_coord = _nearest_vessel_coordinate(
+                nearest_soma_aligned,
+                vessel_tree,
+                vessel_coords_zyx,
+                spacing_zyx,
+            )
             soma_centroid = _mask_centroid(soma_mask)
             if soma_centroid is not None:
+                soma_centroid_global = soma_centroid + bbox_start
                 soma_centroid_to_vessel = _distance_at_coord(
                     vessel_dist,
-                    np.rint(soma_centroid).astype(np.int64) + bbox_start,
+                    np.rint(soma_centroid_global).astype(np.int64),
                     shift,
                     full_shape,
                 )
             else:
+                soma_centroid_global = None
                 soma_centroid_to_vessel = None
         else:
+            soma_coords = np.empty((0, 3), dtype=np.int64)
+            soma_centroid_global = None
             soma_to_vessel = None
             soma_centroid_to_vessel = None
+            nearest_soma_coord = None
+            nearest_soma_aligned = None
+            nearest_soma_vessel_coord = None
 
         if tip_coords.size > 0:
             tip_coords_global = tip_coords.astype(np.int64) + bbox_start
-            nearest_tip_to_vessel = _min_distance_at_coords(
+            nearest_tip_to_vessel, nearest_tip_coord, nearest_tip_aligned = (
+                _nearest_distance_observation(
                 vessel_dist, tip_coords_global, shift, full_shape
+                )
+            )
+            nearest_tip_vessel_coord = _nearest_vessel_coordinate(
+                nearest_tip_aligned,
+                vessel_tree,
+                vessel_coords_zyx,
+                spacing_zyx,
+            )
+            tip_distances = _all_distances_at_coords(
+                vessel_dist, tip_coords_global, shift, full_shape
+            )
+            tip_vessel_coords = _all_nearest_vessel_coordinates(
+                tip_coords_global,
+                shift,
+                full_shape,
+                vessel_tree,
+                vessel_coords_zyx,
+                spacing_zyx,
             )
             tip_near_vessel_component_count = _nearby_vessel_component_count(
                 vessel_labels,
@@ -320,12 +416,19 @@ def analyze_microglia_cells(
                 full_shape,
             )
         else:
+            tip_coords_global = np.empty((0, 3), dtype=np.int64)
             nearest_tip_to_vessel = None
+            nearest_tip_coord = None
+            nearest_tip_aligned = None
+            nearest_tip_vessel_coord = None
+            tip_distances = ()
+            tip_vessel_coords = ()
             tip_near_vessel_component_count = 0
 
         voxel_count = int(np.count_nonzero(local_mask))
         soma_voxel_count = int(np.count_nonzero(soma_mask))
         tip_count = int(tip_coords.shape[0])
+        cell_centroid = np.mean(comp_coords, axis=0) if comp_coords.size > 0 else None
         cells.append(
             MicrogliaCellAnalysis(
                 component_id=int(component_id),
@@ -345,12 +448,81 @@ def analyze_microglia_cells(
                 nearest_cell_to_vessel_um=nearest_cell_to_vessel,
                 soma_to_vessel_um=soma_to_vessel,
                 soma_centroid_to_vessel_um=soma_centroid_to_vessel,
+                cell_contacts_vessel=bool(cell_contacts_vessel),
+                nearest_nonoverlapping_gap_um=nearest_nonoverlapping_gap,
                 soma_equivalent_diameter_um=float(shape_debug.soma_equivalent_diameter_um),
                 soma_roundness=float(shape_debug.soma_roundness),
                 soma_elongation=float(shape_debug.soma_elongation),
                 mean_branch_tortuosity=float(shape_debug.mean_branch_tortuosity),
                 tip_near_vessel_component_count=int(tip_near_vessel_component_count),
                 tips_near_multiple_vessels=bool(tip_near_vessel_component_count >= 2),
+                cell_centroid_zyx_vox=_coord_tuple_float(cell_centroid),
+                cell_centroid_xyz_um=_coord_zyx_to_xyz_um(cell_centroid, spacing_zyx),
+                soma_centroid_zyx_vox=_coord_tuple_float(soma_centroid_global),
+                soma_centroid_xyz_um=_coord_zyx_to_xyz_um(
+                    soma_centroid_global, spacing_zyx
+                ),
+                tip_coordinates_zyx_vox=tuple(
+                    _coord_tuple_int(coord) for coord in tip_coords_global
+                ),
+                tip_coordinates_xyz_um=tuple(
+                    _coord_zyx_to_xyz_um(coord, spacing_zyx)
+                    for coord in tip_coords_global
+                ),
+                tip_distances_to_vessel_um=tip_distances,
+                tip_nearest_vessel_coordinates_zyx_vox=tip_vessel_coords,
+                tip_nearest_vessel_coordinates_xyz_um=tuple(
+                    _coord_zyx_to_xyz_um(coord, spacing_zyx)
+                    for coord in tip_vessel_coords
+                ),
+                nearest_cell_point_zyx_vox=_coord_tuple_int(nearest_cell_coord),
+                nearest_cell_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_cell_coord, spacing_zyx
+                ),
+                nearest_cell_aligned_point_zyx_vox=_coord_tuple_int(
+                    nearest_cell_aligned
+                ),
+                nearest_cell_aligned_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_cell_aligned, spacing_zyx
+                ),
+                nearest_cell_vessel_point_zyx_vox=_coord_tuple_int(
+                    nearest_cell_vessel_coord
+                ),
+                nearest_cell_vessel_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_cell_vessel_coord, spacing_zyx
+                ),
+                nearest_soma_point_zyx_vox=_coord_tuple_int(nearest_soma_coord),
+                nearest_soma_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_soma_coord, spacing_zyx
+                ),
+                nearest_soma_aligned_point_zyx_vox=_coord_tuple_int(
+                    nearest_soma_aligned
+                ),
+                nearest_soma_aligned_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_soma_aligned, spacing_zyx
+                ),
+                nearest_soma_vessel_point_zyx_vox=_coord_tuple_int(
+                    nearest_soma_vessel_coord
+                ),
+                nearest_soma_vessel_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_soma_vessel_coord, spacing_zyx
+                ),
+                nearest_tip_point_zyx_vox=_coord_tuple_int(nearest_tip_coord),
+                nearest_tip_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_tip_coord, spacing_zyx
+                ),
+                nearest_tip_aligned_point_zyx_vox=_coord_tuple_int(
+                    nearest_tip_aligned
+                ),
+                nearest_tip_aligned_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_tip_aligned, spacing_zyx
+                ),
+                nearest_tip_vessel_point_zyx_vox=_coord_tuple_int(
+                    nearest_tip_vessel_coord
+                ),
+                nearest_tip_vessel_point_xyz_um=_coord_zyx_to_xyz_um(
+                    nearest_tip_vessel_coord, spacing_zyx
+                ),
             )
         )
 
@@ -419,34 +591,139 @@ def microglia_analysis_to_csv_rows(
 ) -> list[dict[str, int | float | str | None]]:
     rows: list[dict[str, int | float | str | None]] = []
     for cell in analysis.cells:
-        rows.append(
+        row: dict[str, int | float | str | None] = {
+            "component_id": int(cell.component_id),
+            "voxel_count": int(cell.voxel_count),
+            "volume_um3": float(cell.volume_um3),
+            "soma_voxel_count": int(cell.soma_voxel_count),
+            "soma_volume_um3": float(cell.soma_volume_um3),
+            "branch_count": int(cell.branch_count),
+            "tip_count": int(cell.tip_count),
+            "branch_point_count": int(cell.branch_point_count),
+            "total_process_length_um": float(cell.total_process_length_um),
+            "mean_branch_length_um": float(cell.mean_branch_length_um),
+            "sholl_max_intersections": int(cell.sholl_max_intersections),
+            "sholl_critical_radius_um": float(cell.sholl_critical_radius_um),
+            "sholl_enclosing_radius_um": float(cell.sholl_enclosing_radius_um),
+            "nearest_tip_to_vessel_um": cell.nearest_tip_to_vessel_um,
+            "nearest_cell_to_vessel_um": cell.nearest_cell_to_vessel_um,
+            "soma_to_vessel_um": cell.soma_to_vessel_um,
+            "soma_centroid_to_vessel_um": cell.soma_centroid_to_vessel_um,
+            "cell_contacts_vessel": int(bool(cell.cell_contacts_vessel)),
+            "nearest_nonoverlapping_gap_um": cell.nearest_nonoverlapping_gap_um,
+            "soma_equivalent_diameter_um": float(cell.soma_equivalent_diameter_um),
+            "soma_roundness": float(cell.soma_roundness),
+            "soma_elongation": float(cell.soma_elongation),
+            "mean_branch_tortuosity": float(cell.mean_branch_tortuosity),
+            "tip_near_vessel_component_count": int(cell.tip_near_vessel_component_count),
+            "tips_near_multiple_vessels": int(bool(cell.tips_near_multiple_vessels)),
+            "coordinate_reference": (
+                "zero-based voxel centers in source volume; physical xyz_um uses "
+                "x/y/z voxel spacing and an origin of (0,0,0)"
+            ),
+            "tip_coordinates_zyx_vox_json": json.dumps(
+                cell.tip_coordinates_zyx_vox, separators=(",", ":")
+            ),
+            "tip_coordinates_xyz_um_json": json.dumps(
+                cell.tip_coordinates_xyz_um, separators=(",", ":")
+            ),
+            "tip_distances_to_vessel_um_json": json.dumps(
+                cell.tip_distances_to_vessel_um, separators=(",", ":")
+            ),
+            "tip_nearest_vessel_coordinates_zyx_vox_json": json.dumps(
+                cell.tip_nearest_vessel_coordinates_zyx_vox, separators=(",", ":")
+            ),
+            "tip_nearest_vessel_coordinates_xyz_um_json": json.dumps(
+                cell.tip_nearest_vessel_coordinates_xyz_um, separators=(",", ":")
+            ),
+        }
+        row.update(
+            _coordinate_csv_columns(
+                "cell_centroid",
+                cell.cell_centroid_zyx_vox,
+                cell.cell_centroid_xyz_um,
+            )
+        )
+        row.update(
+            _coordinate_csv_columns(
+                "soma_centroid",
+                cell.soma_centroid_zyx_vox,
+                cell.soma_centroid_xyz_um,
+            )
+        )
+        for prefix, coord_zyx, coord_xyz in (
+            ("nearest_cell_point", cell.nearest_cell_point_zyx_vox, cell.nearest_cell_point_xyz_um),
+            (
+                "nearest_cell_aligned_point",
+                cell.nearest_cell_aligned_point_zyx_vox,
+                cell.nearest_cell_aligned_point_xyz_um,
+            ),
+            (
+                "nearest_cell_vessel_point",
+                cell.nearest_cell_vessel_point_zyx_vox,
+                cell.nearest_cell_vessel_point_xyz_um,
+            ),
+            ("nearest_soma_point", cell.nearest_soma_point_zyx_vox, cell.nearest_soma_point_xyz_um),
+            (
+                "nearest_soma_aligned_point",
+                cell.nearest_soma_aligned_point_zyx_vox,
+                cell.nearest_soma_aligned_point_xyz_um,
+            ),
+            (
+                "nearest_soma_vessel_point",
+                cell.nearest_soma_vessel_point_zyx_vox,
+                cell.nearest_soma_vessel_point_xyz_um,
+            ),
+            ("nearest_tip_point", cell.nearest_tip_point_zyx_vox, cell.nearest_tip_point_xyz_um),
+            (
+                "nearest_tip_aligned_point",
+                cell.nearest_tip_aligned_point_zyx_vox,
+                cell.nearest_tip_aligned_point_xyz_um,
+            ),
+            (
+                "nearest_tip_vessel_point",
+                cell.nearest_tip_vessel_point_zyx_vox,
+                cell.nearest_tip_vessel_point_xyz_um,
+            ),
+        ):
+            row.update(_coordinate_csv_columns(prefix, coord_zyx, coord_xyz))
+        rows.append(row)
+    return rows
+
+
+def _coordinate_csv_columns(
+    prefix: str,
+    coord_zyx_vox: tuple[int | float, int | float, int | float] | None,
+    coord_xyz_um: tuple[float, float, float] | None,
+) -> dict[str, int | float | None]:
+    """Flatten coordinates into explicit, axis-labelled CSV columns."""
+    values: dict[str, int | float | None] = {
+        f"{prefix}_z_vox": None,
+        f"{prefix}_y_vox": None,
+        f"{prefix}_x_vox": None,
+        f"{prefix}_x_um": None,
+        f"{prefix}_y_um": None,
+        f"{prefix}_z_um": None,
+    }
+    if coord_zyx_vox is not None:
+        z_vox, y_vox, x_vox = coord_zyx_vox
+        values.update(
             {
-                "component_id": int(cell.component_id),
-                "voxel_count": int(cell.voxel_count),
-                "volume_um3": float(cell.volume_um3),
-                "soma_voxel_count": int(cell.soma_voxel_count),
-                "soma_volume_um3": float(cell.soma_volume_um3),
-                "branch_count": int(cell.branch_count),
-                "tip_count": int(cell.tip_count),
-                "branch_point_count": int(cell.branch_point_count),
-                "total_process_length_um": float(cell.total_process_length_um),
-                "mean_branch_length_um": float(cell.mean_branch_length_um),
-                "sholl_max_intersections": int(cell.sholl_max_intersections),
-                "sholl_critical_radius_um": float(cell.sholl_critical_radius_um),
-                "sholl_enclosing_radius_um": float(cell.sholl_enclosing_radius_um),
-                "nearest_tip_to_vessel_um": cell.nearest_tip_to_vessel_um,
-                "nearest_cell_to_vessel_um": cell.nearest_cell_to_vessel_um,
-                "soma_to_vessel_um": cell.soma_to_vessel_um,
-                "soma_centroid_to_vessel_um": cell.soma_centroid_to_vessel_um,
-                "soma_equivalent_diameter_um": float(cell.soma_equivalent_diameter_um),
-                "soma_roundness": float(cell.soma_roundness),
-                "soma_elongation": float(cell.soma_elongation),
-                "mean_branch_tortuosity": float(cell.mean_branch_tortuosity),
-                "tip_near_vessel_component_count": int(cell.tip_near_vessel_component_count),
-                "tips_near_multiple_vessels": int(bool(cell.tips_near_multiple_vessels)),
+                f"{prefix}_z_vox": z_vox,
+                f"{prefix}_y_vox": y_vox,
+                f"{prefix}_x_vox": x_vox,
             }
         )
-    return rows
+    if coord_xyz_um is not None:
+        x_um, y_um, z_um = coord_xyz_um
+        values.update(
+            {
+                f"{prefix}_x_um": float(x_um),
+                f"{prefix}_y_um": float(y_um),
+                f"{prefix}_z_um": float(z_um),
+            }
+        )
+    return values
 
 
 def build_microglia_cell_debug(
@@ -480,11 +757,13 @@ def build_microglia_cell_debug(
         int(render.trim_first_slices),
         int(render.trim_last_slices),
     )
-    vessel_mask = _apply_render_trim(
-        red >= float(render.threshold_red),
-        int(render.trim_first_slices),
-        int(render.trim_last_slices),
-    )
+    vessel_mask = build_vascular_masks(
+        red,
+        threshold=float(render.threshold_red),
+        spacing=spacing,
+        render=render,
+        reconstruct_solid=False,
+    ).wall_mask
     component_mask = np.asarray(
         trimmed_labels == component,
         dtype=bool,
@@ -1569,6 +1848,40 @@ def _coords_in_bounds(coords: np.ndarray, shape: tuple[int, int, int]) -> np.nda
     return np.all((pts >= 0) & (pts < bounds), axis=1)
 
 
+def _coord_tuple_int(coord_zyx: object) -> tuple[int, int, int] | None:
+    if coord_zyx is None:
+        return None
+    coord = np.asarray(coord_zyx)
+    if coord.size != 3:
+        return None
+    values = coord.reshape(3)
+    if not np.all(np.isfinite(values.astype(np.float64))):
+        return None
+    return tuple(int(v) for v in values.tolist())
+
+
+def _coord_tuple_float(coord_zyx: object) -> tuple[float, float, float] | None:
+    if coord_zyx is None:
+        return None
+    coord = np.asarray(coord_zyx, dtype=np.float64)
+    if coord.size != 3 or not np.all(np.isfinite(coord)):
+        return None
+    return tuple(float(v) for v in coord.reshape(3).tolist())
+
+
+def _coord_zyx_to_xyz_um(
+    coord_zyx: object,
+    spacing_zyx: np.ndarray,
+) -> tuple[float, float, float] | None:
+    coord = _coord_tuple_float(coord_zyx)
+    if coord is None:
+        return None
+    physical_zyx = np.asarray(coord, dtype=np.float64) * np.asarray(
+        spacing_zyx, dtype=np.float64
+    )
+    return tuple(float(v) for v in physical_zyx[::-1].tolist())
+
+
 def _mask_centroid(mask: np.ndarray) -> np.ndarray | None:
     binary = np.asarray(mask, dtype=bool)
     if not np.any(binary):
@@ -1730,6 +2043,100 @@ def _distance_to_vessel(vessel_mask: np.ndarray, spacing_zyx: np.ndarray) -> np.
     return np.asarray(dt, dtype=np.float32)
 
 
+def _nearest_distance_observation(
+    vessel_distance: np.ndarray | None,
+    coords_zyx: np.ndarray,
+    shift_zyx: np.ndarray,
+    shape: tuple[int, int, int],
+) -> tuple[float | None, np.ndarray | None, np.ndarray | None]:
+    """Return distance plus source and aligned coordinates for the minimum."""
+    if vessel_distance is None:
+        return None, None, None
+    coords = np.asarray(coords_zyx, dtype=np.int64).reshape(-1, 3)
+    if coords.shape[0] == 0:
+        return None, None, None
+    shifted = coords + np.asarray(shift_zyx, dtype=np.int64).reshape(1, 3)
+    in_bounds = _coords_in_bounds(shifted, shape)
+    if not np.any(in_bounds):
+        return None, None, None
+    valid_indices = np.flatnonzero(in_bounds)
+    aligned = shifted[in_bounds]
+    distances = np.asarray(
+        vessel_distance[aligned[:, 0], aligned[:, 1], aligned[:, 2]],
+        dtype=np.float64,
+    )
+    best_valid = int(np.argmin(distances))
+    best_source = int(valid_indices[best_valid])
+    return (
+        float(distances[best_valid]),
+        np.asarray(coords[best_source], dtype=np.int64),
+        np.asarray(aligned[best_valid], dtype=np.int64),
+    )
+
+
+def _all_distances_at_coords(
+    vessel_distance: np.ndarray | None,
+    coords_zyx: np.ndarray,
+    shift_zyx: np.ndarray,
+    shape: tuple[int, int, int],
+) -> tuple[float | None, ...]:
+    coords = np.asarray(coords_zyx, dtype=np.int64).reshape(-1, 3)
+    output: list[float | None] = [None] * int(coords.shape[0])
+    if vessel_distance is None or coords.shape[0] == 0:
+        return tuple(output)
+    shifted = coords + np.asarray(shift_zyx, dtype=np.int64).reshape(1, 3)
+    in_bounds = _coords_in_bounds(shifted, shape)
+    valid_indices = np.flatnonzero(in_bounds)
+    if valid_indices.size > 0:
+        valid = shifted[in_bounds]
+        values = vessel_distance[valid[:, 0], valid[:, 1], valid[:, 2]]
+        for source_idx, value in zip(valid_indices.tolist(), values.tolist(), strict=True):
+            output[int(source_idx)] = float(value)
+    return tuple(output)
+
+
+def _nearest_vessel_coordinate(
+    aligned_coord_zyx: object,
+    vessel_tree: cKDTree | None,
+    vessel_coords_zyx: np.ndarray,
+    spacing_zyx: np.ndarray,
+) -> np.ndarray | None:
+    coord = _coord_tuple_float(aligned_coord_zyx)
+    if coord is None or vessel_tree is None or vessel_coords_zyx.shape[0] == 0:
+        return None
+    query_um = np.asarray(coord, dtype=np.float64) * spacing_zyx
+    _distance, index = vessel_tree.query(query_um, k=1)
+    return np.asarray(vessel_coords_zyx[int(index)], dtype=np.int64)
+
+
+def _all_nearest_vessel_coordinates(
+    coords_zyx: np.ndarray,
+    shift_zyx: np.ndarray,
+    shape: tuple[int, int, int],
+    vessel_tree: cKDTree | None,
+    vessel_coords_zyx: np.ndarray,
+    spacing_zyx: np.ndarray,
+) -> tuple[tuple[int, int, int] | None, ...]:
+    coords = np.asarray(coords_zyx, dtype=np.int64).reshape(-1, 3)
+    output: list[tuple[int, int, int] | None] = [None] * int(coords.shape[0])
+    if vessel_tree is None or vessel_coords_zyx.shape[0] == 0 or coords.shape[0] == 0:
+        return tuple(output)
+    shifted = coords + np.asarray(shift_zyx, dtype=np.int64).reshape(1, 3)
+    in_bounds = _coords_in_bounds(shifted, shape)
+    valid_indices = np.flatnonzero(in_bounds)
+    if valid_indices.size == 0:
+        return tuple(output)
+    query_um = shifted[in_bounds].astype(np.float64) * spacing_zyx.reshape(1, 3)
+    _distances, nearest_indices = vessel_tree.query(query_um, k=1)
+    for source_idx, vessel_idx in zip(
+        valid_indices.tolist(),
+        np.asarray(nearest_indices, dtype=np.int64).tolist(),
+        strict=True,
+    ):
+        output[int(source_idx)] = _coord_tuple_int(vessel_coords_zyx[int(vessel_idx)])
+    return tuple(output)
+
+
 def _min_distance_at_coords(
     vessel_distance: np.ndarray | None,
     coords_zyx: np.ndarray,
@@ -1742,6 +2149,32 @@ def _min_distance_at_coords(
     voxels, but works directly on a coordinate list so no full-volume mask has to
     be allocated per component.
     """
+    dist_vals = _distance_values_at_coords(vessel_distance, coords_zyx, shift_zyx, shape)
+    if dist_vals is None or dist_vals.size == 0:
+        return None
+    return float(np.min(dist_vals))
+
+
+def _min_positive_distance_at_coords(
+    vessel_distance: np.ndarray | None,
+    coords_zyx: np.ndarray,
+    shift_zyx: np.ndarray,
+    shape: tuple[int, int, int],
+) -> float | None:
+    """Nearest non-overlapping gap from coords to vessel, excluding contacts."""
+    dist_vals = _distance_values_at_coords(vessel_distance, coords_zyx, shift_zyx, shape)
+    if dist_vals is None or dist_vals.size == 0:
+        return None
+    outside = dist_vals[dist_vals > 0.0]
+    return float(np.min(outside)) if outside.size > 0 else None
+
+
+def _distance_values_at_coords(
+    vessel_distance: np.ndarray | None,
+    coords_zyx: np.ndarray,
+    shift_zyx: np.ndarray,
+    shape: tuple[int, int, int],
+) -> np.ndarray | None:
     if vessel_distance is None:
         return None
     coords = np.asarray(coords_zyx, dtype=np.int64)
@@ -1753,14 +2186,7 @@ def _min_distance_at_coords(
     if not np.any(in_bounds):
         return None
     s = shifted[in_bounds]
-    dist_vals = vessel_distance[s[:, 0], s[:, 1], s[:, 2]]
-    # Exclude voxels that sit inside the vessel (EDT = 0) — those positions are
-    # at-or-inside the vessel surface and would collapse the minimum to 0 whenever
-    # there is any voxel-level overlap between channels (e.g. spectral bleedthrough).
-    # The biologically meaningful distance is from the nearest non-overlapping cell
-    # voxel to the vessel; only return 0 when the cell is entirely within the mask.
-    outside = dist_vals[dist_vals > 0.0]
-    return float(np.min(outside)) if outside.size > 0 else 0.0
+    return np.asarray(vessel_distance[s[:, 0], s[:, 1], s[:, 2]], dtype=np.float32)
 
 
 def _distance_at_coord(

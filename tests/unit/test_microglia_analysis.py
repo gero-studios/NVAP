@@ -7,7 +7,10 @@ import scipy.ndimage as ndi
 
 from nvap.analysis.microglia_analysis import (
     _HAS_GEODESIC_TIPS,
+    _distance_to_vessel,
     _gate_and_cluster_tips,
+    _min_distance_at_coords,
+    _min_positive_distance_at_coords,
     _nearest_segment_between_masks,
     _spacing_zyx,
     _voxel_tip_coords_geodesic,
@@ -48,6 +51,29 @@ def test_gate_and_cluster_tips_merges_fans_and_drops_body_endpoints() -> None:
 
     assert out.shape[0] == 2
     assert not any(int(r[1]) == 15 and int(r[2]) == 15 for r in out.tolist())
+
+
+def test_vessel_contact_distance_stays_zero_and_gap_is_separate() -> None:
+    vessel = np.zeros((1, 5, 5), dtype=bool)
+    vessel[0, 2, 2] = True
+    dist = _distance_to_vessel(vessel, _spacing_zyx((1.0, 1.0, 0.198467)))
+    coords = np.asarray([[0, 2, 2], [0, 2, 3]], dtype=np.int64)
+
+    contact = _min_distance_at_coords(
+        dist,
+        coords,
+        np.zeros((1, 3), dtype=np.int64),
+        vessel.shape,
+    )
+    gap = _min_positive_distance_at_coords(
+        dist,
+        coords,
+        np.zeros((1, 3), dtype=np.int64),
+        vessel.shape,
+    )
+
+    assert contact == pytest.approx(0.0)
+    assert gap == pytest.approx(0.198467)
 
 
 def test_gate_and_cluster_tips_drops_endpoints_below_visibility_floor() -> None:
@@ -456,6 +482,14 @@ def test_microglia_analysis_csv_rows_follow_cell_metrics() -> None:
     assert "soma_roundness" in rows[0]
     assert "mean_branch_tortuosity" in rows[0]
     assert "tip_near_vessel_component_count" in rows[0]
+    assert rows[0]["coordinate_reference"]
+    assert rows[0]["cell_centroid_z_vox"] == pytest.approx(1.0)
+    assert rows[0]["cell_centroid_y_vox"] == pytest.approx(3.0)
+    assert rows[0]["cell_centroid_x_vox"] == pytest.approx(3.0)
+    assert rows[0]["cell_centroid_x_um"] == pytest.approx(3.0)
+    assert "tip_coordinates_zyx_vox_json" in rows[0]
+    assert "tip_distances_to_vessel_um_json" in rows[0]
+    assert "nearest_soma_vessel_point_x_um" in rows[0]
 
 
 def test_microglia_cell_debug_returns_soma_tips_and_vessel_segments() -> None:

@@ -47,6 +47,9 @@ class NeurovascularAssociation:
     # Fraction of cells whose nearest *tip* reaches a vessel sooner than the
     # cell body would, i.e. processes actively extend toward vasculature.
     tip_leading_fraction: float = 0.0
+    cells_contacting_vessel: int = 0
+    vessel_contact_fraction: float = 0.0
+    mean_nearest_nonoverlapping_gap_um: float = 0.0
 
 
 def _finite(values: list[float | None]) -> np.ndarray:
@@ -65,6 +68,7 @@ def summarize_neurovascular_association(
     soma_d = _finite([c.soma_to_vessel_um for c in cells])
     soma_center_d = _finite([c.soma_centroid_to_vessel_um for c in cells])
     tip_d = _finite([c.nearest_tip_to_vessel_um for c in cells])
+    gap_d = _finite([getattr(c, "nearest_nonoverlapping_gap_um", None) for c in cells])
 
     cells_with_vessel = int(cell_d.size)
 
@@ -93,6 +97,8 @@ def summarize_neurovascular_association(
     if paired:
         leads = sum(1 for tip, soma in paired if float(tip) <= float(soma) + 1.0e-6)
         tip_leading = float(leads) / float(len(paired))
+    contact_count = int(sum(1 for c in cells if bool(getattr(c, "cell_contacts_vessel", False))))
+    contact_fraction = float(contact_count) / float(len(cells)) if cells else 0.0
 
     result = NeurovascularAssociation(
         cell_count=int(len(cells)),
@@ -112,6 +118,9 @@ def summarize_neurovascular_association(
         median_tip_to_vessel_um=float(np.median(tip_d)) if tip_d.size else 0.0,
         perivascular_fraction_by_radius=perivascular,
         tip_leading_fraction=tip_leading,
+        cells_contacting_vessel=contact_count,
+        vessel_contact_fraction=contact_fraction,
+        mean_nearest_nonoverlapping_gap_um=float(np.mean(gap_d)) if gap_d.size else 0.0,
     )
     logger.info(
         "Neurovascular association: cells=%d with_vessel=%d mean_cell=%.2fum "

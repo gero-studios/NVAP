@@ -25,7 +25,8 @@ metric, see **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
 - Computes and displays:
   - basic per-channel metrics (voxel count, physical volume, connected
     components, largest component, red–green overlap);
-  - vascular morphometry (volume fraction, centreline length and density,
+  - vascular morphometry using separate wall and reconstructed-solid masks
+    (wall coverage, anatomical volume fraction, centreline length and density,
     radius/diameter, junctions, tortuosity, surface area);
   - per-cell microglia morphometry (branches, tips, process length, Sholl
     profile, soma shape, distance to vasculature);
@@ -253,8 +254,9 @@ save as `metrics.csv`, you get:
 |------|----------|
 | `metrics.csv` | Per-channel basic metrics and red–green overlap |
 | `metrics_provenance.csv` | The settings that produced the numbers (thresholds, trim, offsets, spacing, backend, dataset, timestamp) |
-| `metrics_vascular.csv` | Vascular morphometry (red channel) |
-| `metrics_microglia.csv` | Per-cell microglia morphometry |
+| `metrics_vascular.csv` | Vascular morphometry (red wall mask plus reconstructed solid vessel mask) |
+| `metrics_vascular_masks.npz` | `vascular_wall_mask` and `vascular_solid_mask` arrays used for the vascular export |
+| `metrics_microglia.csv` | Per-cell microglia morphometry plus cell/soma/tip and nearest-vessel coordinates in voxels and µm |
 | `metrics_neurovascular.csv` | Neurovascular association patterns |
 
 Snapshot export writes a `snapshot.png`. Mesh export writes PLY/OBJ/STL files.

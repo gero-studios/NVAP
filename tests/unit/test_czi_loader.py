@@ -7,7 +7,11 @@ import pytest
 
 from nvap.config.types import ChannelVolume, VoxelSpacing
 from nvap.io import stack_loader
-from nvap.io.czi_loader import czi_array_to_czyx, parse_czi_spacing
+from nvap.io.czi_loader import (
+    czi_array_to_czyx,
+    infer_czi_channel_indices,
+    parse_czi_spacing,
+)
 
 
 def test_parse_czi_spacing_converts_zeiss_meters_to_micrometers() -> None:
@@ -38,6 +42,21 @@ def test_parse_czi_spacing_accepts_explicit_micrometer_and_nanometer_units() -> 
     assert parse_czi_spacing(metadata) == VoxelSpacing(0.25, 0.25, 1.5)
 
 
+def test_parse_czi_spacing_treats_default_unit_as_display_format_for_meter_values() -> None:
+    metadata = """
+    <Scaling><Items>
+      <Distance Id="X"><Value>1.315e-7</Value><DefaultUnitFormat>um</DefaultUnitFormat></Distance>
+      <Distance Id="Y"><Value>1.315e-7</Value><DefaultUnitFormat>um</DefaultUnitFormat></Distance>
+      <Distance Id="Z"><Value>4e-7</Value><DefaultUnitFormat>um</DefaultUnitFormat></Distance>
+    </Items></Scaling>
+    """
+
+    spacing = parse_czi_spacing(metadata)
+    assert spacing.x_um == pytest.approx(0.1315)
+    assert spacing.y_um == pytest.approx(0.1315)
+    assert spacing.z_um == pytest.approx(0.4)
+
+
 def test_parse_czi_spacing_rejects_incomplete_metadata() -> None:
     metadata = """
     <Scaling><Items>
@@ -60,6 +79,34 @@ def test_czi_array_to_czyx_selects_first_time_and_reorders_axes() -> None:
 
     assert result.shape == (4, 3, 5, 6)
     np.testing.assert_array_equal(result[2, 1], image[0, 1, 2])
+
+
+def test_infer_czi_channel_indices_handles_control_reversed_order() -> None:
+    metadata = """
+    <Image><Dimensions><Channels>
+      <Channel Id="Channel:0" Name="EGFP">
+        <ExcitationWavelength>488</ExcitationWavelength>
+        <EmissionWavelength>509</EmissionWavelength><Color>#FF00FF5B</Color>
+      </Channel>
+      <Channel Id="Channel:1" Name="TexRe">
+        <ExcitationWavelength>592</ExcitationWavelength>
+        <EmissionWavelength>614</EmissionWavelength><Color>#FFFF0500</Color>
+      </Channel>
+    </Channels></Dimensions></Image>
+    """
+
+    assert infer_czi_channel_indices(metadata, 2) == (0, 1)
+
+
+def test_infer_czi_channel_indices_handles_ppa_standard_order() -> None:
+    metadata = """
+    <Image><Dimensions><Channels>
+      <Channel Name="Ch2-T1"><Fluor>Texas Red</Fluor><Color>#FF0000</Color></Channel>
+      <Channel Name="Ch1-T2"><Fluor>EGFP</Fluor><Color>#00FF00</Color></Channel>
+    </Channels></Dimensions></Image>
+    """
+
+    assert infer_czi_channel_indices(metadata, 2) == (1, 0)
 
 
 def test_load_dataset_dispatches_single_czi_and_uses_metadata_spacing(
@@ -108,4 +155,3 @@ def test_load_dataset_allows_manual_czi_spacing_override(
     dataset = stack_loader.load_dataset(czi_path, spacing=manual)
 
     assert dataset.green.spacing == manual
-
