@@ -83,6 +83,8 @@ class RecentProjectsList(QTableWidget):
             self.setItem(row, 2, QTableWidgetItem(str(entry.samples or "—")))
             status = entry.status if entry.exists else "Missing"
             status_item = QTableWidgetItem(f"●  {status}")
+            if not entry.exists:
+                status_item.setToolTip("Folder moved or unavailable. Open this row to locate it.")
             self.setItem(row, 3, status_item)
 
     def selected_entry(self) -> ProjectEntry | None:
@@ -106,7 +108,7 @@ class RecentProjectsList(QTableWidget):
         if entry is None:
             return
         menu = QMenu(self)
-        open_act = QAction("Open project", menu)
+        open_act = QAction("Open project" if entry.exists else "Locate moved project…", menu)
         open_act.triggered.connect(lambda: self.project_open_requested.emit(entry.path))
         menu.addAction(open_act)
 

@@ -1,11 +1,12 @@
-"""NVAP home page – hero, quick actions, feature cards, projects library."""
+"""Native NVAP landing screen and project library."""
 from __future__ import annotations
 
 from typing import NamedTuple
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from nvap.ui.landing_scene import LandingScene
 from nvap.ui.design import COLOR, ICON_LG, ICON_MD, SPACE
 from nvap.ui.icons import icon, icon_pixmap, icon_size
 from nvap.ui.services.recent_projects import RecentProjectsStore
@@ -31,86 +33,6 @@ class RecentProject(NamedTuple):
     last_modified: str
     samples: int
     status: str
-
-
-class _FeatureCard(QWidget):
-    def __init__(self, icon_name: str, title: str, description: str, parent=None) -> None:
-        super().__init__(parent)
-        self.setObjectName("featureCard")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(SPACE.sm)
-
-        icon_lbl = QLabel()
-        icon_lbl.setObjectName("featureCardIcon")
-        icon_lbl.setPixmap(icon_pixmap(icon_name, size=ICON_LG, color=COLOR.accent_hover))
-        layout.addWidget(icon_lbl)
-
-        title_lbl = QLabel(title)
-        title_lbl.setObjectName("featureCardTitle")
-        layout.addWidget(title_lbl)
-
-        desc_lbl = QLabel(description)
-        desc_lbl.setObjectName("featureCardDesc")
-        desc_lbl.setWordWrap(True)
-        layout.addWidget(desc_lbl)
-
-        layout.addStretch(1)
-
-
-class _PreviewPanel(QFrame):
-    """Hero preview frame – placeholder text until VTK snapshot is wired in."""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setObjectName("homePreviewBox")
-        self.setFixedSize(360, 220)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(8)
-
-        self._kicker = QLabel("WORKSPACE")
-        self._kicker.setObjectName("previewKicker")
-        layout.addWidget(self._kicker)
-
-        self._title = QLabel("3D Workspace ready")
-        self._title.setObjectName("previewTitle")
-        self._title.setWordWrap(True)
-        layout.addWidget(self._title)
-
-        self._body = QLabel(
-            "Load a dataset to render microglia and vasculature.\n"
-            "Two channels • live metrics • mesh export."
-        )
-        self._body.setObjectName("previewBody")
-        self._body.setWordWrap(True)
-        layout.addWidget(self._body)
-        layout.addStretch(1)
-
-        # Subtle channel legend
-        legend = QHBoxLayout()
-        legend.setSpacing(SPACE.lg)
-        for label, color in (("Microglia", COLOR.channel_green), ("Vasculature", COLOR.channel_red)):
-            row = QHBoxLayout()
-            row.setSpacing(6)
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color: {color}; font-size: 14px; background: transparent;")
-            text = QLabel(label)
-            text.setStyleSheet(f"color: {COLOR.text_tertiary}; background: transparent;")
-            row.addWidget(dot)
-            row.addWidget(text)
-            container = QWidget()
-            container.setLayout(row)
-            legend.addWidget(container)
-        legend.addStretch(1)
-        layout.addLayout(legend)
-
-    def set_summary(self, kicker: str, title: str, body: str) -> None:
-        self._kicker.setText(kicker)
-        self._title.setText(title)
-        self._body.setText(body)
 
 
 class HomePage(QWidget):
@@ -143,30 +65,48 @@ class HomePage(QWidget):
         content = QWidget()
         content.setObjectName("homeContent")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(40, 36, 40, 40)
+        layout.setContentsMargins(40, 32, 40, 40)
         layout.setSpacing(0)
 
         # ─── Hero row ───────────────────────────────────────────────────
         hero_row = QHBoxLayout()
+        self._hero_row = hero_row
         hero_row.setSpacing(SPACE.xl)
 
         hero_left = QVBoxLayout()
         hero_left.setSpacing(0)
 
-        title = QLabel("NVAP")
+        brand_row = QHBoxLayout()
+        brand_row.setSpacing(14)
+        brand_mark = QLabel()
+        brand_mark.setObjectName("homeBrandMark")
+        brand_mark.setPixmap(icon_pixmap("logo", 36, "#c3d5b9"))
+        brand_mark.setFixedSize(36, 36)
+        brand_row.addWidget(brand_mark)
+        eyebrow = QLabel("N V A P   /   NEUROVASCULAR ANALYTICS")
+        eyebrow.setStyleSheet("color: #9fb7c8; font-size: 10px; letter-spacing: 2px;")
+        brand_row.addWidget(eyebrow, 1)
+        hero_left.addLayout(brand_row)
+        hero_left.addSpacing(28)
+        title = QLabel("A closer look.\nA clearer picture.")
         title.setObjectName("heroTitle")
+        title.setWordWrap(True)
+        title.setStyleSheet("font-size: 42px; font-weight: 500; color: #edf2f7; background: transparent;")
         hero_left.addWidget(title)
 
-        subtitle = QLabel("Microglia + Vasculature Analysis Platform")
+        subtitle = QLabel("NeuroVascular Analytics Program")
         subtitle.setObjectName("heroSubtitle")
+        subtitle.setWordWrap(True)
         hero_left.addWidget(subtitle)
         hero_left.addSpacing(SPACE.md)
 
         desc = QLabel(
-            "Reconstruct, segment, and quantify microglia and brain vasculature\n"
-            "from confocal microscopy stacks. Built for neuroscience research."
+            "Explore microglia and vasculature in three dimensions. "
+            "Turn microscopy stacks into measurable insight."
         )
         desc.setObjectName("heroDesc")
+        desc.setWordWrap(True)
+        desc.setMaximumWidth(400)
         hero_left.addWidget(desc)
         hero_left.addSpacing(SPACE.xl)
 
@@ -198,30 +138,20 @@ class HomePage(QWidget):
         hero_left.addLayout(actions)
         hero_row.addLayout(hero_left, 1)
 
-        self._preview = _PreviewPanel()
-        hero_row.addWidget(self._preview, 0, Qt.AlignmentFlag.AlignTop)
+        self._preview = LandingScene()
+        hero_row.addWidget(self._preview, 1)
         layout.addLayout(hero_row)
         layout.addSpacing(SPACE.xl)
 
-        # ─── Feature cards ──────────────────────────────────────────────
-        cards = QGridLayout()
-        cards.setSpacing(SPACE.md)
-        for col in range(4):
-            cards.setColumnStretch(col, 1)
-        feature_specs = [
-            ("box",      "3D Reconstruction", "Reconstruct volumes from 2D stacks with interpolation and channel sync."),
-            ("scissors", "Segmentation",      "Microglia separation and vessel masking with branch-preserving denoise."),
-            ("bar-chart","Analytics",         "Quantify morphology, density, and cell-vessel interactions."),
-            ("share",    "Export",            "Metrics CSV, PNG snapshots, and PLY/OBJ/STL meshes."),
-        ]
-        for i, (ic, title_text, desc_text) in enumerate(feature_specs):
-            cards.addWidget(_FeatureCard(ic, title_text, desc_text), 0, i)
-        layout.addLayout(cards)
-        layout.addSpacing(SPACE.xxl)
+        workflow = QLabel("01  RECONSTRUCT     /     02  QUANTIFY     /     03  DISCOVER")
+        workflow.setStyleSheet("color: #8d98a5; font-size: 10px; letter-spacing: 1px; padding: 20px 0; border-top: 1px solid #242b35; border-bottom: 1px solid #242b35;")
+        workflow.setWordWrap(True)
+        layout.addWidget(workflow)
+        layout.addSpacing(32)
 
         # ─── Projects library ──────────────────────────────────────────
         lib_header = QHBoxLayout()
-        lib_title = QLabel("Projects Library")
+        lib_title = QLabel("Your projects")
         lib_title.setObjectName("sectionTitle")
         lib_header.addWidget(lib_title)
 
@@ -249,9 +179,10 @@ class HomePage(QWidget):
         layout.addWidget(self.recent_table)
 
         self._empty_state = QLabel(
-            "No projects yet. Use New Project or Open Project to get started."
+            "Your next discovery starts here.\nCreate a project or open an existing image stack."
         )
         self._empty_state.setObjectName("pageBody")
+        self._empty_state.setWordWrap(True)
         self._empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_state.setContentsMargins(0, SPACE.xl, 0, SPACE.xl)
         layout.addWidget(self._empty_state)
@@ -263,13 +194,38 @@ class HomePage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self._scroll)
 
+        self._entrance_effect = QGraphicsOpacityEffect(content)
+        content.setGraphicsEffect(self._entrance_effect)
+        self._entrance = QPropertyAnimation(self._entrance_effect, b"opacity", self)
+        self._entrance.setDuration(850)
+        self._entrance.setStartValue(0.0)
+        self._entrance.setEndValue(1.0)
+        self._entrance.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._entrance.finished.connect(lambda: self._entrance_effect.setEnabled(False))
+        self._has_entered = False
+
         self.refresh_projects()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._has_entered:
+            self._has_entered = True
+            self._entrance.start()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        from PySide6.QtWidgets import QBoxLayout
+        compact = self.width() < 850
+        self._hero_row.setDirection(
+            QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight
+        )
+        self._preview.setMinimumHeight(260 if compact else 390)
 
     # ── builders ───────────────────────────────────────────────────────
     def _make_action_btn(self, icon_name: str, label: str, *, primary: bool = False) -> QPushButton:
         btn = QPushButton(f"  {label}")
         btn.setObjectName("primaryActionHome" if primary else "secondaryActionHome")
-        btn.setFixedHeight(40)
+        btn.setFixedHeight(44)
         btn.setIcon(icon(icon_name, size=ICON_MD, color="#FFFFFF" if primary else COLOR.text_primary))
         btn.setIconSize(icon_size(ICON_MD))
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -283,6 +239,8 @@ class HomePage(QWidget):
         has_any = count > 0
         self.recent_table.setVisible(has_any)
         self._empty_state.setVisible(not has_any)
+        if not has_any:
+            self._preview.set_summary("ILLUSTRATIVE VIEW", "Two channels. One perspective.", "Microglia / Vasculature")
         if has_any:
             entries = self._store.all()
             top = entries[0]

@@ -163,6 +163,14 @@ class _MetricsTaskResult:
 
 
 @dataclass(frozen=True)
+class _AnalyticsExportContext:
+    dataset: DatasetVolume | None
+    render: RenderConfig
+    microglia: MicrogliaAnalysisResult | None
+    provenance: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
 class _ProjectAnalyticsConfig:
     render: RenderConfig
     psf: PSFConfig
@@ -306,9 +314,8 @@ class MainWindow(QMainWindow):
         self.controls_scroll = QScrollArea(self)
         self.controls_scroll.setObjectName("controlPanelScrollArea")
         self.controls_scroll.setWidgetResizable(True)
-        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.controls_scroll.setMinimumWidth(260)
-        self.controls_scroll.setMaximumWidth(360)
         self.controls_scroll.setWidget(self.controls)
 
         self._metrics_panel = MetricsPanel()
@@ -331,7 +338,7 @@ class MainWindow(QMainWindow):
         self._workspace_splitter.setStretchFactor(0, 0)
         self._workspace_splitter.setStretchFactor(1, 1)
         self._workspace_splitter.setStretchFactor(2, 0)
-        self._workspace_splitter.setSizes([300, 1000, 260])
+        self._workspace_splitter.setSizes([380, 920, 260])
 
         # ── Project store + pages ────────────────────────────────────────
         self._project_store = RecentProjectsStore()
@@ -604,8 +611,8 @@ class MainWindow(QMainWindow):
         logo_lo.setSpacing(8)
 
         logo_icon = QLabel()
-        logo_icon.setPixmap(icon_pixmap("logo", 22, COLOR.accent))
-        logo_icon.setFixedSize(24, 24)
+        logo_icon.setPixmap(icon_pixmap("logo", 26, "#c3d5b9"))
+        logo_icon.setFixedSize(28, 28)
         logo_icon.setScaledContents(True)
         logo_lo.addWidget(logo_icon)
 
@@ -749,6 +756,15 @@ class MainWindow(QMainWindow):
 
         action_row = QHBoxLayout()
         action_row.setSpacing(10)
+        self._analytics_export_btn = QPushButton("Export Current Dataset CSV")
+        self._analytics_export_btn.setObjectName("primaryAction")
+        self._analytics_export_btn.setIcon(icon("download", ICON_SM, COLOR.text_inverse))
+        self._analytics_export_btn.setEnabled(False)
+        self._analytics_export_btn.setToolTip(
+            "Export this dataset's channel, vascular, microglia, and neurovascular analytics."
+        )
+        self._analytics_export_btn.clicked.connect(self._on_export_metrics_requested)
+        action_row.addWidget(self._analytics_export_btn)
         self._project_analytics_btn = QPushButton("Apply Current Settings to Project Set + Export CSV")
         self._project_analytics_btn.setObjectName("primaryAction")
         self._project_analytics_btn.setIcon(icon("bar-chart", ICON_SM, COLOR.text_inverse))
@@ -1476,6 +1492,8 @@ class MainWindow(QMainWindow):
         self.controls.set_microglia_workflow_enabled(has_dataset)
         if hasattr(self, "_project_analytics_btn"):
             self._project_analytics_btn.setEnabled(has_dataset and has_project_set)
+        if hasattr(self, "_analytics_export_btn"):
+            self._analytics_export_btn.setEnabled(has_dataset)
         if self.dataset_root is not None:
             self._home_page.set_preview_summary(
                 "ACTIVE",
@@ -1517,14 +1535,12 @@ class MainWindow(QMainWindow):
     def _open_recent_project(self, path: str) -> None:
         p = Path(path)
         if not p.exists():
-            QMessageBox.warning(
-                self,
-                "Project Not Found",
-                f"The dataset folder no longer exists:\n{path}",
+            location = QFileDialog.getExistingDirectory(
+                self, "Locate moved project folder", str(p.parent if p.parent.exists() else Path.home()),
             )
-            self._project_store.remove(path)
-            self._home_page.refresh_projects()
-            return
+            if not location:
+                return
+            p = Path(location)
         try:
             state = load_project_state(p)
             channel_overrides = project_channel_sources(state) if state is not None else None
@@ -1532,6 +1548,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Project load failed", str(exc))
             return
+        if str(p) != path:
+            self._project_store.relocate(path, p)
+            self._home_page.refresh_projects()
         self._clear_project_set()
         self.dataset_root = p.resolve()
         self._nav_to(1)
@@ -1968,15 +1987,18 @@ class MainWindow(QMainWindow):
         if green_only:
             return
         self._set_busy_message("Uploading red channel to VTK...")
+        # Use the same native grid and slice trim as vascular cleanup/metrics.
+        # The mesh dataset has a resampled Z axis intended for green analysis.
+        red_channel = (self.processed_dataset or self.visual_dataset).red
         red_volume = self._apply_render_trim(
-            self.visual_dataset.red.data,
+            red_channel.data,
             trim_first,
             trim_last,
         )
         self.scene.set_channel_data(
             channel="red",
             volume=red_volume,
-            spacing=self._display_spacing(self.visual_dataset.red.spacing),
+            spacing=self._display_spacing(red_channel.spacing),
         )
 
     @staticmethod
@@ -2982,6 +3004,7 @@ class MainWindow(QMainWindow):
         vascular_max_voxels = int(self.controls.current_vascular_blob_max_voxels())
         threshold_green = float(self.current_render.threshold_green)
         threshold_red = float(self.current_render.threshold_red)
+        render = self.current_render
         # Detect blobs at exactly the level the red isosurface is drawn at
         # (threshold_red). The retired iso_red control sits at threshold_red +
         # 0.05, so max(threshold_red, iso_red) used to build the mask a notch
@@ -3036,6 +3059,8 @@ class MainWindow(QMainWindow):
                     red,
                     threshold=vascular_cleanup_threshold,
                     max_voxels=vascular_max_voxels,
+                    trim_first_slices=render.trim_first_slices,
+                    trim_last_slices=render.trim_last_slices,
                 )
             self._publish_busy_progress(percent=92.0, message="Updating dataset...")
             return DatasetVolume(
@@ -3582,6 +3607,7 @@ class MainWindow(QMainWindow):
         dataset = self.processed_dataset
         max_voxels = int(self.controls.current_wipe_speck_max_voxels())
         vascular_max_voxels = int(self.controls.current_vascular_blob_max_voxels())
+        render = self.current_render
         # Detect specks among the voxels that are currently visible, so the wipe
         # removes exactly the small dots the user sees in each channel.
         threshold_green = float(self.current_render.threshold_green)
@@ -3602,6 +3628,8 @@ class MainWindow(QMainWindow):
                 dataset.red.data,
                 threshold=vascular_cleanup_threshold,
                 max_voxels=vascular_max_voxels,
+                trim_first_slices=render.trim_first_slices,
+                trim_last_slices=render.trim_last_slices,
             )
             self._publish_busy_progress(percent=85.0, message="Updating dataset...")
             return DatasetVolume(
@@ -3642,6 +3670,7 @@ class MainWindow(QMainWindow):
 
         dataset = self.processed_dataset
         max_voxels = int(self.controls.current_vascular_blob_max_voxels())
+        render = self.current_render
         # Wipe at the level the red isosurface is drawn at (threshold_red) so the
         # mask matches the visible surface exactly.
         threshold = float(self.current_render.threshold_red)
@@ -3652,6 +3681,8 @@ class MainWindow(QMainWindow):
                 dataset.red.data,
                 threshold=threshold,
                 max_voxels=max_voxels,
+                trim_first_slices=render.trim_first_slices,
+                trim_last_slices=render.trim_last_slices,
             )
             self._publish_busy_progress(percent=85.0, message="Updating dataset...")
             return DatasetVolume(
@@ -3942,6 +3973,8 @@ class MainWindow(QMainWindow):
                     red,
                     threshold=float(config.render.threshold_red),
                     max_voxels=int(config.vascular_wipe_max_voxels),
+                    trim_first_slices=config.render.trim_first_slices,
+                    trim_last_slices=config.render.trim_last_slices,
                 )
             processed = DatasetVolume(
                 green=ChannelVolume(
@@ -4297,8 +4330,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_export_metrics_requested(self) -> None:
-        if self.latest_metrics is None:
-            self._show_error("No metrics", "Compute metrics before exporting.")
+        if self.processed_dataset is None:
+            self._show_error("No dataset", "Load a dataset before exporting analytics.")
+            return
+        if self._active_thread is not None and self._active_thread.isRunning():
+            self.statusBar().showMessage("Another operation is still running.", 3000)
             return
         start = str((self.dataset_root or Path.cwd()) / "metrics.csv")
         file_path, _ = QFileDialog.getSaveFileName(
@@ -4309,59 +4345,109 @@ class MainWindow(QMainWindow):
         )
         if not file_path:
             return
-        try:
-            with self._busy("Export Metrics", "Writing CSV..."):
-                self._publish_busy_progress(percent=10.0, message="Collecting metrics rows...")
-                rows = metrics_to_csv_rows(self.latest_metrics)
-                self._publish_busy_progress(percent=50.0, message="Writing CSV file...")
-                out = export_metrics_csv(rows, file_path)
-                self._publish_busy_progress(percent=70.0, message="Computing vascular morphometry...")
-                companions = self._export_extended_analytics(out)
-                self._publish_busy_progress(percent=100.0, message="Metrics export complete.")
+
+        # Capture settings/results on the UI thread. The worker must not read Qt
+        # controls, stale cached metrics, or wait for unrelated vascular tasks.
+        render = self.current_render
+        dataset = self.processed_dataset
+        visual = self.visual_dataset or dataset
+        microglia = self.latest_microglia_analysis
+        if self.visual_dataset is None or (
+            self._microglia_analysis_cache_key != self._microglia_analysis_cache_key_for_render(render)
+        ):
+            microglia = None
+        context = _AnalyticsExportContext(dataset, render, microglia, self._provenance_rows())
+        branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
+        base_min_voxels = max(64, int(self.preprocess_config.green_speckle_min_voxels) * 4)
+
+        def _export_task() -> tuple[Path, list[Path]]:
+            self._publish_busy_progress(percent=10.0, message="Computing current channel metrics...")
+            metrics = compute_metrics(dataset, render)
+            out = export_metrics_csv(metrics_to_csv_rows(metrics), file_path)
+            analysis = context.microglia
+            if analysis is None:
+                self._publish_busy_progress(percent=30.0, message="Computing microglia analytics...")
+                spacing = visual.green.spacing
+                labels, order, _sizes = self._compute_microglia_components_from_params(
+                    visual.green.data,
+                    threshold=float(render.threshold_green),
+                    branch_sense=branch_sensitivity,
+                    base_min_voxels=base_min_voxels,
+                    spacing=(float(spacing.z_um), float(spacing.y_um), float(spacing.x_um)),
+                )
+                analysis = analyze_microglia_cells(
+                    visual.green.data, visual.red.data, labels, order,
+                    spacing=spacing, render=render, branch_sensitivity=branch_sensitivity,
+                )
+            provenance = [row for row in context.provenance if row["setting"] != "microglia_cell_count"]
+            provenance.append({"setting": "microglia_cell_count", "value": analysis.analyzed_cell_count})
+            self._publish_busy_progress(percent=70.0, message="Exporting vascular and cell analytics...")
+            companions = self._export_extended_analytics(
+                out, context=replace(context, microglia=analysis, provenance=provenance),
+            )
+            self._publish_busy_progress(percent=100.0, message="Analytics export complete.")
+            return out, companions
+
+        def _on_export_success(result: object) -> None:
+            out, companions = result
             extra = f" (+{len(companions)} analytics files)" if companions else ""
             self.statusBar().showMessage(f"Metrics exported to {out}{extra}", 5000)
             self._log_info(f"Metrics exported: {out}{extra}")
-        except Exception as exc:
-            self._log_info(f"Metrics export failed: {exc}")
-            self._show_error("Export failed", str(exc))
 
-    def _export_extended_analytics(self, base_path: Path) -> list[Path]:
+        self._start_background_task(
+            title="Export Analytics CSV",
+            message="Computing and exporting the current dataset analytics...",
+            fn=_export_task,
+            on_success=_on_export_success,
+            error_title="Analytics export failed",
+            success_status="Analytics export complete.",
+        )
+
+    def _export_extended_analytics(
+        self, base_path: Path, *, context: _AnalyticsExportContext | None = None,
+    ) -> list[Path]:
         """Write vascular + neurovascular companion CSVs next to ``metrics.csv``.
 
         These carry the quantitative vasculature morphometry and the population
         neurovascular-association patterns that don't fit the per-channel metrics
-        schema. Failures are logged but never block the primary metrics export.
+        schema. An explicit context lets the export worker use an immutable
+        snapshot of the UI's settings and analysis references.
         """
         written: list[Path] = []
         base = Path(base_path)
         stem = base.stem
+        if context is None:
+            context = _AnalyticsExportContext(
+                self.processed_dataset, self.current_render,
+                self.latest_microglia_analysis, self._provenance_rows(),
+            )
 
         # Provenance: record exactly which settings produced these numbers so the
         # CSVs are self-describing and reproducible.
         try:
             ppath = base.with_name(f"{stem}_provenance.csv")
-            export_metrics_csv(self._provenance_rows(), ppath)
+            export_metrics_csv(context.provenance, ppath)
             written.append(ppath)
         except Exception as exc:  # pragma: no cover - defensive UI path
-            self._log_info(f"Provenance export skipped: {exc}")
+            raise RuntimeError(f"Could not export provenance CSV: {exc}") from exc
 
-        dataset = self.processed_dataset
+        dataset = context.dataset
         if dataset is not None:
             try:
                 vascular = analyze_vasculature(
                     dataset.red.data,
-                    threshold=float(self.current_render.threshold_red),
+                    threshold=float(context.render.threshold_red),
                     spacing=dataset.red.spacing,
-                    render=self.current_render,
+                    render=context.render,
                 )
                 vpath = base.with_name(f"{stem}_vascular.csv")
                 export_metrics_csv(vascular_analysis_to_csv_rows(vascular), vpath)
                 written.append(vpath)
                 masks = build_vascular_masks(
                     dataset.red.data,
-                    threshold=float(self.current_render.threshold_red),
+                    threshold=float(context.render.threshold_red),
                     spacing=dataset.red.spacing,
-                    render=self.current_render,
+                    render=context.render,
                 )
                 mpath = base.with_name(f"{stem}_vascular_masks.npz")
                 np.savez_compressed(
@@ -4371,20 +4457,20 @@ class MainWindow(QMainWindow):
                 )
                 written.append(mpath)
             except Exception as exc:  # pragma: no cover - defensive UI path
-                self._log_info(f"Vascular metrics export skipped: {exc}")
+                raise RuntimeError(f"Could not export vascular analytics: {exc}") from exc
 
-        if self.latest_microglia_analysis is not None:
+        if context.microglia is not None:
             try:
                 mpath = base.with_name(f"{stem}_microglia.csv")
-                export_metrics_csv(microglia_analysis_to_csv_rows(self.latest_microglia_analysis), mpath)
+                export_metrics_csv(microglia_analysis_to_csv_rows(context.microglia), mpath)
                 written.append(mpath)
 
-                assoc = summarize_neurovascular_association(self.latest_microglia_analysis)
+                assoc = summarize_neurovascular_association(context.microglia)
                 npath = base.with_name(f"{stem}_neurovascular.csv")
                 export_metrics_csv(neurovascular_association_to_csv_rows(assoc), npath)
                 written.append(npath)
             except Exception as exc:  # pragma: no cover - defensive UI path
-                self._log_info(f"Microglia/neurovascular metrics export skipped: {exc}")
+                raise RuntimeError(f"Could not export microglia/neurovascular analytics: {exc}") from exc
 
         return written
 

@@ -83,6 +83,23 @@ def load_project_state(root: str | Path) -> dict[str, Any] | None:
         return None
     if "green" not in sources or "red" not in sources:
         return None
+    # Project descriptors historically stored absolute paths. Rebase sources
+    # inside the old folder when a user moves/copies the complete project.
+    current_root = Path(root).resolve()
+    old_root = Path(str(raw.get("root") or current_root))
+    resolved_sources = {}
+    for channel in ("green", "red"):
+        source = Path(str(sources[channel]))
+        if not source.is_absolute():
+            source = current_root / source
+        elif old_root != current_root:
+            try:
+                source = current_root / source.relative_to(old_root)
+            except ValueError:
+                pass  # External sources keep their explicitly selected paths.
+        resolved_sources[channel] = str(source)
+    raw["channel_sources"] = resolved_sources
+    raw["root"] = str(current_root)
     return raw
 
 

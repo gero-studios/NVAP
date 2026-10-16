@@ -29,7 +29,9 @@ def resample_channel_for_mesh(
     resampled = ndi.zoom(
         channel.data.astype(np.float32, copy=False),
         zoom=zoom_factors,
-        order=1,
+        # Interpolating red intensities can sever thresholded vessel links and
+        # turn a cleaned connected vessel into thousands of apparent specks.
+        order=0 if channel.name == "red" else 1,
         mode="nearest",
         prefilter=False,
     ).astype(np.float32, copy=False)

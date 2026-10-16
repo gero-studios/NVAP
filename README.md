@@ -188,7 +188,7 @@ preprocessing, and denoising settings.
 - **Isosurface toggles:** show a solid surface at the threshold instead of a
   translucent cloud.
 - **Trim first/last Z:** exclude edge slices from both the view and all metrics
-  (default: 0 slices at each end).
+  (default: 10 slices at each end).
 - **Offset (x/y/z):** shift the green channel relative to red to correct
   registration; applied identically to the view and the overlap metric.
 - **Z height scale:** a display-only depth scale (default `0.70`; `1.0` matches
@@ -216,7 +216,11 @@ through a multi-stack project set — NVAP cleans it up automatically:
 2. **Enhance microglia (clean)** runs the selected enhancement (default
    *Microscopy clean soma/branch*) on the green channel. Skipped if the dataset
    already has a cached enhancement.
-3. **Wipe specks** removes small isolated blobs from both channels.
+3. **Wipe specks** removes small isolated blobs from both channels. Red cleanup
+   measures components in native voxels within the retained Z slices; connections
+   through trimmed slices or corner-only contacts do not protect debris.
+   Elongated vessel fragments are retained. Red rendering uses the same native grid to avoid introducing specks
+   through intensity interpolation.
 
 The two cleanup passes are controlled by the **Enhance microglia (clean) on
 load** and **Wipe specks on load** checkboxes in the Microglia Workbench (both on
@@ -246,6 +250,11 @@ off to batch several edits and apply them together with the Apply button or
 ---
 
 ## Exports
+
+Use **Export Current Dataset CSV** on the Analytics page, or press **Ctrl+E**,
+to export a single loaded dataset. Export computes any missing current results
+in a background task, so pending summary metrics do not block it. The project
+set export button is for processing multiple samples together.
 
 Exporting metrics writes a base CSV plus companion files alongside it. If you
 save as `metrics.csv`, you get:

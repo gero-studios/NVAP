@@ -196,7 +196,9 @@ class ControlPanel(QWidget):
         # ── Scrollable section stack ─────────────────────────────────────
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Some compound controls have an intrinsic minimum width. Keep them
+        # reachable even when the inspector is narrower than that minimum.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
 
         sections_w = QWidget()
@@ -211,6 +213,9 @@ class ControlPanel(QWidget):
         self._processing_section = self._build_processing_section(slo)
         self._build_metrics_export_section(slo)
         self._build_system_section(slo)
+
+        for form in sections_w.findChildren(QFormLayout):
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
         slo.addStretch(1)
         scroll.setWidget(sections_w)
@@ -422,13 +427,13 @@ class ControlPanel(QWidget):
 
         self.trim_first_slices = QSpinBox()
         self.trim_first_slices.setRange(0, 9999)
-        self.trim_first_slices.setValue(0)
+        self.trim_first_slices.setValue(RenderConfig().trim_first_slices)
         self.trim_first_slices.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Trim first Z", self.trim_first_slices)
 
         self.trim_last_slices = QSpinBox()
         self.trim_last_slices.setRange(0, 9999)
-        self.trim_last_slices.setValue(0)
+        self.trim_last_slices.setValue(RenderConfig().trim_last_slices)
         self.trim_last_slices.valueChanged.connect(self._on_render_setting_changed)
         form.addRow("Trim last Z", self.trim_last_slices)
 
@@ -621,6 +626,7 @@ class ControlPanel(QWidget):
         self.vascular_blob_max_voxels.setKeyboardTracking(False)
         self.vascular_blob_max_voxels.setToolTip(
             "Largest compact red-channel component treated as vascular debris.\n"
+            "Sizes use native voxels within the retained Z slices; corner-only contacts are separate.\n"
             "Elongated vessel segments are retained, even below this size."
         )
         wipe_form.addRow("Remove red blobs up to", self.vascular_blob_max_voxels)

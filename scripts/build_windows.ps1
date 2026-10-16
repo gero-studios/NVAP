@@ -66,10 +66,10 @@ Invoke-Checked { & $PythonExe -m pip install --upgrade pip } "pip upgrade"
 $extras = "dev"
 $resolvedMode = "cpu"
 $pyVersion = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-$isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+$nvapIsWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )
-if ($Acceleration -eq "directml" -or ($Acceleration -eq "auto" -and $isWindows -and [version]$pyVersion -lt [version]"3.13")) {
+if ($Acceleration -eq "directml" -or ($Acceleration -eq "auto" -and $nvapIsWindows -and [version]$pyVersion -lt [version]"3.13")) {
     $extras = "dev,directml"
     $resolvedMode = "directml"
     Write-Host "DirectML acceleration will be included when wheels are available for Python $pyVersion."
@@ -87,6 +87,7 @@ $pyInstallerArgs = @(
     "--clean",
     "--$PackageMode",
     "--name", "NVAP",
+    "--icon", "assets\nvap.ico",
     # UPX-packed, unsigned PyInstaller binaries are a classic false-positive
     # trigger for Windows Defender / SmartScreen and other AV heuristics.
     # Disabling UPX regardless of whether it happens to be on PATH keeps the

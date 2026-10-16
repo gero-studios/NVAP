@@ -1452,7 +1452,9 @@ def wipe_vasculature_blobs(
     max_voxels: int,
     max_aspect_ratio: float = 4.0,
     min_solid_voxels: int = 64,
-    connectivity: int = 3,
+    connectivity: int = 1,
+    trim_first_slices: int = 0,
+    trim_last_slices: int = 0,
 ) -> np.ndarray:
     """Remove isolated red-channel debris while preserving the vessel network.
 
@@ -1463,6 +1465,11 @@ def wipe_vasculature_blobs(
     Because that ratio is meaningless for a handful of voxels (a 3-voxel diagonal
     reads as highly "elongated"), the guard never protects components at or below
     ``min_solid_voxels`` — those are always removed as noise.
+    Connectivity is evaluated only in the retained native Z slices. Excluded
+    slices are left unchanged, but cannot keep visible debris attached to a
+    vessel outside the retained volume.
+    Face connectivity is used by default: corner/edge-only contacts do not
+    make a continuous vessel surface and must not protect isolated red dots.
     """
     arr = np.asarray(volume, dtype=np.float32)
     if arr.ndim != 3:
@@ -1470,10 +1477,24 @@ def wipe_vasculature_blobs(
     if arr.size == 0:
         return arr.copy()
 
+    start = min(arr.shape[0], max(0, int(trim_first_slices)))
+    stop = max(start, arr.shape[0] - max(0, int(trim_last_slices)))
+    if start > 0 or stop < arr.shape[0]:
+        out = arr.copy()
+        out[start:stop] = wipe_vasculature_blobs(
+            arr[start:stop],
+            threshold=threshold,
+            max_voxels=max_voxels,
+            max_aspect_ratio=max_aspect_ratio,
+            min_solid_voxels=min_solid_voxels,
+            connectivity=connectivity,
+        )
+        return out
+
     t = float(np.clip(threshold, 0.0, 1.0))
     limit = max(1, int(max_voxels))
     solid_floor = max(0, int(min_solid_voxels))
-    # Finite ratio => keep elongated fragments; inf (default) => pure size wipe.
+    # Finite ratio => keep elongated fragments; inf => pure size wipe.
     size_only = not np.isfinite(float(max_aspect_ratio))
     mask = arr >= t
     if not np.any(mask):

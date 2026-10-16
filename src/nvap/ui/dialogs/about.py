@@ -45,7 +45,7 @@ class AboutDialog(QDialog):
         header.setSpacing(SPACE.lg)
         logo = QLabel()
         logo.setObjectName("aboutLogo")
-        logo.setPixmap(icon_pixmap("logo", size=ICON_XL * 2, color=COLOR.accent_hover))
+        logo.setPixmap(icon_pixmap("logo", size=ICON_XL * 2, color="#c3d5b9"))
         logo.setFixedSize(ICON_XL * 2, ICON_XL * 2)
         header.addWidget(logo, 0, Qt.AlignmentFlag.AlignTop)
 

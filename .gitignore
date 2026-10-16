@@ -10,3 +10,8 @@
 # images are tracked; their regenerated caches are not.
 **/.nvap_cache/
 .nvap_project.json
+
+# Website deployment dependencies and generated public bundle.
+/website/node_modules/
+/website/public/
+/website/.wrangler/

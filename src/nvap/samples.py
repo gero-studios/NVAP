@@ -2,17 +2,20 @@
 
 Bundled samples live in a top-level ``samples/`` directory (one subfolder per
 dataset). On first run they are registered in the recent-projects store as pinned
-entries so they appear on the Home page and open like any other project. If the
-user later removes a sample from the list it is not re-added.
+entries so they appear on the Home page and open like any other project. Frozen
+builds keep their images in the user data directory, outside temporary extraction.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime
 import logging
 from pathlib import Path
+import shutil
 import sys
 
-from nvap.ui.services.recent_projects import RecentProjectsStore
+from nvap.ui.services.recent_projects import ProjectEntry, RecentProjectsStore
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +51,54 @@ def discover_bundled_samples() -> list[tuple[str, Path]]:
 
 
 def register_bundled_samples(store: RecentProjectsStore) -> int:
-    """Register any not-yet-known bundled samples as pinned recent-project entries.
-
-    Returns the number of samples newly added. Existing entries (including ones the
-    user has removed and therefore should stay gone) are left untouched.
-    """
+    """Register stable sample identities and repair old temporary-folder entries."""
     added = 0
-    for name, path in discover_bundled_samples():
-        if store.find(path) is not None:
-            continue
-        store.upsert(path, name=f"{name} (sample)", status="Sample")
-        store.set_pinned(str(path), True)
-        added += 1
-        logger.info("Registered bundled sample: %s -> %s", name, path)
+    entries = store.all()
+    previous = sorted((entry.to_dict() for entry in entries), key=lambda item: item["path"])
+    for name, source in discover_bundled_samples():
+        path = source
+        if getattr(sys, "frozen", False):
+            # One-file builds extract into a different _MEI directory each run.
+            # Store image data outside that directory before persisting a path.
+            path = store.data_dir / "samples" / name
+            for image in source.rglob("*"):
+                if not image.is_file() or image.suffix.lower() not in {".png", ".tif", ".tiff", ".czi"}:
+                    continue
+                destination = path / image.relative_to(source)
+                if not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(image, destination)
+        path = path.resolve()
+
+        def matches(entry: ProjectEntry) -> bool:
+            old = Path(entry.path)
+            legacy_temp = old.parent.name == "samples" and old.parent.parent.name.startswith("_MEI")
+            return entry.sample_id == name or (
+                old.name == name and (
+                    old in {source, path} or legacy_temp
+                    or (entry.status == "Sample" and old.parent.name == "samples")
+                )
+            )
+
+        aliases = [entry for entry in entries if matches(entry)]
+        if aliases:
+            latest = max(aliases, key=lambda entry: entry.last_opened)
+            canonical = replace(
+                latest, path=str(path), name=f"{name} (sample)", sample_id=name,
+                pinned=any(entry.pinned for entry in aliases),
+                samples=max(entry.samples for entry in aliases),
+                tags=list(dict.fromkeys(tag for entry in aliases for tag in entry.tags)),
+            )
+            entries = [entry for entry in entries if not matches(entry)]
+            entries.append(canonical)
+        else:
+            entries.append(ProjectEntry(
+                name=f"{name} (sample)", path=str(path), sample_id=name,
+                status="Sample", pinned=True,
+                last_opened_iso=datetime.now().isoformat(timespec="seconds"),
+            ))
+            added += 1
+            logger.info("Registered bundled sample: %s -> %s", name, path)
+    if sorted((entry.to_dict() for entry in entries), key=lambda item: item["path"]) != previous:
+        store.replace_all(sorted(entries, key=lambda entry: entry.last_opened, reverse=True))
     return added

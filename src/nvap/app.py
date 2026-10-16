@@ -288,6 +288,8 @@ def main() -> int:
     from nvap.ui.theme import DARK_THEME_QSS
 
     app = QApplication([])
+    from nvap.ui.icons import icon
+    app.setWindowIcon(icon("logo", 64, "#c3d5b9"))
     app.setStyleSheet(DARK_THEME_QSS)
     splash_pixmap = build_loading_pixmap(
         detail=(

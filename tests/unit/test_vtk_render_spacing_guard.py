@@ -5,12 +5,30 @@ import numpy as np
 from nvap.analysis.microglia_analysis import _offset_shift_zyx
 from nvap.config.types import RenderConfig, VoxelSpacing
 from nvap.render.vtk_scene import (
+    VTKScene,
     _cubic_render_spacing,
     _downsample_volume_for_render,
     _recommended_sample_distance,
     _render_downsample_factors,
     _snap_offset_to_voxel,
 )
+
+
+def test_red_surface_stays_on_native_grid_on_upload_and_fast_update(qtbot, monkeypatch) -> None:
+    scene = VTKScene()
+    qtbot.addWidget(scene.widget())
+    monkeypatch.setattr(scene, "render", lambda: None)
+    spacing = VoxelSpacing(x_um=0.131531, y_um=0.131531, z_um=0.4)
+    volume = np.zeros((5, 16, 16), dtype=np.float32)
+    volume[:, 5:10, 5:10] = 0.9
+
+    for data in (volume, volume * 0.9):
+        scene.set_channel_data("red", data, spacing)
+        actor = scene._actors["red"]
+        assert actor.resample is None
+        assert actor.image.GetDimensions() == (16, 16, 5)
+        assert scene._spacing["red"] == spacing
+        assert scene._surface_input(actor) is actor.image
 
 
 def test_cubic_render_spacing_skips_xy_upsample_when_z_is_finer() -> None:

@@ -659,7 +659,9 @@ class VTKScene:
             )
         voxel_count = int(np.prod(np.asarray(volume.shape, dtype=np.int64)))
         surface_allowed = voxel_count <= _SURFACE_PIPELINE_MAX_VOXELS
-        render_spacing = _cubic_render_spacing(volume.shape, spacing)
+        # Red connectivity is measured/cleaned on this grid. Keep the surface
+        # on it too: interpolating before thresholding creates detached dots.
+        render_spacing = spacing if channel == "red" else _cubic_render_spacing(volume.shape, spacing)
         needs_resample = not _same_spacing(render_spacing, spacing)
         logger.info(
             "VTK set_channel_data: channel=%s %s input_spacing=(%.4f, %.4f, %.4f) "

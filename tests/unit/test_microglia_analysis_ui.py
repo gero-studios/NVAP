@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QScrollArea
 
@@ -85,8 +86,8 @@ def test_render_trim_defaults_and_updates(qtbot) -> None:
     assert cfg.opacity_green == 0.40
     assert cfg.opacity_red == 0.80
     assert cfg.display_z_scale == 0.70
-    assert cfg.trim_first_slices == 0
-    assert cfg.trim_last_slices == 0
+    assert cfg.trim_first_slices == 10
+    assert cfg.trim_last_slices == 10
     assert panel.microglia_branch_sensitivity.isHidden()
 
     panel.trim_first_slices.setValue(7)
@@ -102,6 +103,55 @@ def test_main_window_render_trim_zeroes_requested_slices() -> None:
     assert np.all(trimmed[0] == 0.0)
     assert np.all(trimmed[1:3] == 1.0)
     assert np.all(trimmed[3:] == 0.0)
+
+
+def test_red_scene_upload_uses_native_cleaned_grid_and_trim(qtbot, monkeypatch) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    native = _sample_dataset()
+    native.red.data[:] = 0.9
+    visual = replace(native, red=ChannelVolume(
+        "red", np.ones((6, 8, 8), dtype=np.float32), list(range(6)),
+        VoxelSpacing(x_um=1.0, y_um=1.0, z_um=0.5),
+    ))
+    window.processed_dataset = native
+    window.visual_dataset = visual
+    window.current_render = replace(window.current_render, trim_first_slices=1, trim_last_slices=1)
+    uploads = {}
+    monkeypatch.setattr(window, "_current_green_volume_for_view", lambda: native.green.data)
+    monkeypatch.setattr(window.scene, "set_channel_component_coloring", lambda *a, **kw: None)
+    monkeypatch.setattr(window.scene, "set_channel_data", lambda **kw: uploads.update({kw["channel"]: kw}))
+
+    window._push_scene_channels()
+
+    red = uploads["red"]
+    assert red["volume"].shape == native.red.data.shape
+    assert not np.any(red["volume"][[0, -1]])
+    np.testing.assert_array_equal(red["volume"][1], native.red.data[1])
+    assert red["spacing"] == window._display_spacing(native.red.spacing)
+
+
+@pytest.mark.parametrize("action", [
+    "_on_wipe_vasculature_blobs_requested", "_on_wipe_specks_requested", "_run_auto_load_pipeline",
+])
+def test_red_wipe_actions_apply_native_slice_trim(qtbot, monkeypatch, action) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    native = _sample_dataset()
+    native.red.data[:] = 0.9  # 192 voxels overall; only 64 in the retained slice.
+    window.processed_dataset = native
+    window.current_render = replace(window.current_render, trim_first_slices=1, trim_last_slices=1)
+    window.controls.vascular_blob_max_voxels.setValue(128)
+    window.controls.auto_enhance_on_load.setChecked(False)
+    tasks = {}
+    monkeypatch.setattr(window, "_start_background_task", lambda **kw: tasks.update(kw))
+    monkeypatch.setattr(window, "_publish_busy_progress", lambda **kw: None)
+
+    getattr(window, action)()
+    result = tasks["fn"]()
+
+    assert not np.any(result.red.data[1])
+    np.testing.assert_array_equal(result.red.data[[0, 2]], native.red.data[[0, 2]])
 
 
 def test_reprocess_button_emits_signal(qtbot) -> None:

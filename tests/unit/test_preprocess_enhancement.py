@@ -69,6 +69,46 @@ def test_wipe_vasculature_blobs_keeps_elongated_fragments_by_default() -> None:
     assert np.array_equal(out[1, 60, 10:106], vol[1, 60, 10:106])
 
 
+@pytest.mark.parametrize("trim_first, trim_last, bridge_z, dot_z", [(1, 0, 0, 1), (0, 1, 5, 4)])
+def test_vascular_wipe_ignores_connections_through_trimmed_slices(
+    trim_first, trim_last, bridge_z, dot_z,
+) -> None:
+    vol = np.zeros((6, 40, 40), dtype=np.float32)
+    vol[:, 20:30, 20:30] = 0.9
+    vol[bridge_z, 5:30, 5:30] = 0.9
+    vol[dot_z, 5, 5] = 0.9
+
+    out = wipe_vasculature_blobs(
+        vol, threshold=0.4, max_voxels=128,
+        trim_first_slices=trim_first, trim_last_slices=trim_last,
+    )
+
+    assert out[dot_z, 5, 5] == 0
+    np.testing.assert_array_equal(out[bridge_z], vol[bridge_z])
+    np.testing.assert_array_equal(out[:, 20:30, 20:30], vol[:, 20:30, 20:30])
+    assert vol[dot_z, 5, 5] > 0  # The source is not modified.
+
+
+def test_vascular_wipe_does_not_protect_corner_touching_dots() -> None:
+    vol = np.zeros((20, 20, 20), dtype=np.float32)
+    vol[6:16, 6:16, 6:16] = 0.9
+    vol[5, 5, 5] = 0.9  # Only touches a vessel corner, not a continuous surface.
+
+    out = wipe_vasculature_blobs(vol, threshold=0.4, max_voxels=128)
+
+    assert out[5, 5, 5] == 0
+    np.testing.assert_array_equal(out[6:16, 6:16, 6:16], vol[6:16, 6:16, 6:16])
+
+
+def test_vascular_wipe_with_no_retained_slices_leaves_source_unchanged() -> None:
+    vol = np.ones((3, 8, 8), dtype=np.float32)
+    out = wipe_vasculature_blobs(
+        vol, threshold=0.4, max_voxels=8000,
+        trim_first_slices=10, trim_last_slices=10,
+    )
+    np.testing.assert_array_equal(out, vol)
+
+
 def test_vasculature_enhancement_reduces_uniform_background_and_keeps_vessel() -> None:
     arr = np.full((3, 64, 64), 0.20, dtype=np.float32)
     arr[:, 32, 8:56] = 0.90

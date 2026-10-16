@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
+from nvap.ui.icons import icon_pixmap
 
 LOADING_BG = "#07090c"
 LOADING_SURFACE = "#0b0e12"
@@ -36,7 +37,8 @@ def build_loading_pixmap(
     title_font.setWeight(QFont.Weight.Bold)
     painter.setFont(title_font)
     painter.setPen(QColor(LOADING_ACCENT))
-    painter.drawText(QRect(28, 28, 364, 28), Qt.AlignmentFlag.AlignLeft, title)
+    painter.drawPixmap(28, 24, icon_pixmap("logo", 36, "#c3d5b9"))
+    painter.drawText(QRect(78, 28, 314, 28), Qt.AlignmentFlag.AlignLeft, title)
 
     body_font = QFont("Aptos")
     body_font.setPointSize(9)

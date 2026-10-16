@@ -34,6 +34,7 @@ class ProjectEntry:
     status: str = "Ready"
     pinned: bool = False
     tags: list[str] = field(default_factory=list)
+    sample_id: str | None = None
 
     @property
     def last_opened(self) -> datetime:
@@ -62,6 +63,7 @@ class ProjectEntry:
             status=str(data.get("status", "Ready")),
             pinned=bool(data.get("pinned", False)),
             tags=list(data.get("tags") or []),
+            sample_id=str(data["sample_id"]) if data.get("sample_id") else None,
         )
 
 
@@ -72,6 +74,10 @@ class RecentProjectsStore:
         self._path = path or _store_path()
         self._entries: list[ProjectEntry] = []
         self._load()
+
+    @property
+    def data_dir(self) -> Path:
+        return self._path.parent
 
     # ── persistence ────────────────────────────────────────────────────
     def _load(self) -> None:
@@ -165,6 +171,20 @@ class RecentProjectsStore:
         if entry is None:
             return
         entry.pinned = bool(pinned)
+        self._save()
+
+    def relocate(self, old_path: str | os.PathLike, new_path: str | os.PathLike) -> None:
+        """Update a user-selected location while preserving its saved history."""
+        entry = self.find(old_path)
+        if entry is None:
+            return
+        target = str(Path(new_path).resolve())
+        duplicate = self.find(target)
+        if duplicate is not None and duplicate is not entry:
+            entry.pinned = entry.pinned or duplicate.pinned
+            entry.tags = list(dict.fromkeys(entry.tags + duplicate.tags))
+            self._entries = [item for item in self._entries if item is not duplicate]
+        entry.path = target
         self._save()
 
     def clear(self) -> None:

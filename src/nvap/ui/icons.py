@@ -12,7 +12,7 @@ Usage:
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QByteArray, QSize, Qt
+from PySide6.QtCore import QByteArray, QRectF, QSize, Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 
@@ -83,7 +83,7 @@ _ICONS: dict[str, str] = {
     "external-link": '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>',
 
     # Logo mark – simple geometric brand mark
-    "logo": '<circle cx="12" cy="12" r="10" stroke-width="1.5"/><path d="M7 8v8M17 8v8M7 8l10 8" stroke-width="2"/>',
+    "logo": '<path d="M2 18V6a2 2 0 0 1 3.5-1.3L18 20a1.6 1.6 0 0 1-2.5 2L5 9v9Z"/><path d="m16 15 5-9h3l-6 12Z"/>',
 }
 
 
@@ -100,7 +100,13 @@ def _render_pixmap(name: str, size: int, color: str, dpr: float = 2.0) -> QPixma
     if inner is None:
         # Unknown icon – render a fallback square so missing names are visible.
         inner = '<rect x="4" y="4" width="16" height="16" rx="2"/>'
-    svg_bytes = _wrap_svg(inner, color)
+    if name == "logo":
+        svg_bytes = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 26 26" '
+            f'fill="{color}"><g transform="translate(0 0)">{inner}</g></svg>'
+        ).encode("utf-8")
+    else:
+        svg_bytes = _wrap_svg(inner, color)
     renderer = QSvgRenderer(QByteArray(svg_bytes))
     px = QPixmap(int(size * dpr), int(size * dpr))
     px.setDevicePixelRatio(dpr)
@@ -108,7 +114,7 @@ def _render_pixmap(name: str, size: int, color: str, dpr: float = 2.0) -> QPixma
     painter = QPainter(px)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-    renderer.render(painter)
+    renderer.render(painter, QRectF(0, 0, size, size))
     painter.end()
     return px
 
