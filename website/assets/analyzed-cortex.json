@@ -1,0 +1,100 @@
+{
+  "sample": "7015-4 cortex",
+  "cell_count": 11,
+  "selected_cell": 9,
+  "spacing_um": {
+    "x_um": 0.1315305679563492,
+    "y_um": 0.1315305679563492,
+    "z_um": 0.39999999999999997
+  },
+  "source_shape_zyx": [
+    65,
+    1024,
+    1024
+  ],
+  "source_sha256": "58be4bc4ac9500b645a9192e5ca0242a5873fa4e02a17c1e5a1fe9adbb5c6d4d",
+  "analysis_population": "retained segmented cell labels intersected with green intensity >= selected threshold",
+  "browser_mesh": "Surface extracted on native grid; reduced triangles for display only. No measurements recomputed.",
+  "parts": [
+    {
+      "id": 0,
+      "triangles": 65000,
+      "voxel_count": 1719354
+    },
+    {
+      "id": 1,
+      "triangles": 9499,
+      "voxel_count": 211213
+    },
+    {
+      "id": 2,
+      "triangles": 9499,
+      "voxel_count": 176768
+    },
+    {
+      "id": 3,
+      "triangles": 9500,
+      "voxel_count": 152211
+    },
+    {
+      "id": 4,
+      "triangles": 9499,
+      "voxel_count": 130075
+    },
+    {
+      "id": 5,
+      "triangles": 9500,
+      "voxel_count": 117907
+    },
+    {
+      "id": 6,
+      "triangles": 9500,
+      "voxel_count": 103237
+    },
+    {
+      "id": 7,
+      "triangles": 9499,
+      "voxel_count": 57303
+    },
+    {
+      "id": 8,
+      "triangles": 9500,
+      "voxel_count": 52943
+    },
+    {
+      "id": 9,
+      "triangles": 9499,
+      "voxel_count": 48552
+    },
+    {
+      "id": 10,
+      "triangles": 9500,
+      "voxel_count": 29888
+    },
+    {
+      "id": 11,
+      "triangles": 9500,
+      "voxel_count": 16566
+    }
+  ],
+  "vertex_count": 84992,
+  "index_count": 508485,
+  "analysis_export_date": "2026-10-01",
+  "current_code_check": {
+    "date": "2026-10-05",
+    "method": "MainWindow._compute_microglia_components_from_params on saved cleaned volume",
+    "exact_voxel_match": true,
+    "different_voxels": 0,
+    "live_gui_session": false
+  },
+  "selected_component_review": {
+    "id": 9,
+    "extent_xyz_um": [
+      29.594377790178573,
+      39.59070095486111,
+      21.2
+    ],
+    "touches_image_boundary": true,
+    "single_cell_validated": false
+  }
+}

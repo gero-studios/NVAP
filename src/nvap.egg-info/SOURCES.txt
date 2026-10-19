@@ -49,6 +49,7 @@ src/nvap/ui/control_panel.py
 src/nvap/ui/design.py
 src/nvap/ui/home_page.py
 src/nvap/ui/icons.py
+src/nvap/ui/landing_scene.py
 src/nvap/ui/loading.py
 src/nvap/ui/main_window.py
 src/nvap/ui/metrics_panel.py
