@@ -558,10 +558,14 @@ def test_run_microglia_analysis_button_opens_analytics(qtbot, monkeypatch) -> No
     assert refresh_calls == ["analysis"]
 
 
-def test_microglia_all_view_preserves_enhanced_intensity_volume(qtbot) -> None:
+@pytest.mark.parametrize("sparse_cache", [False, True])
+def test_microglia_views_use_component_ids_without_changing_intensities(qtbot, sparse_cache) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
     dataset = _multi_component_dataset()
+    original = dataset.green.data.copy()
+    if sparse_cache:
+        window._microglia_label_cache_max_bytes = 0
 
     window.processed_dataset = dataset
     window.visual_dataset = dataset
@@ -573,12 +577,67 @@ def test_microglia_all_view_preserves_enhanced_intensity_volume(qtbot) -> None:
     )
     window.controls.microglia_isolate.setChecked(True)
     window.controls.microglia_index.setValue(0)
-    window._ensure_microglia_components_current()
+    labels = np.zeros(original.shape, dtype=np.int32)
+    labels[2, 3:8, 3:8] = 1
+    labels[2, 15:21, 15:21] = 2
+    order = np.array([1, 2], dtype=np.int32)
+    window._cache_microglia_components(
+        labels, order, np.bincount(labels.ravel()), threshold=0.5,
+        branch_sensitivity=window.controls.current_microglia_branch_sensitivity(),
+        shape=labels.shape, selected_index=0,
+    )
 
     view = window._current_green_volume_for_view()
 
-    assert np.allclose(view, dataset.green.data)
+    expected = np.where(original >= 0.5, labels, 0)
+    np.testing.assert_array_equal(view, expected)
+    assert window._green_component_coloring_active is True
+    for index, component_id in enumerate(order, start=1):
+        window.controls.microglia_index.setValue(index)
+        isolated = window._current_green_volume_for_view()
+        np.testing.assert_array_equal(isolated, np.where(expected == component_id, expected, 0))
+        assert window._green_component_coloring_active is True
+
+    window.controls.microglia_isolate.setChecked(False)
+    np.testing.assert_array_equal(window._current_green_volume_for_view(), original)
     assert window._green_component_coloring_active is False
+    np.testing.assert_array_equal(dataset.green.data, original)
+
+
+@pytest.mark.parametrize("sparse_cache", [False, True])
+def test_microglia_tints_exclude_dim_segmentation_support_and_apply_trim(qtbot, monkeypatch, sparse_cache) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _multi_component_dataset()
+    dataset.green.data[2, 3, 3] = 0.2
+    window.processed_dataset = window.visual_dataset = dataset
+    if sparse_cache:
+        window._microglia_label_cache_max_bytes = 0
+    window.current_render = replace(
+        window.current_render, threshold_green=0.5, trim_first_slices=1, trim_last_slices=1,
+    )
+    window.controls.microglia_isolate.setChecked(True)
+    labels = np.zeros(dataset.green.data.shape, dtype=np.int32)
+    labels[:, 3:8, 3:8] = 1
+    labels[:, 15:21, 15:21] = 2
+    dataset.green.data[0, 3, 4] = 0.9
+    window._cache_microglia_components(
+        labels, np.array([1, 2], dtype=np.int32), np.bincount(labels.ravel()),
+        threshold=0.5, branch_sensitivity=window.controls.current_microglia_branch_sensitivity(),
+        shape=labels.shape, selected_index=0,
+    )
+    uploads = {}
+    modes = []
+    monkeypatch.setattr(window.scene, "set_channel_component_coloring", lambda *a, **kw: modes.append((a, kw)))
+    monkeypatch.setattr(window.scene, "set_channel_data", lambda **kw: uploads.update({kw["channel"]: kw["volume"]}))
+
+    window._push_scene_channels(green_only=True)
+
+    assert modes[-1] == (("green", True), {"label_count": 2})
+    expected = np.where(dataset.green.data >= 0.5, labels, 0)
+    expected[[0, -1]] = 0
+    np.testing.assert_array_equal(uploads["green"], expected)
+    assert uploads["green"][2, 3, 3] == 0
 
 
 def test_microglia_analysis_debug_overlay_builds_for_selected_cell(qtbot, monkeypatch) -> None:

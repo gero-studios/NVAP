@@ -202,6 +202,11 @@ Use the **Microglia Viewer** panel to inspect one green component at a time:
 1. Enable **View one microglia**.
 2. Select a **Cell** index to isolate that component in 3D.
 
+After **Run Segmentation**, **All** shows each detected component with its own
+tint in both volume and surface rendering. Isolating a cell keeps its tint.
+The current green threshold and slice trim still apply; the underlying
+enhanced intensities and analysis data are unchanged.
+
 Components are ranked by size (largest first) at the current green threshold.
 
 ### Automatic on load

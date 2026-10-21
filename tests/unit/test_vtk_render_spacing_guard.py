@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
+from dataclasses import replace
+from vtkmodules.util.numpy_support import vtk_to_numpy
 
 from nvap.analysis.microglia_analysis import _offset_shift_zyx
 from nvap.config.types import RenderConfig, VoxelSpacing
@@ -12,6 +14,61 @@ from nvap.render.vtk_scene import (
     _render_downsample_factors,
     _snap_offset_to_voxel,
 )
+
+
+def test_segmented_components_have_distinct_surface_and_volume_tints(qtbot, monkeypatch) -> None:
+    scene = VTKScene()
+    qtbot.addWidget(scene.widget())
+    monkeypatch.setattr(scene, "render", lambda: None)
+    labels = np.zeros((6, 8, 10), dtype=np.uint8)
+    # Touching cells must retain a boundary and separate cell scalars.
+    labels[1:5, 1:7, 1:5] = 1
+    labels[1:5, 1:7, 5:9] = 2
+    config = RenderConfig(show_iso_green=True, opacity_green=0.6)
+    scene.set_channel_component_coloring("green", True, label_count=2)
+    scene.set_channel_data("green", labels, VoxelSpacing(x_um=1, y_um=1, z_um=1))
+    scene.apply_render_config(config)
+
+    actor = scene._actors["green"]
+    mapper = actor.iso_actor.GetMapper()
+    mapper.Update()
+    mesh = mapper.GetInput()
+    assert actor.marching.IsA("vtkDiscreteMarchingCubes")
+    assert mapper.GetScalarVisibility()
+    cell_labels = vtk_to_numpy(mesh.GetCellData().GetScalars())
+    np.testing.assert_array_equal(np.unique(cell_labels), [1, 2])
+    # Each side of the shared boundary at x=4.5 belongs to a different label.
+    for component_id in (1, 2):
+        boundary_cells = [
+            mesh.GetCell(int(i)) for i in np.flatnonzero(cell_labels == component_id)
+            if np.allclose([mesh.GetCell(int(i)).GetPoints().GetPoint(j)[0] for j in range(3)], 4.5)
+        ]
+        assert boundary_cells
+    surface_colors = mapper.GetLookupTable()
+    colors = [surface_colors.GetColor(i) for i in (1, 2)]
+    assert not np.allclose(*colors)
+    for i, color in enumerate(colors, start=1):
+        np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(i), color)
+    assert actor.iso_actor.GetVisibility()
+    assert not actor.volume_actor.GetVisibility()
+    assert np.isclose(actor.iso_actor.GetProperty().GetOpacity(), 0.6)
+
+    scene.apply_render_config(replace(config, show_iso_green=False))
+    assert actor.volume_actor.GetVisibility()
+    assert not actor.iso_actor.GetVisibility()
+    assert actor.volume_property.GetInterpolationTypeAsString() == "Nearest Neighbor"
+    assert np.isclose(actor.volume_property.GetScalarOpacity().GetValue(1),
+                      actor.volume_property.GetScalarOpacity().GetValue(2))
+    # Reusing the same actor when selecting one cell preserves that cell's tint.
+    scene.set_channel_data("green", np.where(labels == 2, labels, 0), VoxelSpacing(x_um=1, y_um=1, z_um=1))
+    np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(2), colors[1])
+
+    # Returning to intensities must rebuild the continuous surface pipeline.
+    scene.set_channel_component_coloring("green", False)
+    scene.set_channel_data("green", (labels > 0).astype(np.float32), VoxelSpacing(x_um=1, y_um=1, z_um=1))
+    scene.apply_render_config(config)
+    assert not actor.marching.IsA("vtkDiscreteMarchingCubes")
+    assert not actor.iso_actor.GetMapper().GetScalarVisibility()
 
 
 def test_red_surface_stays_on_native_grid_on_upload_and_fast_update(qtbot, monkeypatch) -> None:

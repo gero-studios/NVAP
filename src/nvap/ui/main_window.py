@@ -93,7 +93,6 @@ from nvap.pipeline import (
 from nvap.analysis.microglia_components import (
     compute_component_labels,
     filter_components_by_preferred_voxel_floor,
-    isolate_component,
 )
 from nvap.preprocess.enhancement import (
     enhance_microglia_background,
@@ -1931,36 +1930,48 @@ class MainWindow(QMainWindow):
         if self._green_component_sizes is None:
             return base
         count = int(len(self._green_component_order))
+        if count == 0:
+            return base
         if selected_index <= 0:
             self.controls.set_microglia_component_summary(
                 count=count,
                 selected_index=0,
                 selected_voxels=0,
             )
-            # Preserve the enhanced intensity volume in the "All" view.
-            # Rendering label IDs here makes the segmented result look like it
-            # lost thresholding / cleanup even though the underlying data did not.
+        elif selected_index > count:
             return base
-        if selected_index > int(len(self._green_component_order)):
-            return base
-        component_id = int(self._green_component_order[selected_index - 1])
-        selected_voxels = int(self._green_component_sizes[component_id])
-        self.controls.set_microglia_component_summary(
-            count=int(len(self._green_component_order)),
-            selected_index=selected_index,
-            selected_voxels=selected_voxels,
-        )
-        if self._green_component_labels is not None:
-            return isolate_component(base, self._green_component_labels, component_id)
+        else:
+            component_id = int(self._green_component_order[selected_index - 1])
+            self.controls.set_microglia_component_summary(
+                count=count,
+                selected_index=selected_index,
+                selected_voxels=int(self._green_component_sizes[component_id]),
+            )
 
-        sparse = self._green_component_sparse.get(component_id)
-        if sparse is None:
-            return base
-        comp_slice, local_mask = sparse
-        out = np.zeros_like(base, dtype=np.float32)
-        out_region = out[comp_slice]
-        base_region = base[comp_slice]
-        out_region[local_mask] = base_region[local_mask]
+        # Use component IDs only for display. Keep the enhanced data untouched
+        # and retain its threshold so dim watershed support does not become an
+        # opaque halo. Keep original IDs when isolating to preserve each tint.
+        component_id = int(self._green_component_order[selected_index - 1]) if selected_index > 0 else 0
+        threshold = float(self.current_render.threshold_green)
+        if self._green_component_labels is not None:
+            labels = self._green_component_labels
+            out = np.zeros_like(labels)
+            visible = base >= threshold
+            if component_id > 0:
+                visible &= labels == component_id
+            np.copyto(out, labels, where=visible)
+        else:
+            dtype = np.uint8 if count <= np.iinfo(np.uint8).max else np.uint16
+            out = np.zeros(base.shape, dtype=dtype)
+            component_ids = [component_id] if component_id > 0 else self._green_component_order
+            for label_id in component_ids:
+                sparse = self._green_component_sparse.get(int(label_id))
+                if sparse is None:
+                    continue
+                comp_slice, local_mask = sparse
+                visible = local_mask & (base[comp_slice] >= threshold)
+                out[comp_slice][visible] = int(label_id)
+        self._green_component_coloring_active = True
         return out
 
     def _push_scene_channels(self, *, green_only: bool = False) -> None:

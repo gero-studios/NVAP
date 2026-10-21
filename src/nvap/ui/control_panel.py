@@ -465,6 +465,10 @@ class ControlPanel(QWidget):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self.microglia_isolate = QCheckBox("View one microglia")
+        self.microglia_isolate.setToolTip(
+            "Show segmented components with distinct tints. Choose All to view "
+            "them together, or a Cell index to isolate one with the same tint."
+        )
         self.microglia_isolate.toggled.connect(self._on_microglia_setting_changed)
         form.addRow(self.microglia_isolate)
 

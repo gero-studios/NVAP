@@ -13,6 +13,7 @@ from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkImageData, vtkPiecewiseFunction, vtkPolyData
 from vtkmodules.vtkFiltersCore import vtkMarchingCubes, vtkTubeFilter
+from vtkmodules.vtkFiltersGeneral import vtkDiscreteMarchingCubes
 from vtkmodules.vtkFiltersSources import vtkSphereSource
 from vtkmodules.vtkImagingCore import vtkImageResample
 from vtkmodules.vtkIOImage import vtkPNGWriter
@@ -916,22 +917,31 @@ class VTKScene:
     ) -> bool:
         if not actor.surface_allowed:
             return False
-        if actor.marching is None:
-            marching = vtkMarchingCubes()
+        label_count = int(self._component_coloring.get(channel, 0))
+        label_mode = label_count > 0
+        if actor.marching is None or bool(actor.marching.IsA("vtkDiscreteMarchingCubes")) != label_mode:
+            marching = vtkDiscreteMarchingCubes() if label_mode else vtkMarchingCubes()
             self._set_pipeline_input(marching, self._surface_input(actor))
-            marching.SetValue(0, iso_value)
             marching.ComputeNormalsOn()
             marching.ComputeGradientsOff()
 
             iso_mapper = vtkPolyDataMapper()
             iso_mapper.SetInputConnection(marching.GetOutputPort())
-            iso_mapper.ScalarVisibilityOff()
             actor.iso_actor.SetMapper(iso_mapper)
             actor.marching = marching
             logger.info("VTK isosurface pipeline created: channel=%s", channel)
-            return True
-
-        actor.marching.SetValue(0, iso_value)
+        iso_mapper = actor.iso_actor.GetMapper()
+        if label_mode:
+            # Extract a separate boundary for every label, including touching
+            # cells. Ordinary marching cubes at 0.5 merges them into one object.
+            actor.marching.GenerateValues(label_count, 1, label_count)
+            iso_mapper.SetScalarModeToUseCellData()
+            iso_mapper.SetLookupTable(self._component_color_transfer_function(label_count))
+            iso_mapper.SetScalarRange(1, label_count)
+            iso_mapper.ScalarVisibilityOn()
+        else:
+            actor.marching.SetValue(0, iso_value)
+            iso_mapper.ScalarVisibilityOff()
         return True
 
     def apply_render_config(self, config: RenderConfig) -> None:
@@ -1015,7 +1025,7 @@ class VTKScene:
             scalar_opacity.AddPoint(0.0, 0.0)
             scalar_opacity.AddPoint(0.5, 0.0)
             scalar_opacity.AddPoint(1.0, opacity * 0.74)
-            scalar_opacity.AddPoint(float(label_count) + 0.5, opacity * 0.88)
+            scalar_opacity.AddPoint(float(label_count) + 0.5, opacity * 0.74)
 
             gradient_opacity = vtkPiecewiseFunction()
             gradient_opacity.AddPoint(0.0, 1.0)
@@ -1025,12 +1035,14 @@ class VTKScene:
             actor.volume_property.SetColor(color_tf)
             actor.volume_property.SetScalarOpacity(scalar_opacity)
             actor.volume_property.SetGradientOpacity(0, gradient_opacity)
+            actor.iso_actor.GetProperty().SetOpacity(opacity)
             # Surface mode avoids the slab-like label volume when inspecting 3D components.
             surface_visible = bool(visible and show_iso and self._ensure_surface_pipeline(channel, actor, 0.5))
             actor.volume_actor.SetVisibility(1 if (visible and not surface_visible) else 0)
             actor.iso_actor.SetVisibility(1 if surface_visible else 0)
             return
 
+        actor.iso_actor.GetProperty().SetOpacity(0.85)
         color_tf = vtkColorTransferFunction()
         color_tf.AddRGBPoint(0.0, 0.0, 0.0, 0.0)
         color_tf.AddRGBPoint(1.0e-6, rgb[0], rgb[1], rgb[2])
