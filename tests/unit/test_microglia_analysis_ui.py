@@ -598,6 +598,7 @@ def test_microglia_views_use_component_ids_without_changing_intensities(qtbot, s
     assert window._green_component_unassigned_label == 3
     assert window.controls.microglia_index.maximum() == 2
     assert "Unassigned signal stays green" in window.controls.microglia_info.text()
+    assert "98.4% of visible signal assigned" in window.controls.microglia_info.text()
     assert window._green_component_coloring_active is True
     for index, component_id in enumerate(order, start=1):
         window.controls.microglia_index.setValue(index)

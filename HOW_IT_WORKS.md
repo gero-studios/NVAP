@@ -66,8 +66,14 @@ driven by the UI in `src/nvap/ui/main_window.py`):
    volume is separated into individual microglia. Soma-like blobs are detected
    from the Euclidean distance transform (thick interior regions), used as seeds,
    and grown outward so each connected cell — including touching cells — gets its
-   own label. Components are ranked largest-first; that ranking is the `Cell`
-   index in the viewer.
+   own label. Unseeded regions are checked for soma-sized interiors at the active
+   threshold. A second growth pass follows fainter measured signal to recover
+   disconnected branches when they have one cell owner; these weak paths establish
+   ownership without adding below-mask voxels to the measured cell. Ambiguous
+   fragments remain unassigned and visible in green. Smaller accepted cells are
+   preserved. Components are ranked by size (unusually large objects may follow
+   typical cells); that ranking is the `Cell` index in the viewer. The viewer also
+   reports assignment coverage within the current slice trim.
 
 5. **Render and analyse.** The renderer (`render/vtk_scene.py`) and the analysis
    modules (`analysis/`) both consume the processed dataset and the active

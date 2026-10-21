@@ -1276,6 +1276,126 @@ def _seed_labels_from_soma_candidates(
     return np.asarray(seed_labels, dtype=np.int32)
 
 
+def _recover_unseeded_cell_bodies(
+    labels: np.ndarray,
+    candidate: np.ndarray,
+    working: np.ndarray,
+    visible: np.ndarray,
+    *,
+    threshold: float,
+    min_voxels: int,
+    max_components: int,
+    spacing_zyx: np.ndarray,
+    seed_labels: np.ndarray | None = None,
+) -> np.ndarray:
+    """Add soma markers only in signal regions no existing cell can reach."""
+    orphan_labels, _ = ndi.label(candidate & (labels == 0), structure=_CUBIC_STRUCTURE)
+    sizes = np.bincount(orphan_labels.ravel())
+    visible_sizes = np.bincount(orphan_labels[visible].ravel(), minlength=len(sizes))
+    objects = ndi.find_objects(orphan_labels)
+    next_id = int(labels.max())
+    out = labels
+    recovered = 0
+    for orphan_id, bounds in enumerate(objects, start=1):
+        if bounds is None or sizes[orphan_id] < min_voxels or visible_sizes[orphan_id] < 2:
+            continue
+        if next_id >= max_components:
+            break
+        local_orphan = orphan_labels[bounds] == orphan_id
+        values = working[bounds]
+        # Assess each missed body's thickness at the actual visible cutoff,
+        # instead of a bright neighbour's global intensity quantile.
+        body = local_orphan & (values >= max(1.0e-6, threshold))
+        if not np.any(body):
+            continue
+        if int(np.prod(np.asarray(body.shape) + 2)) > _MAX_SOMA_EDT_VOXELS:
+            logger.info("Microglia soma recovery: skipped oversized region shape=%s.", body.shape)
+            continue
+        distance = ndi.distance_transform_edt(
+            np.pad(body, 1, mode="constant"), sampling=tuple(spacing_zyx),
+        )[1:-1, 1:-1, 1:-1]
+        cores, n_cores = ndi.label(
+            body & (distance >= _MIN_CREDIBLE_SOMA_RADIUS_UM), structure=_CUBIC_STRUCTURE,
+        )
+        if n_cores == 0:
+            continue
+        positions = _max_positions_for_labels(distance, cores, list(range(1, n_cores + 1)))
+        positions = _merge_close_soma_marker_positions(
+            positions, values, low_floor=0.0, high_t=threshold,
+            branch_sensitivity=1.0, spacing_zyx=spacing_zyx,
+        )
+        markers = np.zeros(body.shape, dtype=np.int32)
+        for position in positions[:max_components - next_id]:
+            next_id += 1
+            markers[position] = next_id
+            if seed_labels is not None:
+                global_position = tuple(position[i] + int(bounds[i].start or 0) for i in range(3))
+                seed_labels[global_position] = next_id
+            recovered += 1
+        local_labels = _watershed(-values, markers=markers, mask=local_orphan, connectivity=_CUBIC_STRUCTURE)
+        if out is labels:
+            out = labels.copy()
+        region = out[bounds]
+        region[local_orphan] = local_labels[local_orphan]
+    if recovered:
+        logger.info("Microglia recovery: added %d soma markers in previously unseeded signal regions.", recovered)
+    return out
+
+
+def _recover_faint_connected_branches(
+    labels: np.ndarray,
+    candidate: np.ndarray,
+    working: np.ndarray,
+    visible: np.ndarray,
+    *,
+    weak_floor: float,
+    min_voxels: int,
+) -> np.ndarray:
+    """Recover signal through faint paths when a fragment has one cell owner.
+
+    Weak paths establish ownership only: they are never added to the returned
+    mask. Ambiguous fragments and regions without a signal path stay unassigned.
+    """
+    if working.size > _MAX_DISTANCE_COMPONENT_LABEL_VOXELS:
+        logger.info("Microglia faint-path recovery: skipped oversized volume shape=%s.", working.shape)
+        return labels
+    orphans, n_orphans = ndi.label(candidate & (labels == 0), structure=_CUBIC_STRUCTURE)
+    if n_orphans == 0:
+        return labels
+    sizes = np.bincount(orphans.ravel())
+    visible_sizes = np.bincount(orphans[visible].ravel(), minlength=len(sizes))
+    eligible = (sizes >= min_voxels) & (visible_sizes >= 2)
+    eligible[0] = False
+    if not np.any(eligible):
+        return labels
+    weak_mask = (np.isfinite(working) & (working >= weak_floor)) | candidate
+    grown = _watershed(-working, markers=labels, mask=weak_mask, connectivity=_CUBIC_STRUCTURE)
+    out = labels
+    recovered_voxels = 0
+    recovered_parts = 0
+    for orphan_id, bounds in enumerate(ndi.find_objects(orphans), start=1):
+        if bounds is None or not eligible[orphan_id]:
+            continue
+        local = orphans[bounds] == orphan_id
+        owners = np.unique(grown[bounds][local])
+        owners = owners[owners > 0]
+        if len(owners) != 1:
+            continue
+        # Unreachable portions remain zero even if another part found an owner.
+        recovered_mask = local & (grown[bounds] > 0)
+        if out is labels:
+            out = labels.copy()
+        out[bounds][recovered_mask] = owners[0]
+        recovered_voxels += int(np.count_nonzero(recovered_mask & visible[bounds]))
+        recovered_parts += 1
+    if recovered_parts:
+        logger.info(
+            "Microglia recovery: assigned %d previously unassigned visible voxels in %d fragments through faint signal paths (floor=%.5f).",
+            recovered_voxels, recovered_parts, weak_floor,
+        )
+    return out
+
+
 def compute_component_labels(
     volume: np.ndarray,
     threshold: float,
@@ -1491,10 +1611,23 @@ def compute_component_labels(
             -working_roi,
             markers=seed_labels,
             mask=candidate,
-            connectivity=structure,
+            connectivity=_CUBIC_STRUCTURE,
         ),
         dtype=np.int32,
     )
+    raw_labels = _recover_unseeded_cell_bodies(
+        raw_labels, candidate, working_roi, visible_roi, threshold=t,
+        min_voxels=min_keep, max_components=max_keep, spacing_zyx=spacing_zyx,
+        seed_labels=seed_labels,
+    )
+    # The growth floor is raised in dense fields. Permit weaker real signal to
+    # reconnect fragments, while staying above the measured background level.
+    weak_floor = float(max(0.02, t * 0.10, positive_q75 * 1.05))
+    if weak_floor < low_t:
+        raw_labels = _recover_faint_connected_branches(
+            raw_labels, candidate, working_roi, visible_roi,
+            weak_floor=weak_floor, min_voxels=min_keep,
+        )
     labeled_voxels = int(np.count_nonzero(raw_labels))
     label_count = int(np.max(raw_labels)) if labeled_voxels > 0 else 0
     if labeled_voxels > int(_MAX_BRANCH_REASSIGN_VOXELS) or label_count > int(_MAX_BRANCH_REASSIGN_LABELS):
@@ -1619,7 +1752,11 @@ def filter_components_by_preferred_voxel_floor(
     *,
     preferred_min_voxels: int = PREFERRED_VISIBLE_MICROGLIA_MIN_VOXELS,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Drop small components when clearly visible larger components already exist."""
+    """Rank accepted cells without dropping smaller cells beside larger ones.
+
+    ``preferred_min_voxels`` is a ranking reference only. Biological size and
+    sampling differ between cells/datasets; it must not erase accepted labels.
+    """
     lbl = np.asarray(labels, dtype=np.int32)
     ordered = np.asarray(order, dtype=np.int32)
     comp_sizes = np.asarray(sizes, dtype=np.int64)
@@ -1639,7 +1776,7 @@ def filter_components_by_preferred_voxel_floor(
     if not np.any(keep_mask):
         return lbl, ordered, comp_sizes
 
-    keep_ids = ordered[keep_mask]
+    keep_ids = ordered.copy()
     if keep_ids.size >= 8:
         keep_sizes = np.asarray(comp_sizes[keep_ids], dtype=np.float64)
         median_size = float(np.median(keep_sizes))

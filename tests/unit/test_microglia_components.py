@@ -811,7 +811,7 @@ def test_faint_bridge_branch_gets_single_soma_owner() -> None:
     assert len(bridge_ids) == 1
 
 
-def test_preferred_voxel_floor_drops_small_components_when_large_one_exists() -> None:
+def test_preferred_voxel_floor_preserves_valid_small_cells_beside_large_cells() -> None:
     labels = np.zeros((1, 4, 5), dtype=np.int32)
     labels[0, 0, 0:2] = 1
     labels[0, 1:4, 1:5] = 2
@@ -824,11 +824,130 @@ def test_preferred_voxel_floor_drops_small_components_when_large_one_exists() ->
         sizes,
     )
 
-    assert filtered_order.tolist() == [1]
+    assert filtered_order.tolist() == [1, 2]
     assert int(filtered_sizes[1]) == 18_000
-    assert int(np.max(filtered_labels)) == 1
-    assert int(filtered_labels[0, 0, 0]) == 0
+    assert int(filtered_sizes[2]) == 4_000
+    assert int(np.max(filtered_labels)) == 2
+    assert int(filtered_labels[0, 0, 0]) == 2
     assert int(filtered_labels[0, 2, 2]) == 1
+
+
+def test_recovery_finds_dim_soma_without_splitting_existing_bright_cell() -> None:
+    shape = (11, 32, 48)
+    zz, yy, xx = np.indices(shape)
+    bright = (zz - 5) ** 2 + (yy - 16) ** 2 + (xx - 10) ** 2 <= 4 ** 2
+    dim = (zz - 5) ** 2 + (yy - 16) ** 2 + (xx - 36) ** 2 <= 4 ** 2
+    working = np.zeros(shape, dtype=np.float32)
+    working[bright] = 0.95
+    working[dim] = 0.40
+    candidate = working > 0
+    labels = np.zeros(shape, dtype=np.int32)
+    labels[bright] = 1
+    seeds = np.zeros_like(labels)
+    seeds[5, 16, 10] = 1
+
+    recovered = microglia_components._recover_unseeded_cell_bodies(
+        labels, candidate, working, working >= 0.3, threshold=0.3,
+        min_voxels=20, max_components=16, spacing_zyx=np.array([0.5, 0.5, 0.5]),
+        seed_labels=seeds,
+    )
+
+    np.testing.assert_array_equal(recovered[bright], labels[bright])
+    assert np.all(recovered[dim] == 2)
+    assert np.count_nonzero(seeds == 2) >= 1  # New soma passes subsequent core-evidence filtering.
+    assert np.all(labels[dim] == 0)
+
+
+def test_dim_cell_recovered_by_pipeline_survives_final_quality_filters() -> None:
+    spacing = np.array([0.4, 0.25, 0.25])
+    zz, yy, xx = np.indices((17, 64, 96), dtype=np.float32)
+    bright = ((zz - 8) * spacing[0]) ** 2 + ((yy - 32) * spacing[1]) ** 2 + ((xx - 24) * spacing[2]) ** 2 <= 3.0 ** 2
+    dim = ((zz - 8) * spacing[0]) ** 2 + ((yy - 32) * spacing[1]) ** 2 + ((xx - 72) * spacing[2]) ** 2 <= 2.0 ** 2
+    volume = np.full(bright.shape, 0.01, dtype=np.float32)
+    volume[bright] = 1.0
+    volume[dim] = 0.4
+
+    labels, order, sizes = compute_component_labels(
+        volume, threshold=0.3, min_voxels=53, max_components=32,
+        smooth_sigma=(0.2, 0.45, 0.45), spacing=tuple(spacing),
+    )
+    labels, order, sizes = filter_components_by_preferred_voxel_floor(labels, order, sizes)
+
+    assert len(order) == 2
+    assert labels[8, 32, 24] > 0
+    assert labels[8, 32, 72] > 0
+    assert labels[8, 32, 24] != labels[8, 32, 72]
+    assert np.all(labels[dim] > 0)
+
+
+def test_recovery_does_not_promote_thin_terminal_bulbs_to_cells() -> None:
+    working = np.zeros((5, 12, 24), dtype=np.float32)
+    working[2, 6, 2:10] = 0.5
+    working[2, 6, 15:22] = 0.9
+    labels = np.zeros(working.shape, dtype=np.int32)
+    labels[2, 6, 2:10] = 1
+
+    recovered = microglia_components._recover_unseeded_cell_bodies(
+        labels, working > 0, working, working > 0,
+        threshold=0.3, min_voxels=4, max_components=16,
+        spacing_zyx=np.array([0.4, 0.2, 0.2]),
+    )
+
+    np.testing.assert_array_equal(recovered, labels)
+
+
+def test_faint_path_recovery_assigns_branch_without_painting_bridge_or_remote_signal() -> None:
+    working = np.zeros((3, 12, 30), dtype=np.float32)
+    working[1, 6, 2:8] = 0.8
+    working[1, 6, 8:15] = 0.08  # Faint, measured connection below the growth mask.
+    working[1, 6, 15:24] = 0.5
+    working[1, 2, 15:24] = 0.5  # No connection to a soma.
+    candidate = working >= 0.2
+    labels = np.zeros_like(working, dtype=np.int32)
+    labels[1, 6, 2:8] = 1
+
+    recovered = microglia_components._recover_faint_connected_branches(
+        labels, candidate, working, working >= 0.3, weak_floor=0.05, min_voxels=4,
+    )
+
+    assert np.all(recovered[1, 6, 15:24] == 1)
+    assert not np.any(recovered[1, 6, 8:15])
+    assert not np.any(recovered[1, 2, 15:24])
+    np.testing.assert_array_equal(recovered[labels > 0], labels[labels > 0])
+    assert not np.any((recovered > 0) & ~candidate)
+
+
+def test_faint_path_recovery_leaves_competing_cell_ownership_unassigned() -> None:
+    working = np.zeros((3, 12, 30), dtype=np.float32)
+    working[1, 6, 2:7] = 0.8
+    working[1, 6, 7:12] = 0.08
+    working[1, 6, 12:18] = 0.5
+    working[1, 6, 18:23] = 0.08
+    working[1, 6, 23:28] = 0.8
+    labels = np.zeros_like(working, dtype=np.int32)
+    labels[1, 6, 2:7] = 1
+    labels[1, 6, 23:28] = 2
+
+    recovered = microglia_components._recover_faint_connected_branches(
+        labels, working >= 0.2, working, working >= 0.3, weak_floor=0.05, min_voxels=4,
+    )
+
+    assert not np.any(recovered[1, 6, 12:18])
+    np.testing.assert_array_equal(recovered[labels > 0], labels[labels > 0])
+
+
+def test_faint_path_recovery_does_not_cross_background_haze() -> None:
+    working = np.full((3, 12, 30), 0.04, dtype=np.float32)
+    working[1, 6, 2:8] = 0.8
+    working[1, 6, 15:24] = 0.5
+    labels = np.zeros_like(working, dtype=np.int32)
+    labels[1, 6, 2:8] = 1
+
+    recovered = microglia_components._recover_faint_connected_branches(
+        labels, working >= 0.2, working, working >= 0.3, weak_floor=0.05, min_voxels=4,
+    )
+
+    np.testing.assert_array_equal(recovered, labels)
 
 
 def test_preferred_voxel_floor_preserves_small_components_when_no_large_one_exists() -> None:

@@ -206,6 +206,10 @@ After **Run Segmentation**, **All** shows each detected component with its own
 tint in both volume and surface rendering. Isolating a cell keeps its tint.
 Signal that has not been assigned to a detected cell stays visible in green
 in **All**; it is not counted as an additional cell.
+The viewer reports the percentage of visible signal assigned to cells.
+Segmentation checks unassigned regions for dimmer cell bodies and reconnects
+branches through faint measured signal paths. Smaller accepted cells are kept
+alongside larger cells. Fragments with competing cell owners remain unassigned.
 The current green threshold and slice trim still apply; the underlying
 enhanced intensities and analysis data are unchanged.
 

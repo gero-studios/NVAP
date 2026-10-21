@@ -1979,11 +1979,16 @@ class MainWindow(QMainWindow):
             unassigned = (out == 0) & (base >= threshold)
             if np.any(unassigned):
                 self._green_component_unassigned_label = count + 1
-                out[unassigned] = self._green_component_unassigned_label
+                trim_first = max(0, int(self.current_render.trim_first_slices))
+                trim_stop = max(trim_first, base.shape[0] - max(0, int(self.current_render.trim_last_slices)))
+                assigned_count = int(np.count_nonzero(out[trim_first:trim_stop]))
+                unassigned_count = int(np.count_nonzero(unassigned[trim_first:trim_stop]))
+                coverage = 100.0 * assigned_count / max(1, assigned_count + unassigned_count)
                 self.controls.microglia_info.setText(
-                    f"{count} components detected. Showing all green signal. "
+                    f"{count} components detected. {coverage:.1f}% of visible signal assigned. "
                     "Unassigned signal stays green."
                 )
+                out[unassigned] = self._green_component_unassigned_label
         self._green_component_coloring_active = True
         return out
 
