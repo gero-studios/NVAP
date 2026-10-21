@@ -563,6 +563,8 @@ def test_microglia_views_use_component_ids_without_changing_intensities(qtbot, s
     window = MainWindow()
     qtbot.addWidget(window)
     dataset = _multi_component_dataset()
+    dataset.green.data[2, 10, 10] = 0.9  # Visible signal segmentation did not assign.
+    dataset.green.data[2, 10, 11] = 0.2  # Dim signal stays excluded by threshold.
     original = dataset.green.data.copy()
     if sparse_cache:
         window._microglia_label_cache_max_bytes = 0
@@ -589,14 +591,20 @@ def test_microglia_views_use_component_ids_without_changing_intensities(qtbot, s
 
     view = window._current_green_volume_for_view()
 
-    expected = np.where(original >= 0.5, labels, 0)
+    expected = np.where(original >= 0.5, np.where(labels > 0, labels, 3), 0)
     np.testing.assert_array_equal(view, expected)
+    np.testing.assert_array_equal(view > 0, original >= 0.5)
+    assert view[2, 10, 10] == 3
+    assert window._green_component_unassigned_label == 3
+    assert window.controls.microglia_index.maximum() == 2
+    assert "Unassigned signal stays green" in window.controls.microglia_info.text()
     assert window._green_component_coloring_active is True
     for index, component_id in enumerate(order, start=1):
         window.controls.microglia_index.setValue(index)
         isolated = window._current_green_volume_for_view()
         np.testing.assert_array_equal(isolated, np.where(expected == component_id, expected, 0))
         assert window._green_component_coloring_active is True
+        assert window._green_component_unassigned_label == 0
 
     window.controls.microglia_isolate.setChecked(False)
     np.testing.assert_array_equal(window._current_green_volume_for_view(), original)
@@ -633,11 +641,60 @@ def test_microglia_tints_exclude_dim_segmentation_support_and_apply_trim(qtbot, 
 
     window._push_scene_channels(green_only=True)
 
-    assert modes[-1] == (("green", True), {"label_count": 2})
+    assert modes[-1] == (("green", True), {"label_count": 2, "unassigned_label": 0})
     expected = np.where(dataset.green.data >= 0.5, labels, 0)
     expected[[0, -1]] = 0
     np.testing.assert_array_equal(uploads["green"], expected)
     assert uploads["green"][2, 3, 3] == 0
+
+
+@pytest.mark.parametrize("sparse_cache", [False, True])
+def test_unassigned_display_label_does_not_overflow_uint8(qtbot, sparse_cache) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _multi_component_dataset()
+    dataset.green.data[:] = 0
+    dataset.green.data.ravel()[:256] = 0.9
+    window.processed_dataset = window.visual_dataset = dataset
+    window.current_render = replace(window.current_render, threshold_green=0.5)
+    window.controls.microglia_isolate.setChecked(True)
+    if sparse_cache:
+        window._microglia_label_cache_max_bytes = 0
+    labels = np.zeros(dataset.green.data.shape, dtype=np.int32)
+    labels.ravel()[:255] = np.arange(1, 256)
+    window._cache_microglia_components(
+        labels, np.arange(1, 256, dtype=np.int32), np.bincount(labels.ravel()),
+        threshold=0.5, branch_sensitivity=window.controls.current_microglia_branch_sensitivity(),
+        shape=labels.shape, selected_index=0,
+    )
+
+    view = window._current_green_volume_for_view()
+
+    assert view.dtype == np.uint16
+    assert view.ravel()[255] == 256
+    np.testing.assert_array_equal(view > 0, dataset.green.data >= 0.5)
+    np.testing.assert_array_equal(window._green_component_order, np.arange(1, 256))
+    np.testing.assert_array_equal(window._green_component_sizes, np.bincount(labels.ravel()))
+
+
+def test_unassigned_display_does_not_fill_background_at_zero_threshold(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    dataset = _multi_component_dataset()
+    window.processed_dataset = window.visual_dataset = dataset
+    window.current_render = replace(window.current_render, threshold_green=0.0)
+    window.controls.microglia_isolate.setChecked(True)
+    labels = np.zeros(dataset.green.data.shape, dtype=np.int32)
+    labels[2, 3:8, 3:8] = 1
+    window._cache_microglia_components(
+        labels, np.array([1], dtype=np.int32), np.bincount(labels.ravel()),
+        threshold=0.0, branch_sensitivity=window.controls.current_microglia_branch_sensitivity(),
+        shape=labels.shape, selected_index=0,
+    )
+
+    view = window._current_green_volume_for_view()
+
+    np.testing.assert_array_equal(view > 0, dataset.green.data > 0)
 
 
 def test_microglia_analysis_debug_overlay_builds_for_selected_cell(qtbot, monkeypatch) -> None:

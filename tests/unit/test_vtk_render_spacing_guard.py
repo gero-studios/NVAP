@@ -51,7 +51,7 @@ def test_segmented_components_have_distinct_surface_and_volume_tints(qtbot, monk
         np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(i), color)
     assert actor.iso_actor.GetVisibility()
     assert not actor.volume_actor.GetVisibility()
-    assert np.isclose(actor.iso_actor.GetProperty().GetOpacity(), 0.6)
+    assert np.isclose(actor.iso_actor.GetProperty().GetOpacity(), 0.85)
 
     scene.apply_render_config(replace(config, show_iso_green=False))
     assert actor.volume_actor.GetVisibility()
@@ -159,7 +159,7 @@ def test_downsample_volume_for_render_uses_max_pool_and_adjusts_spacing() -> Non
     assert np.isclose(reduced_spacing.z_um, 1.0)
 
 
-def test_downsample_volume_for_render_label_mode_uses_nearest_stride() -> None:
+def test_downsample_volume_for_render_preserves_label_foreground() -> None:
     volume = np.arange(2 * 4 * 4, dtype=np.uint16).reshape(2, 4, 4)
     spacing = VoxelSpacing(x_um=0.5, y_um=0.25, z_um=1.0)
 
@@ -171,7 +171,47 @@ def test_downsample_volume_for_render_label_mode_uses_nearest_stride() -> None:
     )
 
     assert factors == (1, 2, 2)
-    np.testing.assert_array_equal(reduced, volume[:, ::2, ::2])
+    expected = volume.reshape(2, 2, 2, 2, 2).max(axis=(2, 4))
+    np.testing.assert_array_equal(reduced, expected)
+
+
+def test_label_downsampling_keeps_thin_branches_between_sample_positions() -> None:
+    labels = np.zeros((2, 4, 4), dtype=np.uint16)
+    labels[:, 1, :] = 2
+    labels[:, 3, :] = 256
+
+    reduced, _spacing, _factors = _downsample_volume_for_render(
+        labels, VoxelSpacing(), label_mode=True, max_voxels=8,
+    )
+
+    assert np.all(reduced > 0)
+    np.testing.assert_array_equal(np.unique(reduced), [2, 256])
+
+
+def test_unassigned_microglia_signal_stays_green_in_both_render_modes(qtbot, monkeypatch) -> None:
+    scene = VTKScene()
+    qtbot.addWidget(scene.widget())
+    monkeypatch.setattr(scene, "render", lambda: None)
+    labels = np.zeros((6, 8, 10), dtype=np.uint16)
+    labels[1:5, 1:7, 1:4] = 1
+    labels[1:5, 1:7, 6:9] = 2  # Display-only unassigned signal, not a detected cell.
+    scene.set_channel_component_coloring("green", True, label_count=1, unassigned_label=2)
+    scene.set_channel_data("green", labels, VoxelSpacing(x_um=1, y_um=1, z_um=1))
+    config = RenderConfig(show_iso_green=True)
+    scene.apply_render_config(config)
+    actor = scene._actors["green"]
+    mapper = actor.iso_actor.GetMapper()
+    mapper.Update()
+    np.testing.assert_array_equal(np.unique(vtk_to_numpy(mapper.GetInput().GetCellData().GetScalars())), [1, 2])
+    np.testing.assert_allclose(mapper.GetLookupTable().GetColor(2), [0.1, 1.0, 0.2])
+    assigned_color = mapper.GetLookupTable().GetColor(1)
+
+    scene.apply_render_config(replace(config, show_iso_green=False))
+    np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(2), [0.1, 1.0, 0.2])
+    np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(1), assigned_color)
+    assert actor.volume_actor.GetVisibility()
+    scene.set_channel_component_coloring("green", False)
+    assert "green" not in scene._component_unassigned_labels
 
 
 def test_snap_offset_to_voxel_rounds_to_nearest_voxel_multiple() -> None:

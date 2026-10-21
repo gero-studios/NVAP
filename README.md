@@ -204,6 +204,8 @@ Use the **Microglia Viewer** panel to inspect one green component at a time:
 
 After **Run Segmentation**, **All** shows each detected component with its own
 tint in both volume and surface rendering. Isolating a cell keeps its tint.
+Signal that has not been assigned to a detected cell stays visible in green
+in **All**; it is not counted as an additional cell.
 The current green threshold and slice trim still apply; the underlying
 enhanced intensities and analysis data are unchanged.
 

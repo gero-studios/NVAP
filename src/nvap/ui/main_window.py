@@ -445,6 +445,7 @@ class MainWindow(QMainWindow):
         self._green_component_shape: tuple[int, int, int] | None = None
         self._green_component_sparse: dict[int, tuple[tuple[slice, slice, slice], np.ndarray]] = {}
         self._green_component_coloring_active = False
+        self._green_component_unassigned_label = 0
         self._microglia_isolate_active = bool(self.controls.microglia_view_state()[0])
         self._microglia_label_cache_max_bytes = 256 * 1024 * 1024
         self._analytics_selection_sync = False
@@ -1697,6 +1698,7 @@ class MainWindow(QMainWindow):
         self._green_component_shape = None
         self._green_component_sparse = {}
         self._green_component_coloring_active = False
+        self._green_component_unassigned_label = 0
         self._mark_microglia_analysis_dirty()
         self.scene.set_microglia_analysis_debug(None)
         self.scene.set_channel_component_coloring("green", False)
@@ -1923,6 +1925,7 @@ class MainWindow(QMainWindow):
         base = np.asarray(self.visual_dataset.green.data, dtype=np.float32)
         enabled, selected_index = self.controls.microglia_view_state()
         self._green_component_coloring_active = False
+        self._green_component_unassigned_label = 0
         if not enabled:
             return base
 
@@ -1948,20 +1951,21 @@ class MainWindow(QMainWindow):
                 selected_voxels=int(self._green_component_sizes[component_id]),
             )
 
-        # Use component IDs only for display. Keep the enhanced data untouched
-        # and retain its threshold so dim watershed support does not become an
-        # opaque halo. Keep original IDs when isolating to preserve each tint.
+        # Cell labels cover only accepted cells, not the entire green signal.
+        # Preserve the full threshold mask in All; unassigned signal gets a
+        # display-only label rendered in green, never an extra analysis cell.
         component_id = int(self._green_component_order[selected_index - 1]) if selected_index > 0 else 0
-        threshold = float(self.current_render.threshold_green)
+        threshold = float(np.clip(self.current_render.threshold_green, 1.0e-3, 1.0))
+        max_display_label = count + (1 if component_id == 0 else 0)
+        dtype = np.uint8 if max_display_label <= np.iinfo(np.uint8).max else np.uint16
         if self._green_component_labels is not None:
             labels = self._green_component_labels
-            out = np.zeros_like(labels)
+            out = np.zeros(labels.shape, dtype=dtype)
             visible = base >= threshold
             if component_id > 0:
                 visible &= labels == component_id
             np.copyto(out, labels, where=visible)
         else:
-            dtype = np.uint8 if count <= np.iinfo(np.uint8).max else np.uint16
             out = np.zeros(base.shape, dtype=dtype)
             component_ids = [component_id] if component_id > 0 else self._green_component_order
             for label_id in component_ids:
@@ -1971,6 +1975,15 @@ class MainWindow(QMainWindow):
                 comp_slice, local_mask = sparse
                 visible = local_mask & (base[comp_slice] >= threshold)
                 out[comp_slice][visible] = int(label_id)
+        if component_id == 0:
+            unassigned = (out == 0) & (base >= threshold)
+            if np.any(unassigned):
+                self._green_component_unassigned_label = count + 1
+                out[unassigned] = self._green_component_unassigned_label
+                self.controls.microglia_info.setText(
+                    f"{count} components detected. Showing all green signal. "
+                    "Unassigned signal stays green."
+                )
         self._green_component_coloring_active = True
         return out
 
@@ -1989,6 +2002,7 @@ class MainWindow(QMainWindow):
             "green",
             self._green_component_coloring_active,
             label_count=int(len(self._green_component_order)),
+            unassigned_label=self._green_component_unassigned_label,
         )
         self.scene.set_channel_data(
             channel="green",

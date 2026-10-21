@@ -222,10 +222,10 @@ def _downsample_volume_for_render(
         return volume, spacing, factors
 
     fz, fy, fx = factors
-    if label_mode:
-        reduced = np.ascontiguousarray(volume[::fz, ::fy, ::fx])
-    else:
-        reduced = _block_reduce_max(volume, factors)
+    # Preserve foreground occupancy for labels too. Striding missed thin
+    # processes between sample positions. Max pooling selects an existing ID
+    # from each block without interpolating categorical IDs or dropping signal.
+    reduced = _block_reduce_max(volume, factors)
     return (
         reduced,
         VoxelSpacing(
@@ -290,6 +290,7 @@ class VTKScene:
         self._spacing: dict[str, VoxelSpacing] = {}
         self._current = RenderConfig()
         self._component_coloring: dict[str, int] = {}
+        self._component_unassigned_labels: dict[str, int] = {}
         self._microglia_debug_actors: list[vtkActor] = []
         self._last_render_time = time.perf_counter()
         self._fps_actor = self._build_fps_actor()
@@ -405,12 +406,15 @@ class VTKScene:
         enabled: bool,
         *,
         label_count: int = 0,
+        unassigned_label: int = 0,
     ) -> None:
         channel = channel.lower()
         if enabled:
-            self._component_coloring[channel] = max(0, int(label_count))
+            self._component_coloring[channel] = max(0, int(label_count), int(unassigned_label))
+            self._component_unassigned_labels[channel] = max(0, int(unassigned_label))
         else:
             self._component_coloring.pop(channel, None)
+            self._component_unassigned_labels.pop(channel, None)
         if channel in self._actors:
             self.apply_render_config(self._current)
 
@@ -936,7 +940,9 @@ class VTKScene:
             # cells. Ordinary marching cubes at 0.5 merges them into one object.
             actor.marching.GenerateValues(label_count, 1, label_count)
             iso_mapper.SetScalarModeToUseCellData()
-            iso_mapper.SetLookupTable(self._component_color_transfer_function(label_count))
+            iso_mapper.SetLookupTable(self._component_color_transfer_function(
+                label_count, unassigned_label=self._component_unassigned_labels.get(channel, 0),
+            ))
             iso_mapper.SetScalarRange(1, label_count)
             iso_mapper.ScalarVisibilityOn()
         else:
@@ -1017,7 +1023,9 @@ class VTKScene:
 
         label_count = int(self._component_coloring.get(channel, 0))
         if label_count > 0:
-            color_tf = self._component_color_transfer_function(label_count)
+            color_tf = self._component_color_transfer_function(
+                label_count, unassigned_label=self._component_unassigned_labels.get(channel, 0),
+            )
             scalar_opacity = actor.volume_property.GetScalarOpacity()
             if scalar_opacity is None:
                 scalar_opacity = vtkPiecewiseFunction()
@@ -1035,7 +1043,9 @@ class VTKScene:
             actor.volume_property.SetColor(color_tf)
             actor.volume_property.SetScalarOpacity(scalar_opacity)
             actor.volume_property.SetGradientOpacity(0, gradient_opacity)
-            actor.iso_actor.GetProperty().SetOpacity(opacity)
+            # Keep the same surface opacity as the original intensity view;
+            # switching on colors must not make the structures look thinner.
+            actor.iso_actor.GetProperty().SetOpacity(0.85)
             # Surface mode avoids the slab-like label volume when inspecting 3D components.
             surface_visible = bool(visible and show_iso and self._ensure_surface_pipeline(channel, actor, 0.5))
             actor.volume_actor.SetVisibility(1 if (visible and not surface_visible) else 0)
@@ -1079,7 +1089,9 @@ class VTKScene:
         actor.iso_actor.SetVisibility(1 if surface_visible else 0)
 
     @staticmethod
-    def _component_color_transfer_function(label_count: int) -> vtkColorTransferFunction:
+    def _component_color_transfer_function(
+        label_count: int, *, unassigned_label: int = 0,
+    ) -> vtkColorTransferFunction:
         color_tf = vtkColorTransferFunction()
         color_tf.AddRGBPoint(0.0, 0.0, 0.0, 0.0)
         for label_id in range(1, int(label_count) + 1):
@@ -1087,6 +1099,8 @@ class VTKScene:
             saturation = 0.74 if label_id % 3 else 0.58
             value = 0.98 if label_id % 2 else 0.86
             red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+            if label_id == unassigned_label:
+                red, green, blue = (0.1, 1.0, 0.2)
             x = float(label_id)
             color_tf.AddRGBPoint(x - 0.49, red, green, blue)
             color_tf.AddRGBPoint(x + 0.49, red, green, blue)
