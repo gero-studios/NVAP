@@ -1931,10 +1931,11 @@ class MainWindow(QMainWindow):
 
         self._refresh_microglia_components_if_needed()
         if self._green_component_sizes is None:
-            return base
+            return np.zeros(base.shape, dtype=np.uint8)
         count = int(len(self._green_component_order))
         if count == 0:
-            return base
+            self.controls.microglia_info.setText("No accepted cells. Unassigned signal is hidden.")
+            return np.zeros(base.shape, dtype=np.uint8)
         if selected_index <= 0:
             self.controls.set_microglia_component_summary(
                 count=count,
@@ -1942,7 +1943,7 @@ class MainWindow(QMainWindow):
                 selected_voxels=0,
             )
         elif selected_index > count:
-            return base
+            return np.zeros(base.shape, dtype=np.uint8)
         else:
             component_id = int(self._green_component_order[selected_index - 1])
             self.controls.set_microglia_component_summary(
@@ -1951,12 +1952,11 @@ class MainWindow(QMainWindow):
                 selected_voxels=int(self._green_component_sizes[component_id]),
             )
 
-        # Cell labels cover only accepted cells, not the entire green signal.
-        # Preserve the full threshold mask in All; unassigned signal gets a
-        # display-only label rendered in green, never an extra analysis cell.
+        # Show only accepted cell labels consumed by the analysis. Unassigned
+        # fluorescence must not appear to be another measured cell in All.
         component_id = int(self._green_component_order[selected_index - 1]) if selected_index > 0 else 0
         threshold = float(np.clip(self.current_render.threshold_green, 1.0e-3, 1.0))
-        max_display_label = count + (1 if component_id == 0 else 0)
+        max_display_label = int(np.max(self._green_component_order))
         dtype = np.uint8 if max_display_label <= np.iinfo(np.uint8).max else np.uint16
         if self._green_component_labels is not None:
             labels = self._green_component_labels
@@ -1976,19 +1976,15 @@ class MainWindow(QMainWindow):
                 visible = local_mask & (base[comp_slice] >= threshold)
                 out[comp_slice][visible] = int(label_id)
         if component_id == 0:
-            unassigned = (out == 0) & (base >= threshold)
-            if np.any(unassigned):
-                self._green_component_unassigned_label = count + 1
-                trim_first = max(0, int(self.current_render.trim_first_slices))
-                trim_stop = max(trim_first, base.shape[0] - max(0, int(self.current_render.trim_last_slices)))
-                assigned_count = int(np.count_nonzero(out[trim_first:trim_stop]))
-                unassigned_count = int(np.count_nonzero(unassigned[trim_first:trim_stop]))
-                coverage = 100.0 * assigned_count / max(1, assigned_count + unassigned_count)
-                self.controls.microglia_info.setText(
-                    f"{count} components detected. {coverage:.1f}% of visible signal assigned. "
-                    "Unassigned signal stays green."
-                )
-                out[unassigned] = self._green_component_unassigned_label
+            trim_first = max(0, int(self.current_render.trim_first_slices))
+            trim_stop = max(trim_first, base.shape[0] - max(0, int(self.current_render.trim_last_slices)))
+            assigned_count = int(np.count_nonzero(out[trim_first:trim_stop]))
+            visible_count = int(np.count_nonzero(base[trim_first:trim_stop] >= threshold))
+            coverage = 100.0 * assigned_count / max(1, visible_count)
+            self.controls.microglia_info.setText(
+                f"{count} components detected. {coverage:.1f}% of visible signal assigned. "
+                "Unassigned signal is hidden."
+            )
         self._green_component_coloring_active = True
         return out
 

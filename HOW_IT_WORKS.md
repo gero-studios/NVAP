@@ -70,7 +70,7 @@ driven by the UI in `src/nvap/ui/main_window.py`):
    threshold. A second growth pass follows fainter measured signal to recover
    disconnected branches when they have one cell owner; these weak paths establish
    ownership without adding below-mask voxels to the measured cell. Ambiguous
-   fragments remain unassigned and visible in green. Smaller accepted cells are
+   fragments remain unassigned and are hidden in the segmented view. Smaller accepted cells are
    preserved. Components are ranked by size (unusually large objects may follow
    typical cells); that ranking is the `Cell` index in the viewer. The viewer also
    reports assignment coverage within the current slice trim.
