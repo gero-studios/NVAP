@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1011">
+  <meta name="description" content="Explore brain microscopy in 3D with NVAP. Inspect microglia segmentation, measure cell morphology and vasculature, and export neurovascular analysis results.">
+  <title>3D Microglia &amp; Neurovascular Analysis Software | NVAP</title>
+  <link rel="canonical" href="https://nueroanalytics.com/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="NVAP">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:url" content="https://nueroanalytics.com/">
+  <meta property="og:title" content="NVAP — 3D Microglia &amp; Neurovascular Analysis">
+  <meta property="og:description" content="Explore brain microscopy in 3D. Inspect microglia segmentation, measure cell morphology and vasculature, and export your results.">
+  <meta property="og:image" content="https://nueroanalytics.com/assets/analyzed-cortex.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="900">
+  <meta property="og:image:alt" content="NVAP 3D cortex reconstruction showing microglia segmentation components and vessels">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="NVAP — 3D Microglia &amp; Neurovascular Analysis">
+  <meta name="twitter:description" content="Explore brain microscopy in 3D. Inspect microglia segmentation, measure cell morphology and vasculature, and export your results.">
+  <meta name="twitter:image" content="https://nueroanalytics.com/assets/analyzed-cortex.png">
+  <meta name="twitter:image:alt" content="NVAP 3D cortex reconstruction showing microglia segmentation components and vessels">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "WebSite",
+        "@id": "https://nueroanalytics.com/#website",
+        "url": "https://nueroanalytics.com/",
+        "name": "NVAP — NeuroVascular Analytics Program",
+        "inLanguage": "en"
+      },
+      {
+        "@type": "WebPage",
+        "@id": "https://nueroanalytics.com/#webpage",
+        "url": "https://nueroanalytics.com/",
+        "name": "3D Microglia & Neurovascular Analysis Software | NVAP",
+        "isPartOf": { "@id": "https://nueroanalytics.com/#website" },
+        "mainEntity": { "@id": "https://nueroanalytics.com/#application" },
+        "inLanguage": "en"
+      },
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://nueroanalytics.com/#application",
+        "name": "NVAP",
+        "alternateName": "NeuroVascular Analytics Program",
+        "url": "https://nueroanalytics.com/",
+        "description": "A desktop workspace for two-channel 3D brain microscopy, microglia segmentation, cell morphology, and vascular analysis.",
+        "applicationCategory": "ScientificApplication",
+        "applicationSubCategory": "3D microscopy and neurovascular analysis",
+        "installUrl": "https://github.com/gero-studios/NVAP#installing-and-running-from-source",
+        "sameAs": "https://github.com/gero-studios/NVAP",
+        "screenshot": "https://nueroanalytics.com/assets/analyzed-cortex.png",
+        "featureList": [
+          "TIFF, CZI, and image-stack loading",
+          "Interactive two-channel 3D reconstruction",
+          "Microglia segmentation and morphology measurements",
+          "Vascular geometry and cell-to-vessel distances in physical units",
+          "CSV measurements, PNG snapshots, and PLY, OBJ, STL mesh export"
+        ]
+      }
+    ]
+  }
+  </script>
+  <link rel="icon" href="mark.svg?v=13" type="image/svg+xml">
+  <link rel="stylesheet" href="landing.css?v=13">
+  <script src="landing.js?v=13" defer></script>
+  <script src="segmentation.js?v=13" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="brand" href="#" aria-label="NVAP home"><img src="mark.svg?v=13" width="32" height="32" alt="">NVAP</a>
+    <nav aria-label="Main navigation"><a href="#explore">Explore</a><a href="https://github.com/gero-studios/NVAP#installing-and-running-from-source" target="_blank" rel="noopener noreferrer">Install <span aria-hidden="true">↗</span></a></nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <h1 id="hero-title" class="entrance">A closer look at<br>the <em>connected</em><br>brain.</h1>
+        <p class="intro entrance">NVAP brings 3D brain microscopy,<br>microglia, and vascular analysis together.</p>
+        <a class="button entrance" href="https://github.com/gero-studios/NVAP#installing-and-running-from-source" target="_blank" rel="noopener noreferrer">Get NVAP <span aria-hidden="true">↗</span></a>
+      </div>
+      <figure class="specimen entrance">
+        <canvas id="neural-field" aria-label="Animated, illustrative branching vasculature surrounded by microglial cells" role="img"></canvas>
+        <button id="motion" type="button" aria-label="Pause animation" aria-pressed="false"><span aria-hidden="true">Ⅱ</span></button>
+        
+      </figure>
+
+    </section>
+    <section class="workflow wrap" id="explore" aria-labelledby="segmentation-title">
+      <section class="segmentation reveal" aria-labelledby="segmentation-title">
+        <div class="segmentation-heading"><div><p class="eyebrow">A CLOSER LOOK</p><h2 id="segmentation-title">Inspect the segmentation.</h2></div><button id="segmentation-motion" type="button" aria-pressed="false">Pause walkthrough</button></div>
+        <div class="segmentation-layout">
+          <figure class="segmentation-view">
+            <div class="segmentation-images model-view" aria-busy="true">
+              <img class="active model-fallback" src="assets/analyzed-cortex.png" width="1200" height="900" loading="lazy" decoding="async" alt="3D render of cortex segmentation labels and reconstructed vessels">
+              <canvas id="analyzed-model" tabindex="0" role="img" aria-label="Interactive 3D model of cortex segmentation components and vessels. Drag or use arrow keys to rotate; use the zoom buttons to inspect."></canvas>
+              <div class="model-controls"><span id="model-status" role="status">Loading analyzed model…</span><div><button type="button" id="model-zoom-in" aria-label="Zoom in">+</button><button type="button" id="model-zoom-out" aria-label="Zoom out">−</button><button type="button" id="model-reset">Reset view</button></div></div>
+            </div>
+            <figcaption>7015-4 cortex · analyzed 3D masks · <span id="model-count">11 labeled components</span></figcaption>
+          </figure>
+          <div class="segmentation-stages" role="group" aria-label="Segmentation walkthrough stages">
+            <button class="stage selected" type="button" aria-pressed="true" data-stage="0"><span class="stage-number">01</span><span><strong>See both channels.</strong><span>Analyzed microglia in green, reconstructed vessels in red. Rotate to see their spatial relationship.</span></span></button>
+            <button class="stage" type="button" aria-pressed="false" data-stage="1"><span class="stage-number">02</span><span><strong>See the labels.</strong><span>Explore how the segmentation assigns tissue to individual components.</span></span></button>
+            <button class="stage" type="button" aria-pressed="false" data-stage="2"><span class="stage-number">03</span><span><strong>Inspect one component.</strong><span>Inspect a smaller microglia component, with vessels for spatial context.</span></span></button>
+          </div>
+        </div>
+      </section>
+      <div class="capabilities">
+        <article class="reveal"><h3>Explore in 3D.</h3><p>Load TIFF or CZI microscopy stacks. Rotate through microglia and vasculature, adjust channel thresholds, and inspect segmentation components.</p><span>TIFF · CZI · Image stacks</span></article>
+        <article class="reveal"><h3>Measure what matters.</h3><p>Measure microglia branches and tips, vessel geometry, and cell-to-vessel distances in micrometres using calibrated voxel spacing.</p><span>Morphology · Vasculature · Spatial relationships</span></article>
+      </div>
+      <div class="export-line reveal"><h3>Ready for your next step.</h3><p>Export measurements as CSV, capture PNG views, or take 3D meshes into other tools.</p><span>CSV / PNG / PLY / OBJ / STL</span></div>
+    </section>
+  </main>
+  <footer class="wrap"><p>NeuroVascular Analytics Program</p><a href="https://github.com/gero-studios/NVAP" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a></footer>
+</body>
+</html>
