@@ -597,7 +597,7 @@ def test_microglia_views_use_component_ids_without_changing_intensities(qtbot, s
     assert view[2, 10, 10] == 0
     assert window._green_component_unassigned_label == 0
     assert window.controls.microglia_index.maximum() == 2
-    assert "Unassigned signal is hidden" in window.controls.microglia_info.text()
+    assert "Excluded signal is hidden" in window.controls.microglia_info.text()
     assert "98.4% of visible signal assigned" in window.controls.microglia_info.text()
     assert window._green_component_coloring_active is True
     for index, component_id in enumerate(order, start=1):
@@ -719,8 +719,45 @@ def test_segmented_view_with_no_accepted_cells_hides_all_signal(qtbot, sparse_ca
     )
 
     assert not np.any(window._current_green_volume_for_view())
-    assert "No accepted cells" in window.controls.microglia_info.text()
+    assert "No cells eligible for analysis" in window.controls.microglia_info.text()
     np.testing.assert_array_equal(dataset.green.data, original)
+
+
+@pytest.mark.parametrize("sparse_cache", [False, True])
+def test_component_view_hides_somaless_candidate_before_analysis(qtbot, monkeypatch, sparse_cache):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    zz, yy, xx = np.indices((20, 40, 60))
+    body = ((zz - 10) * 0.4) ** 2 + ((yy - 20) * 0.4) ** 2 + ((xx - 18) * 0.4) ** 2 <= 2.1 ** 2
+    raw_labels = np.zeros(body.shape, dtype=np.int32)
+    raw_labels[body] = 1
+    raw_labels[10, 5, 10:50] = 2
+    green = np.where(raw_labels > 0, 0.9, 0.0).astype(np.float32)
+    spacing = VoxelSpacing(x_um=0.4, y_um=0.4, z_um=0.4)
+    z = list(range(20))
+    dataset = DatasetVolume(
+        ChannelVolume('green', green, z, spacing),
+        ChannelVolume('red', np.zeros_like(green), z, spacing), (0, 19),
+    )
+    window.processed_dataset = window.visual_dataset = dataset
+    window.current_render = replace(window.current_render, threshold_green=0.4, trim_first_slices=0, trim_last_slices=0)
+    monkeypatch.setattr('nvap.ui.main_window.compute_component_labels', lambda *args, **kwargs: (
+        raw_labels, np.array([1, 2]), np.bincount(raw_labels.ravel()),
+    ))
+    labels, order, sizes = window._compute_microglia_components(green, 0.4)
+    window.controls.microglia_isolate.blockSignals(True)
+    window.controls.microglia_isolate.setChecked(True)
+    window.controls.microglia_isolate.blockSignals(False)
+    if sparse_cache:
+        window._microglia_label_cache_max_bytes = 0
+    window._cache_microglia_components(
+        labels, order, sizes, threshold=0.4,
+        branch_sensitivity=window.controls.current_microglia_branch_sensitivity(),
+        shape=green.shape, selected_index=0,
+    )
+    np.testing.assert_array_equal(window._current_green_volume_for_view() > 0, body)
+    assert len(window._green_component_order) == 1
+    assert '1 cells eligible for analysis' in window.controls.microglia_info.text()
 
 
 def test_microglia_analysis_debug_overlay_builds_for_selected_cell(qtbot, monkeypatch) -> None:

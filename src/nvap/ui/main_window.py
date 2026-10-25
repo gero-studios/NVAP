@@ -45,6 +45,7 @@ from nvap.analysis.microglia_analysis import (
     microglia_analysis_to_csv_rows,
 )
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
+from nvap.analysis.microglia_quality import filter_analyzable_components
 from nvap.analysis.vascular_analysis import (
     analyze_vasculature,
     build_vascular_masks,
@@ -1724,6 +1725,8 @@ class MainWindow(QMainWindow):
             branch_sense=branch_sense,
             base_min_voxels=base_min_voxels,
             spacing=spacing_zyx,
+            trim_first_slices=self.current_render.trim_first_slices,
+            trim_last_slices=self.current_render.trim_last_slices,
         )
 
     def _compute_microglia_components_from_params(
@@ -1734,6 +1737,8 @@ class MainWindow(QMainWindow):
         branch_sense: float,
         base_min_voxels: int,
         spacing: tuple[float, float, float] | None = None,
+        trim_first_slices: int = 0,
+        trim_last_slices: int = 0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         min_voxels = int(round(base_min_voxels / (0.85 + (0.35 * branch_sense))))
         min_voxels = max(32, min_voxels)
@@ -1747,6 +1752,11 @@ class MainWindow(QMainWindow):
             smooth_sigma=(0.2, 0.45, 0.45),
             branch_sensitivity=branch_sense,
             spacing=spacing,
+        )
+        labels, order, sizes = filter_analyzable_components(
+            green, labels, order, sizes, threshold=threshold,
+            spacing=spacing or (1.0, 1.0, 1.0),
+            trim_first_slices=trim_first_slices, trim_last_slices=trim_last_slices,
         )
         return filter_components_by_preferred_voxel_floor(labels, order, sizes)
 
@@ -1808,6 +1818,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Another operation is still running.", 3000)
             return
 
+        quality_trim = (self.current_render.trim_first_slices, self.current_render.trim_last_slices)
         threshold = float(self.current_render.threshold_green)
         branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
         selected_index = int(self.controls.microglia_view_state()[1])
@@ -1843,6 +1854,8 @@ class MainWindow(QMainWindow):
                 branch_sense=branch_sensitivity,
                 base_min_voxels=base_min_voxels,
                 spacing=spacing_zyx,
+                trim_first_slices=quality_trim[0],
+                trim_last_slices=quality_trim[1],
             )
             self._publish_busy_progress(percent=75.0, message="Preparing isolate cache...")
             return _MicrogliaComponentsTaskResult(
@@ -1934,7 +1947,7 @@ class MainWindow(QMainWindow):
             return np.zeros(base.shape, dtype=np.uint8)
         count = int(len(self._green_component_order))
         if count == 0:
-            self.controls.microglia_info.setText("No accepted cells. Unassigned signal is hidden.")
+            self.controls.microglia_info.setText("No cells eligible for analysis. Excluded signal is hidden.")
             return np.zeros(base.shape, dtype=np.uint8)
         if selected_index <= 0:
             self.controls.set_microglia_component_summary(
@@ -1982,8 +1995,8 @@ class MainWindow(QMainWindow):
             visible_count = int(np.count_nonzero(base[trim_first:trim_stop] >= threshold))
             coverage = 100.0 * assigned_count / max(1, visible_count)
             self.controls.microglia_info.setText(
-                f"{count} components detected. {coverage:.1f}% of visible signal assigned. "
-                "Unassigned signal is hidden."
+                f"{count} cells eligible for analysis. {coverage:.1f}% of visible signal assigned. "
+                "Excluded signal is hidden."
             )
         self._green_component_coloring_active = True
         return out
@@ -3377,10 +3390,10 @@ class MainWindow(QMainWindow):
             (green_threshold_changed or red_threshold_changed)
             and self.controls.auto_wipe_specks_on_threshold_edit_enabled()
         )
-        if green_threshold_changed:
+        if green_threshold_changed or trim_changed:
             self._invalidate_microglia_components()
         isolate_enabled, _ = self.controls.microglia_view_state()
-        if isolate_enabled and green_threshold_changed:
+        if isolate_enabled and (green_threshold_changed or trim_changed):
             # Start background microglia refresh which will also push scene
             # channels when done — avoid synchronous watershed here.
             if data_upload_changed:
@@ -4056,6 +4069,8 @@ class MainWindow(QMainWindow):
                 branch_sense=float(config.branch_sensitivity),
                 base_min_voxels=base_min_voxels,
                 spacing=spacing_zyx,
+                trim_first_slices=config.render.trim_first_slices,
+                trim_last_slices=config.render.trim_last_slices,
             )
             microglia = analyze_microglia_cells(
                 visual.green.data,
@@ -4400,6 +4415,8 @@ class MainWindow(QMainWindow):
                     branch_sense=branch_sensitivity,
                     base_min_voxels=base_min_voxels,
                     spacing=(float(spacing.z_um), float(spacing.y_um), float(spacing.x_um)),
+                    trim_first_slices=render.trim_first_slices,
+                    trim_last_slices=render.trim_last_slices,
                 )
                 analysis = analyze_microglia_cells(
                     visual.green.data, visual.red.data, labels, order,

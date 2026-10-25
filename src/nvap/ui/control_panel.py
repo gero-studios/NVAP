@@ -1170,7 +1170,7 @@ class ControlPanel(QWidget):
             self.microglia_info.setText("No microglia component found above threshold.")
             return
         if selected <= 0:
-            self.microglia_info.setText(f"{total} components detected. Showing all.")
+            self.microglia_info.setText(f"{total} cells eligible for analysis. Showing all.")
             return
         self.microglia_info.setText(
             f"Component {selected}/{total} · voxels={int(selected_voxels)}"

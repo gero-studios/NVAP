@@ -172,6 +172,15 @@ density and radius metrics available otherwise.
 One row per cell in `metrics_microglia.csv`. Each cell is processed inside its
 own bounding box for speed.
 
+The colored cell view and analysis share a single-soma eligibility check
+(`microglia_quality.py`). Only visible signal at the current green threshold
+and within the slice trim counts. A component must contain exactly one supported
+soma core: radius at least 1 µm, with at least 1 µm³ of core support above the
+larger of 1 µm or 45% of its maximum interior radius. Components with no qualifying
+core or multiple qualifying cores are excluded from both the colored view and
+cell analysis. These are application quality thresholds, not a validated
+biological classification. The full arbor of each eligible cell is retained.
+
 **Soma segmentation.** The soma is the thick core of the cell: within a component,
 the distance-transform peak marks the centre, and voxels above a fraction of that
 peak are grown into the soma body (`_segment_soma_body`).

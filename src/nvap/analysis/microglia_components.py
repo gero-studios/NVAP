@@ -836,6 +836,37 @@ def _segment_soma_markers_from_reduced_threshold(
     spacing_zyx: np.ndarray,
     structure: np.ndarray,
 ) -> np.ndarray:
+    if working.size > _MAX_SOMA_EDT_VOXELS:
+        # Keep the same soma-thickness test on large stacks. Bypassing EDT
+        # turns every disconnected bright branch into a cell marker.
+        steps = np.ones(3, dtype=np.int32)
+        while int(np.prod((np.asarray(working.shape) + steps - 1) // steps + 2)) > _MAX_SOMA_EDT_VOXELS:
+            available = np.asarray(working.shape) > steps
+            if not np.any(available):
+                break
+            axes = np.where(available, spacing_zyx * steps, np.inf)
+            steps[int(np.argmin(axes))] *= 2
+        sample = tuple(slice(None, None, int(step)) for step in steps)
+        reduced_working = np.asarray(working[sample], dtype=np.float32)
+        reduced_spacing = spacing_zyx * steps
+        logger.info("Microglia soma EDT: bounded grid %s -> %s, steps=%s.", working.shape, reduced_working.shape, steps.tolist())
+        reduced_labels = _segment_soma_markers_from_reduced_threshold(
+            seed[sample], reduced_working, finite[sample],
+            low_floor=low_floor, high_t=high_t,
+            branch_sensitivity=branch_sensitivity,
+            min_keep=max(2, int(min_keep // np.prod(steps))),
+            spacing_zyx=reduced_spacing,
+            structure=_spacing_aware_structure(reduced_spacing),
+        )
+        out = np.zeros(working.shape, dtype=np.int32)
+        positions = _max_positions_for_labels(
+            reduced_working, reduced_labels,
+            list(range(1, int(reduced_labels.max()) + 1)),
+        )
+        for label_id, position in enumerate(positions, start=1):
+            native = np.asarray(position) * steps
+            out[tuple(native)] = label_id
+        return out
     sensitivity = float(np.clip(branch_sensitivity, 0.4, 2.0))
     dense_floor = max(0.02, low_floor, high_t * 0.25)
     dense_mode = _dense_microglia_scene(
@@ -857,10 +888,12 @@ def _segment_soma_markers_from_reduced_threshold(
     )
     if use_full_dist:
         try:
+            # The ROI touches signal at its edges. Pad with background so an
+            # edge branch cannot acquire an artificial soma-sized radius.
             dist = ndi.distance_transform_edt(
-                soma_candidate,
+                np.pad(soma_candidate, 1, mode="constant"),
                 sampling=(float(spacing_zyx[0]), float(spacing_zyx[1]), float(spacing_zyx[2])),
-            )
+            )[1:-1, 1:-1, 1:-1]
         except MemoryError:
             dist = np.zeros_like(working, dtype=np.float32)
             use_full_dist = False
@@ -895,16 +928,18 @@ def _segment_soma_markers_from_reduced_threshold(
             core_sizes = np.bincount(core_labels.ravel(), minlength=n_core + 1)
             min_core_voxels = max(2, int(min_keep // 3))
             min_core_radius_um = float(_MIN_CREDIBLE_SOMA_RADIUS_UM)
+            sized_ids = np.flatnonzero(core_sizes >= min_core_voxels)
+            sized_ids = sized_ids[sized_ids > 0]
+            # Measure all core radii in one pass; a full-volume scan per speck
+            # makes the soma check prohibitively slow on microscopy stacks.
+            core_radii = (
+                ndi.maximum(dist, labels=core_labels, index=sized_ids)
+                if use_full_dist and sized_ids.size
+                else np.full(sized_ids.size, np.inf)
+            )
             valid_ids = [
-                i
-                for i in range(1, n_core + 1)
-                if (
-                    int(core_sizes[i]) >= min_core_voxels
-                    and (
-                        (not use_full_dist)
-                        or float(np.max(dist[core_labels == int(i)])) >= min_core_radius_um
-                    )
-                )
+                int(i) for i, radius in zip(sized_ids, core_radii)
+                if float(radius) >= min_core_radius_um
             ]
             if valid_ids:
                 marker_positions.extend(_max_positions_for_labels(working, core_labels, valid_ids))
@@ -1615,11 +1650,6 @@ def compute_component_labels(
         ),
         dtype=np.int32,
     )
-    raw_labels = _recover_unseeded_cell_bodies(
-        raw_labels, candidate, working_roi, visible_roi, threshold=t,
-        min_voxels=min_keep, max_components=max_keep, spacing_zyx=spacing_zyx,
-        seed_labels=seed_labels,
-    )
     # The growth floor is raised in dense fields. Permit weaker real signal to
     # reconnect fragments, while staying above the measured background level.
     weak_floor = float(max(0.02, t * 0.10, positive_q75 * 1.05))
@@ -1628,6 +1658,14 @@ def compute_component_labels(
             raw_labels, candidate, working_roi, visible_roi,
             weak_floor=weak_floor, min_voxels=min_keep,
         )
+    # Resolve faint connections before looking for missed somas. Otherwise a
+    # detached bright branch gets a new marker first and can never be recovered
+    # by its existing owner (faint-path recovery preserves assigned labels).
+    raw_labels = _recover_unseeded_cell_bodies(
+        raw_labels, candidate, working_roi, visible_roi, threshold=t,
+        min_voxels=min_keep, max_components=max_keep, spacing_zyx=spacing_zyx,
+        seed_labels=seed_labels,
+    )
     labeled_voxels = int(np.count_nonzero(raw_labels))
     label_count = int(np.max(raw_labels)) if labeled_voxels > 0 else 0
     if labeled_voxels > int(_MAX_BRANCH_REASSIGN_VOXELS) or label_count > int(_MAX_BRANCH_REASSIGN_LABELS):

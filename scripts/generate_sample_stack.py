@@ -22,8 +22,9 @@ def build_sample_volumes() -> tuple[np.ndarray, np.ndarray]:
     red = np.zeros(SAMPLE_SHAPE_ZYX, dtype=np.float32)
 
     # One compact soma with two straight processes. With NVAP's default spacing,
-    # each process is long enough to pass the 3 um terminal-branch gate.
-    green[6:11, 23:32, 23:32] = 1.0
+    # each process passes the 3 um branch gate. Seven z-slices also give the
+    # soma enough physical core support to pass single-soma eligibility.
+    green[5:12, 23:32, 23:32] = 1.0
     green[8, 27, 32:48] = 1.0
     green[8, 27, 7:23] = 1.0
 

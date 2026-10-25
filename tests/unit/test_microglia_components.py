@@ -175,7 +175,7 @@ def test_merge_close_soma_marker_positions_uses_fast_path_for_large_volume(monke
     assert 1 <= len(merged) <= len(positions)
 
 
-def test_segment_soma_markers_skips_edt_for_large_candidates(monkeypatch) -> None:
+def test_segment_soma_markers_uses_bounded_edt_for_large_candidates(monkeypatch) -> None:
     working = np.zeros((3, 12, 12), dtype=np.float32)
     working[:, 2:10, 2:10] = 0.45
     finite = np.isfinite(working)
@@ -183,13 +183,16 @@ def test_segment_soma_markers_skips_edt_for_large_candidates(monkeypatch) -> Non
     seed[1, 4, 4] = True
     seed[1, 7, 7] = True
 
-    monkeypatch.setattr(microglia_components, "_MAX_SOMA_EDT_VOXELS", 8)
-    monkeypatch.setattr(microglia_components, "_MAX_SOMA_CORE_LABEL_VOXELS", 8)
+    monkeypatch.setattr(microglia_components, "_MAX_SOMA_EDT_VOXELS", 128)
+    edt = microglia_components.ndi.distance_transform_edt
+    evaluated_shapes = []
 
-    def _fail_edt(*_args, **_kwargs):
-        raise AssertionError("large-candidate path should skip full-resolution EDT")
+    def bounded_edt(mask, *args, **kwargs):
+        assert mask.size <= 128
+        evaluated_shapes.append(mask.shape)
+        return edt(mask, *args, **kwargs)
 
-    monkeypatch.setattr(microglia_components.ndi, "distance_transform_edt", _fail_edt)
+    monkeypatch.setattr(microglia_components.ndi, "distance_transform_edt", bounded_edt)
 
     labels = microglia_components._segment_soma_markers_from_reduced_threshold(
         seed,
@@ -205,6 +208,7 @@ def test_segment_soma_markers_skips_edt_for_large_candidates(monkeypatch) -> Non
 
     assert labels.shape == working.shape
     assert int(np.max(labels)) >= 1
+    assert evaluated_shapes
 
 
 def test_segment_soma_markers_skips_watershed_for_large_volume(monkeypatch) -> None:
@@ -235,6 +239,26 @@ def test_segment_soma_markers_skips_watershed_for_large_volume(monkeypatch) -> N
 
     assert labels.shape == working.shape
     assert int(np.max(labels)) >= 1
+
+
+def test_bounded_soma_check_keeps_two_bodies_and_rejects_branch_bulb(monkeypatch) -> None:
+    zz, yy, xx = np.indices((24, 64, 96), dtype=np.float32)
+    working = np.zeros(zz.shape, dtype=np.float32)
+    for x, radius in ((24, 2.1), (68, 2.1), (46, 0.7)):
+        body = ((zz - 12) * 0.3) ** 2 + ((yy - 32) * 0.3) ** 2 + ((xx - x) * 0.3) ** 2 <= radius ** 2
+        working[body] = 0.9
+    monkeypatch.setattr(microglia_components, "_MAX_SOMA_EDT_VOXELS", 40_000)
+    labels = microglia_components._segment_soma_markers_from_reduced_threshold(
+        working >= 0.8, working, np.isfinite(working), low_floor=0.2,
+        high_t=0.8, branch_sensitivity=1.0, min_keep=20,
+        spacing_zyx=np.array([0.3, 0.3, 0.3]),
+        structure=microglia_components._CUBIC_STRUCTURE,
+    )
+    assert labels.max() == 2
+    positions = np.argwhere(labels > 0)
+    assert np.any(np.abs(positions[:, 2] - 24) <= 7)
+    assert np.any(np.abs(positions[:, 2] - 68) <= 7)
+    assert not np.any((positions[:, 2] > 40) & (positions[:, 2] < 52))
 
 
 def test_compute_component_labels_skips_branch_reassignment_for_oversized_label_volume(
@@ -550,6 +574,11 @@ def test_single_soma_with_two_close_lobes_stays_one_component() -> None:
     assert int(sizes[comp_id]) >= 100
     assert int(labels[z, 35, 31]) == comp_id
     assert int(labels[z, 35, 39]) == comp_id
+
+
+def test_bright_terminal_bulbs_on_bounded_soma_grid(monkeypatch) -> None:
+    monkeypatch.setattr(microglia_components, "_MAX_SOMA_EDT_VOXELS", 40_000)
+    test_bright_terminal_bulbs_are_not_mistaken_for_somas()
 
 
 def test_bright_terminal_bulbs_are_not_mistaken_for_somas() -> None:
@@ -894,6 +923,37 @@ def test_recovery_does_not_promote_thin_terminal_bulbs_to_cells() -> None:
     )
 
     np.testing.assert_array_equal(recovered, labels)
+
+
+def test_faintly_connected_bright_branch_keeps_existing_cell_owner(monkeypatch) -> None:
+    spacing = (0.4, 0.25, 0.25)
+    zz, yy, xx = np.indices((25, 80, 128), dtype=np.float32)
+    def radius(x):
+        return ((zz - 12) * spacing[0]) ** 2 + ((yy - 40) * spacing[1]) ** 2 + ((xx - x) * spacing[2]) ** 2
+    soma = radius(32) <= 3.0 ** 2
+    bulb = radius(88) <= 1.4 ** 2
+    volume = np.full(soma.shape, 0.01, dtype=np.float32)
+    volume[12, 40, 32:89] = 0.08
+    volume[soma] = 0.95
+    volume[bulb] = 0.5
+
+    # Isolate ownership recovery from initial soma detection: only the true
+    # soma has a marker, and the bulb is thick enough to pass missed-soma checks.
+    def soma_marker(seed, working, finite, **kwargs):
+        markers = np.zeros(seed.shape, dtype=np.int32)
+        markers[np.unravel_index(np.argmax(working), working.shape)] = 1
+        return markers
+
+    monkeypatch.setattr(microglia_components, "_seed_labels_from_soma_candidates", soma_marker)
+
+    labels, order, _ = compute_component_labels(
+        volume, threshold=0.3, min_voxels=20, spacing=spacing,
+    )
+
+    assert len(order) == 1
+    assert labels[12, 40, 32] > 0
+    assert np.all(labels[bulb] == labels[12, 40, 32])
+    assert labels[12, 40, 60] == 0  # The invisible bridge is not painted in.
 
 
 def test_faint_path_recovery_assigns_branch_without_painting_bridge_or_remote_signal() -> None:

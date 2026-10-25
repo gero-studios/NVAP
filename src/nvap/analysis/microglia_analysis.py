@@ -11,6 +11,7 @@ from scipy.spatial import cKDTree
 from skimage.morphology import remove_small_holes, skeletonize
 
 from nvap.analysis.vascular_analysis import build_vascular_masks
+from nvap.analysis.microglia_quality import analyzable_component_ids
 from nvap.config.types import RenderConfig, VoxelSpacing
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,12 @@ def analyze_microglia_cells(
 
     spacing_zyx = _spacing_zyx(spacing)
     voxel_volume_um3 = float(np.prod(spacing_zyx))
+    ordered = analyzable_component_ids(
+        green, lbl, ordered, threshold=float(render.threshold_green),
+        spacing=tuple(spacing_zyx),
+        trim_first_slices=render.trim_first_slices,
+        trim_last_slices=render.trim_last_slices,
+    )
 
     trimmed_labels = _apply_render_trim(
         lbl,
