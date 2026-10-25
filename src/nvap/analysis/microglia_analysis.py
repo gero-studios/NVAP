@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import inspect
 import json
 import logging
@@ -11,8 +13,9 @@ from scipy.spatial import cKDTree
 from skimage.morphology import remove_small_holes, skeletonize
 
 from nvap.analysis.vascular_analysis import build_vascular_masks
-from nvap.analysis.microglia_quality import analyzable_component_ids
-from nvap.config.types import RenderConfig, VoxelSpacing
+from nvap.analysis.microglia_quality import filter_analyzable_components
+from nvap.config.types import RenderConfig, VoxelSpacing, SomaCriteria
+from nvap.runtime_optimization import available_memory_bytes, configured_cpu_workers
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +158,17 @@ class MicrogliaCellAnalysis:
     nearest_tip_aligned_point_xyz_um: tuple[float, float, float] | None = None
     nearest_tip_vessel_point_zyx_vox: tuple[int, int, int] | None = None
     nearest_tip_vessel_point_xyz_um: tuple[float, float, float] | None = None
+    inferred_from_z_interior: bool = False
+
+    @property
+    def classification_basis(self) -> str:
+        if self.inferred_from_z_interior:
+            return 'z_interior_inferred'
+        return 'soma_supported' if self.soma_detected else 'unassigned'
+
+    @property
+    def soma_detected(self) -> bool:
+        return self.soma_voxel_count > 0
 
 
 @dataclass(frozen=True)
@@ -234,25 +248,50 @@ def analyze_microglia_cells(
     render: RenderConfig,
     min_branch_length_um: float = _DEFAULT_MIN_BRANCH_LENGTH_UM,
     branch_sensitivity: float = 1.0,
+    components_prepared: bool = False,
+    workers: int | None = None,
+    inferred_component_ids=None,
+    interior_min_voxels: int = 128,
 ) -> MicrogliaAnalysisResult:
     green = np.asarray(green_volume, dtype=np.float32)
     red = np.asarray(red_volume, dtype=np.float32)
-    lbl = np.asarray(labels, dtype=np.int32)
+    # Accepted display caches often fit in uint8/uint16. Keep that storage
+    # instead of copying a large label volume into int32 just to read it.
+    lbl = np.asarray(labels)
+    if lbl.dtype.kind not in {'i', 'u'}:
+        lbl = lbl.astype(np.int32)
     ordered = np.asarray(order, dtype=np.int32)
 
     if green.shape != red.shape or green.shape != lbl.shape:
         raise ValueError("green_volume, red_volume, and labels must share the same shape.")
     if green.ndim != 3:
         raise ValueError("green_volume must be 3D in (z, y, x) order.")
+    if not ordered.size:
+        return MicrogliaAnalysisResult()
 
     spacing_zyx = _spacing_zyx(spacing)
     voxel_volume_um3 = float(np.prod(spacing_zyx))
-    ordered = analyzable_component_ids(
-        green, lbl, ordered, threshold=float(render.threshold_green),
-        spacing=tuple(spacing_zyx),
-        trim_first_slices=render.trim_first_slices,
-        trim_last_slices=render.trim_last_slices,
-    )
+    if not components_prepared:
+        # Raw callers still receive the full shared soma/ownership check.
+        # The UI supplies labels already prepared with the same dataset,
+        # threshold, trim and spacing; repeating it changes nothing but cost.
+        lbl, ordered, _ = filter_analyzable_components(
+            green, lbl, ordered, np.bincount(lbl.ravel()), threshold=float(render.threshold_green),
+            spacing=tuple(spacing_zyx),
+            trim_first_slices=render.trim_first_slices,
+            trim_last_slices=render.trim_last_slices,
+            compact_ids=False,
+            interior_min_voxels=interior_min_voxels, soma_criteria=render.soma_criteria,
+        )
+        from nvap.analysis.contact_components import classify_components
+        classification = classify_components(green, lbl, ordered, threshold=render.threshold_green,
+            spacing=tuple(spacing_zyx), trim_first_slices=render.trim_first_slices,
+            trim_last_slices=render.trim_last_slices, interior_min_voxels=interior_min_voxels, soma_criteria=render.soma_criteria)
+        inferred_component_ids = classification.interior_ids
+    if not ordered.size:
+        return MicrogliaAnalysisResult()
+
+    inferred_ids = frozenset(int(cid) for cid in (() if inferred_component_ids is None else inferred_component_ids))
 
     trimmed_labels = _apply_render_trim(
         lbl,
@@ -305,20 +344,19 @@ def analyze_microglia_cells(
     objects = ndi.find_objects(trimmed_labels)
     n_objects = len(objects)
 
-    cells: list[MicrogliaCellAnalysis] = []
-    for component_id in ordered.tolist():
+    def analyze_one(component_id: int) -> MicrogliaCellAnalysis | None:
         cid = int(component_id)
         if cid <= 0 or cid > n_objects:
-            continue
+            return None
         bbox = objects[cid - 1]
         if bbox is None:
-            continue
+            return None
         local_mask = np.asarray(
             trimmed_labels[bbox] == cid,
             dtype=bool,
         )
         if not np.any(local_mask):
-            continue
+            return None
         bbox_start = np.asarray(
             [bbox[0].start or 0, bbox[1].start or 0, bbox[2].start or 0],
             dtype=np.int64,
@@ -331,6 +369,7 @@ def analyze_microglia_cells(
             branch_sensitivity=float(branch_sensitivity),
             intensity=green[bbox],
             tip_intensity_floor=tip_intensity_floor,
+            allow_soma=cid not in inferred_ids, soma_criteria=render.soma_criteria,
         )
         soma_mask = shape_debug.soma_mask  # bbox-local frame
         tip_coords = shape_debug.tip_coords  # bbox-local frame
@@ -436,9 +475,9 @@ def analyze_microglia_cells(
         soma_voxel_count = int(np.count_nonzero(soma_mask))
         tip_count = int(tip_coords.shape[0])
         cell_centroid = np.mean(comp_coords, axis=0) if comp_coords.size > 0 else None
-        cells.append(
-            MicrogliaCellAnalysis(
+        return MicrogliaCellAnalysis(
                 component_id=int(component_id),
+                inferred_from_z_interior=cid in inferred_ids,
                 voxel_count=voxel_count,
                 volume_um3=float(voxel_count * voxel_volume_um3),
                 soma_voxel_count=soma_voxel_count,
@@ -530,8 +569,51 @@ def analyze_microglia_cells(
                 nearest_tip_vessel_point_xyz_um=_coord_zyx_to_xyz_um(
                     nearest_tip_vessel_coord, spacing_zyx
                 ),
-            )
         )
+
+    # Independent cell kernels release the GIL, but large bounding boxes can
+    # each require substantial EDT/geodesic workspace. Limit both the worker
+    # count and queued workspace; process oversized cells on their own.
+    worker_count = max(1, int(workers)) if workers is not None else min(2, configured_cpu_workers())
+    available = available_memory_bytes()
+    budget = 0 if available is None else available // 2
+    cells: list[MicrogliaCellAnalysis] = []
+    if worker_count <= 1 or len(ordered) < 4 or not budget:
+        for cid in ordered.tolist():
+            cell = analyze_one(cid)
+            if cell is not None:
+                cells.append(cell)
+    else:
+        pending = deque()
+        reserved = 0
+
+        def collect_first() -> None:
+            nonlocal reserved
+            future, size = pending.popleft()
+            cell = future.result()
+            reserved -= size
+            if cell is not None:
+                cells.append(cell)
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='nvap-cell') as pool:
+            for cid in ordered.tolist():
+                bbox = objects[cid - 1] if 0 < cid <= n_objects else None
+                if bbox is None:
+                    continue
+                # Conservatively allow for simultaneously resident masks,
+                # EDTs, geodesic fields, reconstruction and skeleton buffers.
+                size = int(np.prod([s.stop - s.start for s in bbox])) * 96
+                while pending and (len(pending) >= worker_count or reserved + size > budget):
+                    collect_first()
+                if size > budget:
+                    cell = analyze_one(cid)
+                    if cell is not None:
+                        cells.append(cell)
+                else:
+                    pending.append((pool.submit(analyze_one, cid), size))
+                    reserved += size
+            while pending:
+                collect_first()
 
     distances = [
         float(cell.nearest_cell_to_vessel_um)
@@ -558,6 +640,7 @@ def analyze_microglia_cells(
             zero_cells,
             float(min(soma_distances)) if soma_distances else float("nan"),
         )
+    detected_somas = [cell for cell in cells if cell.soma_detected]
     return MicrogliaAnalysisResult(
         cells=cells,
         analyzed_cell_count=int(len(cells)),
@@ -569,7 +652,7 @@ def analyze_microglia_cells(
         mean_process_length_um=(
             float(np.mean([cell.total_process_length_um for cell in cells])) if cells else 0.0
         ),
-        mean_soma_volume_um3=float(np.mean([cell.soma_volume_um3 for cell in cells])) if cells else 0.0,
+        mean_soma_volume_um3=float(np.mean([cell.soma_volume_um3 for cell in detected_somas])) if detected_somas else 0.0,
         mean_sholl_max_intersections=(
             float(np.mean([cell.sholl_max_intersections for cell in cells])) if cells else 0.0
         ),
@@ -579,10 +662,10 @@ def analyze_microglia_cells(
             float(np.mean(soma_centroid_distances)) if soma_centroid_distances else None
         ),
         mean_soma_equivalent_diameter_um=(
-            float(np.mean([cell.soma_equivalent_diameter_um for cell in cells])) if cells else 0.0
+            float(np.mean([cell.soma_equivalent_diameter_um for cell in detected_somas])) if detected_somas else 0.0
         ),
         mean_soma_roundness=(
-            float(np.mean([cell.soma_roundness for cell in cells])) if cells else 0.0
+            float(np.mean([cell.soma_roundness for cell in detected_somas])) if detected_somas else 0.0
         ),
         mean_branch_tortuosity=(
             float(np.mean([cell.mean_branch_tortuosity for cell in cells])) if cells else 0.0
@@ -603,6 +686,8 @@ def microglia_analysis_to_csv_rows(
             "voxel_count": int(cell.voxel_count),
             "volume_um3": float(cell.volume_um3),
             "soma_voxel_count": int(cell.soma_voxel_count),
+            "soma_detected": cell.soma_detected,
+            "classification_basis": cell.classification_basis,
             "soma_volume_um3": float(cell.soma_volume_um3),
             "branch_count": int(cell.branch_count),
             "tip_count": int(cell.tip_count),
@@ -747,6 +832,7 @@ def build_microglia_cell_debug(
     known_tip_distance_um: float | None = None,
     known_soma_distance_um: float | None = None,
     known_cell_distance_um: float | None = None,
+    allow_soma: bool = True,
 ) -> MicrogliaCellDebug | None:
     green = np.asarray(green_volume, dtype=np.float32)
     red = np.asarray(red_volume, dtype=np.float32)
@@ -785,6 +871,7 @@ def build_microglia_cell_debug(
         branch_sensitivity=float(branch_sensitivity),
         intensity=green,
         tip_intensity_floor=float(render.threshold_green) + _TIP_VISIBILITY_MARGIN,
+        allow_soma=allow_soma, soma_criteria=render.soma_criteria,
     )
     soma_sample_coords = _sample_mask_coords(
         shape_debug.soma_mask,
@@ -853,7 +940,11 @@ def _describe_component_shape(
     branch_sensitivity: float,
     intensity: np.ndarray | None = None,
     tip_intensity_floor: float = 0.0,
+    allow_soma: bool = True,
+    soma_criteria: SomaCriteria = SomaCriteria(),
 ) -> _ComponentShapeDebug:
+    if np.count_nonzero(component_mask) < 2:
+        return _empty_shape_debug(component_mask)
     bounds = _mask_bounds(component_mask)
     if bounds is None:
         return _empty_shape_debug(component_mask)
@@ -874,8 +965,15 @@ def _describe_component_shape(
         added = int(np.count_nonzero(filled_mask) - np.count_nonzero(local_mask))
         if 0 < added <= int(_FILL_HOLE_VOXELS):
             local_mask = filled_mask
-    dist = ndi.distance_transform_edt(component_local, sampling=tuple(float(v) for v in spacing_zyx))
-    soma_local = _segment_soma_body(component_local, dist, spacing_zyx)
+    # Treat the outside of a tight component box as background. Without padding,
+    # a completely filled thin box can acquire an artificial, enormous radius.
+    dist = ndi.distance_transform_edt(np.pad(component_local, 1), sampling=tuple(float(v) for v in spacing_zyx))[1:-1, 1:-1, 1:-1]
+    credible_body = (
+        all(size >= 3 for size in component_local.shape)
+        and float(dist.max()) >= soma_criteria.min_radius_um
+        and np.count_nonzero(dist >= soma_criteria.min_radius_um) * float(np.prod(spacing_zyx)) >= max(soma_criteria.min_core_volume_um3, 3 * float(np.prod(spacing_zyx)))
+    )
+    soma_local = _segment_soma_body(component_local, dist, spacing_zyx) if credible_body and allow_soma else np.zeros_like(component_local)
     soma_local &= component_local
     soma_shape = _soma_shape_metrics(soma_local, spacing_zyx)
     # Tips must land at the branch ends the user actually sees, and align with
@@ -1571,11 +1669,17 @@ def _voxel_tip_coords_geodesic(
 
     # One representative per connected maximum region: its most distal voxel.
     peak_labels, n_peaks = ndi.label(peaks, structure=_FULL_STRUCTURE)
-    reps = np.empty((n_peaks, 3), dtype=np.int32)
-    for i in range(1, n_peaks + 1):
-        region = np.argwhere(peak_labels == i)
-        vals = geo_field[region[:, 0], region[:, 1], region[:, 2]]
-        reps[i - 1] = region[int(np.argmax(vals))]
+    coords = np.argwhere(peaks)
+    ids = peak_labels[tuple(coords.T)]
+    values = geo_field[tuple(coords.T)]
+    maxima = np.full(n_peaks + 1, -np.inf)
+    np.maximum.at(maxima, ids, values)
+    best = np.full(n_peaks + 1, len(coords), dtype=np.int64)
+    matches = values == maxima[ids]
+    # argwhere is lexicographic, so the first index preserves the original
+    # argmax tie-breaking exactly, without a volume scan for every peak.
+    np.minimum.at(best, ids[matches], np.flatnonzero(matches))
+    reps = coords[best[1:]].astype(np.int32, copy=False)
 
     merge_radius = float(np.clip(_DEFAULT_TIP_MERGE_RADIUS_UM / sensitivity, 1.5, 12.0))
     result = _merge_tip_points(reps, geo_field, spacing_zyx, merge_radius)
@@ -2236,6 +2340,11 @@ def _nearby_vessel_component_count(
     spacing = np.asarray(spacing_zyx, dtype=np.float64).reshape(3)
     radius = float(max(0.0, radius_um))
     voxel_radius = np.ceil(radius / np.maximum(spacing, 1.0e-6)).astype(np.int64)
+    # Reuse the physical-radius stencil for every tip. Previously each tip
+    # allocated vessel coordinates and recomputed their distances in Python.
+    voxel_radius = np.minimum(voxel_radius, np.asarray(shape, dtype=np.int64) - 1)
+    axes = np.ogrid[tuple(slice(-int(r), int(r) + 1) for r in voxel_radius)]
+    neighborhood = np.sqrt(sum((axis * step) ** 2 for axis, step in zip(axes, spacing, strict=True))) <= radius
     labels_seen: set[int] = set()
     for coord in shifted:
         start = np.maximum(0, coord - voxel_radius)
@@ -2244,12 +2353,10 @@ def _nearby_vessel_component_count(
         local = np.asarray(vessel_labels[slices], dtype=np.int32)
         if local.size == 0:
             continue
-        local_coords = np.argwhere(local > 0).astype(np.float64)
-        if local_coords.shape[0] == 0:
-            continue
-        offset = start.astype(np.float64).reshape(1, 3)
-        dist = np.linalg.norm(((local_coords + offset) - coord.reshape(1, 3)) * spacing, axis=1)
-        nearby_labels = np.unique(local[tuple(local_coords[dist <= radius].astype(np.int64).T)])
+        kernel_start = start - coord + voxel_radius
+        kernel_stop = stop - coord + voxel_radius
+        kernel_slices = tuple(slice(int(lo), int(hi)) for lo, hi in zip(kernel_start, kernel_stop, strict=True))
+        nearby_labels = np.unique(local[neighborhood[kernel_slices]])
         labels_seen.update(int(label) for label in nearby_labels.tolist() if int(label) > 0)
     return int(len(labels_seen))
 

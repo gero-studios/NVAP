@@ -16,6 +16,12 @@ from nvap.render.vtk_scene import (
 )
 
 
+def _color_at(transfer_function, value):
+    color = [0.0, 0.0, 0.0]
+    transfer_function.GetColor(value, color)
+    return color
+
+
 def test_segmented_components_have_distinct_surface_and_volume_tints(qtbot, monkeypatch) -> None:
     scene = VTKScene()
     qtbot.addWidget(scene.widget())
@@ -45,10 +51,10 @@ def test_segmented_components_have_distinct_surface_and_volume_tints(qtbot, monk
         ]
         assert boundary_cells
     surface_colors = mapper.GetLookupTable()
-    colors = [surface_colors.GetColor(i) for i in (1, 2)]
+    colors = [_color_at(surface_colors, i) for i in (1, 2)]
     assert not np.allclose(*colors)
     for i, color in enumerate(colors, start=1):
-        np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(i), color)
+        np.testing.assert_allclose(_color_at(actor.volume_property.GetRGBTransferFunction(), i), color)
     assert actor.iso_actor.GetVisibility()
     assert not actor.volume_actor.GetVisibility()
     assert np.isclose(actor.iso_actor.GetProperty().GetOpacity(), 0.85)
@@ -61,7 +67,7 @@ def test_segmented_components_have_distinct_surface_and_volume_tints(qtbot, monk
                       actor.volume_property.GetScalarOpacity().GetValue(2))
     # Reusing the same actor when selecting one cell preserves that cell's tint.
     scene.set_channel_data("green", np.where(labels == 2, labels, 0), VoxelSpacing(x_um=1, y_um=1, z_um=1))
-    np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(2), colors[1])
+    np.testing.assert_allclose(_color_at(actor.volume_property.GetRGBTransferFunction(), 2), colors[1])
 
     # Returning to intensities must rebuild the continuous surface pipeline.
     scene.set_channel_component_coloring("green", False)
@@ -159,7 +165,7 @@ def test_downsample_volume_for_render_uses_max_pool_and_adjusts_spacing() -> Non
     assert np.isclose(reduced_spacing.z_um, 1.0)
 
 
-def test_downsample_volume_for_render_preserves_label_foreground() -> None:
+def test_component_render_preserves_exact_native_label_grid() -> None:
     volume = np.arange(2 * 4 * 4, dtype=np.uint16).reshape(2, 4, 4)
     spacing = VoxelSpacing(x_um=0.5, y_um=0.25, z_um=1.0)
 
@@ -170,9 +176,10 @@ def test_downsample_volume_for_render_preserves_label_foreground() -> None:
         max_voxels=8,
     )
 
-    assert factors == (1, 2, 2)
-    expected = volume.reshape(2, 2, 2, 2, 2).max(axis=(2, 4))
-    np.testing.assert_array_equal(reduced, expected)
+    assert factors == (1, 1, 1)
+    assert reduced is volume
+    assert _spacing == spacing
+    np.testing.assert_array_equal(reduced, volume)
 
 
 def test_label_downsampling_keeps_thin_branches_between_sample_positions() -> None:
@@ -184,8 +191,8 @@ def test_label_downsampling_keeps_thin_branches_between_sample_positions() -> No
         labels, VoxelSpacing(), label_mode=True, max_voxels=8,
     )
 
-    assert np.all(reduced > 0)
-    np.testing.assert_array_equal(np.unique(reduced), [2, 256])
+    np.testing.assert_array_equal(reduced, labels)
+    np.testing.assert_array_equal(np.unique(reduced), [0, 2, 256])
 
 
 def test_unassigned_microglia_signal_stays_green_in_both_render_modes(qtbot, monkeypatch) -> None:
@@ -203,15 +210,49 @@ def test_unassigned_microglia_signal_stays_green_in_both_render_modes(qtbot, mon
     mapper = actor.iso_actor.GetMapper()
     mapper.Update()
     np.testing.assert_array_equal(np.unique(vtk_to_numpy(mapper.GetInput().GetCellData().GetScalars())), [1, 2])
-    np.testing.assert_allclose(mapper.GetLookupTable().GetColor(2), [0.1, 1.0, 0.2])
-    assigned_color = mapper.GetLookupTable().GetColor(1)
+    np.testing.assert_allclose(_color_at(mapper.GetLookupTable(), 2), [0.1, 1.0, 0.2])
+    assigned_color = _color_at(mapper.GetLookupTable(), 1)
 
     scene.apply_render_config(replace(config, show_iso_green=False))
-    np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(2), [0.1, 1.0, 0.2])
-    np.testing.assert_allclose(actor.volume_property.GetRGBTransferFunction().GetColor(1), assigned_color)
+    np.testing.assert_allclose(_color_at(actor.volume_property.GetRGBTransferFunction(), 2), [0.1, 1.0, 0.2])
+    np.testing.assert_allclose(_color_at(actor.volume_property.GetRGBTransferFunction(), 1), assigned_color)
     assert actor.volume_actor.GetVisibility()
     scene.set_channel_component_coloring("green", False)
     assert "green" not in scene._component_unassigned_labels
+
+
+def test_gray_fragments_share_context_color_without_sharing_component_ids(qtbot, monkeypatch):
+    scene = VTKScene()
+    qtbot.addWidget(scene.widget())
+    monkeypatch.setattr(scene, 'render', lambda: None)
+    labels = np.zeros((8, 10, 20), dtype=np.uint16)
+    labels[2:6, 2:7, 2:6] = 1
+    labels[3:5, 3:6, 10:12] = 2
+    labels[3:5, 3:6, 16:18] = 3
+    scene.set_channel_component_coloring('green', True, label_count=3, gray_labels=[2, 3])
+    scene.set_channel_data('green', labels, VoxelSpacing())
+    scene.apply_render_config(RenderConfig(show_iso_green=True))
+    actor = scene._actors['green']
+    mapper = actor.iso_actor.GetMapper()
+    mapper.Update()
+    np.testing.assert_array_equal(np.unique(vtk_to_numpy(mapper.GetInput().GetCellData().GetScalars())), [1, 2, 3])
+    for cid in [2, 3]:
+        np.testing.assert_allclose(_color_at(mapper.GetLookupTable(), cid), [.48, .50, .54])
+    assert not np.allclose(_color_at(mapper.GetLookupTable(), 1), [.48, .50, .54])
+    image_time = actor.image.GetMTime()
+    contours_time = actor.marching.GetMTime()
+    scene.set_gray_branches_visible(False)
+    assert mapper.GetLookupTable().GetOpacity(2) == 0.0
+    assert mapper.GetLookupTable().GetOpacity(1) == 1.0
+    assert actor.image.GetMTime() == image_time
+    assert actor.marching.GetMTime() == contours_time
+    scene.set_gray_branches_visible(True)
+    assert mapper.GetLookupTable().GetOpacity(2) == 1.0
+    scene.apply_render_config(replace(RenderConfig(), show_iso_green=False))
+    np.testing.assert_allclose(_color_at(actor.volume_property.GetRGBTransferFunction(), 3), [.48, .50, .54])
+    scene.set_gray_branches_visible(False)
+    assert actor.volume_property.GetScalarOpacity().GetValue(3) == 0.0
+    assert actor.volume_property.GetScalarOpacity().GetValue(1) > 0.0
 
 
 def test_snap_offset_to_voxel_rounds_to_nearest_voxel_multiple() -> None:

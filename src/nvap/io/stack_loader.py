@@ -457,6 +457,21 @@ def _load_channel(
             return z, _extract_and_normalize_plane(img, channel_name)
 
         workers = _resolve_io_workers(len(z_and_files))
+
+        def _assemble(loaded):
+            # Stream directly into the final stack. Retaining every decoded
+            # plane before np.stack used another complete channel's RAM.
+            volume = None
+            for index, (_, plane) in enumerate(loaded):
+                if volume is None:
+                    volume = np.empty((len(z_and_files), *plane.shape), dtype=np.float32)
+                elif plane.shape != volume.shape[1:]:
+                    raise ValueError("all input arrays must have the same shape")
+                volume[index] = plane
+            if volume is None:
+                raise ValueError("need at least one array to stack")
+            return volume
+
         if workers > 1:
             logger.info(
                 "Loading channel '%s' slices in parallel: files=%d workers=%d",
@@ -465,11 +480,14 @@ def _load_channel(
                 workers,
             )
             with get_executor(workers, "nvap-io") as pool:
-                loaded = list(pool.map(_read_slice, z_and_files))
+                def _loaded_batches():
+                    # Bound completed futures as well as the active readers.
+                    window = workers * 2
+                    for start in range(0, len(z_and_files), window):
+                        yield from pool.map(_read_slice, z_and_files[start:start + window])
+                volume = _assemble(_loaded_batches())
         else:
-            loaded = [_read_slice(item) for item in z_and_files]
-        slices = [plane for _, plane in loaded]
-        volume = np.stack(slices, axis=0).astype(np.float32, copy=False)
+            volume = _assemble(_read_slice(item) for item in z_and_files)
     except FileNotFoundError:
         stack_channel = _load_channel_from_single_stack(channel_name, channel_source)
         return ChannelVolume(
@@ -514,17 +532,15 @@ def _load_combined_channels(
         else:
             return None
 
-        green_slices: list[np.ndarray] = []
-        red_slices: list[np.ndarray] = []
         depth = int(planes.shape[0])
+        green_volume = np.empty((depth, *planes.shape[1:3]), dtype=np.float32)
+        red_volume = np.empty_like(green_volume)
         for idx in range(depth):
             plane = np.asarray(planes[idx])
-            green_slices.append(_extract_and_normalize_plane(plane, "green"))
-            red_slices.append(_extract_and_normalize_plane(plane, "red"))
+            green_volume[idx] = _extract_and_normalize_plane(plane, "green")
+            red_volume[idx] = _extract_and_normalize_plane(plane, "red")
 
         z_indices = list(range(1, depth + 1))
-        green_volume = np.stack(green_slices, axis=0).astype(np.float32, copy=False)
-        red_volume = np.stack(red_slices, axis=0).astype(np.float32, copy=False)
         logger.info(
             "Loaded combined red/green stack once: %s slices=%d shape=%s",
             channel_source,
@@ -569,6 +585,19 @@ def _load_combined_channels(
         )
 
     workers = _resolve_io_workers(len(z_and_files))
+
+    def _assemble_combined(loaded):
+        green_volume = red_volume = None
+        for index, (_, green, red) in enumerate(loaded):
+            if green_volume is None:
+                green_volume = np.empty((len(z_and_files), *green.shape), dtype=np.float32)
+                red_volume = np.empty((len(z_and_files), *red.shape), dtype=np.float32)
+            elif green.shape != green_volume.shape[1:] or red.shape != red_volume.shape[1:]:
+                raise ValueError('all input arrays must have the same shape')
+            green_volume[index] = green
+            red_volume[index] = red
+        return green_volume, red_volume
+
     if workers > 1:
         logger.info(
             "Loading combined red/green slices in parallel: files=%d workers=%d",
@@ -576,15 +605,13 @@ def _load_combined_channels(
             workers,
         )
         with get_executor(workers, "nvap-io") as pool:
-            loaded = list(pool.map(_read_combined_slice, z_and_files))
+            def _loaded_batches():
+                window = workers * 2
+                for start in range(0, len(z_and_files), window):
+                    yield from pool.map(_read_combined_slice, z_and_files[start:start + window])
+            green_volume, red_volume = _assemble_combined(_loaded_batches())
     else:
-        loaded = [_read_combined_slice(item) for item in z_and_files]
-
-    green_slices = [green for _, green, _ in loaded]
-    red_slices = [red for _, _, red in loaded]
-
-    green_volume = np.stack(green_slices, axis=0).astype(np.float32, copy=False)
-    red_volume = np.stack(red_slices, axis=0).astype(np.float32, copy=False)
+        green_volume, red_volume = _assemble_combined(_read_combined_slice(item) for item in z_and_files)
     logger.info(
         "Loaded combined red/green slices once: source=%s slices=%d shape=%s",
         channel_source,

@@ -57,6 +57,8 @@ def _align_channel_to_range(
     z_end: int,
 ) -> ChannelVolume:
     full_z = list(range(int(z_start), int(z_end) + 1))
+    if channel.z_indices == full_z:
+        return channel
     index_map = {int(z): idx for idx, z in enumerate(channel.z_indices)}
     plane_shape = channel.data.shape[1:]
     out = np.zeros((len(full_z),) + plane_shape, dtype=np.float32)
@@ -136,7 +138,9 @@ def apply_psf_to_dataset(
         t = time.perf_counter()
         if channel_name == "green" and green_passthrough:
             logger.info("PSF channel skipped: %s passthrough", channel_name)
-            return channel_name, np.asarray(channel.data, dtype=np.float32).copy(), (time.perf_counter() - t)
+            passthrough = np.asarray(channel.data, dtype=np.float32).view()
+            passthrough.flags.writeable = False
+            return channel_name, passthrough, (time.perf_counter() - t)
         logger.info("PSF channel start: %s shape=%s", channel_name, channel.data.shape)
         data = deconvolve_volume(
             channel.data,
@@ -198,6 +202,22 @@ def prepare_dataset_for_mesh(
     preprocess_config: PreprocessConfig,
 ) -> DatasetVolume:
     return prepare_mesh_dataset(dataset, preprocess_config)
+
+
+def prepare_dataset_for_view(
+    dataset: DatasetVolume,
+    preprocess_config: PreprocessConfig | None = None,
+) -> DatasetVolume:
+    """Keep measurement/connectivity on the acquired voxel grid.
+
+    Interpolating fluorescence before thresholding changes which voxels touch.
+    The renderer already handles anisotropic display spacing and resamples
+    categorical labels with nearest neighbors. Explicit mesh export retains its
+    separate resampling path in prepare_dataset_for_mesh.
+    """
+    logger.info('Preserving native view/analysis grid: green=%s red=%s',
+                dataset.green.data.shape, dataset.red.data.shape)
+    return dataset
 
 
 def default_threshold(volume: np.ndarray, fallback: float = 0.15) -> float:

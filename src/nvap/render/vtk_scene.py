@@ -22,6 +22,7 @@ from vtkmodules.vtkRenderingAnnotation import vtkAxesActor, vtkLegendScaleActor
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
     vtkColorTransferFunction,
+    vtkDiscretizableColorTransferFunction,
     vtkGlyph3DMapper,
     vtkLight,
     vtkPolyDataMapper,
@@ -51,6 +52,9 @@ _SURFACE_PIPELINE_MAX_VOXELS = 96_000_000
 
 def _volume_debug_summary(volume: np.ndarray) -> str:
     arr = np.asarray(volume)
+    if not logger.isEnabledFor(logging.DEBUG):
+        # Normal uploads should not scan/copy hundreds of MB for debug stats.
+        return f"shape={arr.shape} dtype={arr.dtype} c_contiguous={arr.flags.c_contiguous}"
     if arr.size == 0:
         return (
             f"shape={arr.shape} dtype={arr.dtype} empty "
@@ -217,6 +221,11 @@ def _downsample_volume_for_render(
     label_mode: bool = False,
     max_voxels: int = _RENDER_UPLOAD_MAX_VOXELS,
 ) -> tuple[np.ndarray, VoxelSpacing, tuple[int, int, int]]:
+    if label_mode:
+        # Categorical max pooling lets the larger ID erase smaller objects in
+        # the same block, and can break a component at a thin point of contact.
+        # Preserve the native label grid used by the contact-based analysis.
+        return volume, spacing, (1, 1, 1)
     factors = _render_downsample_factors(tuple(int(v) for v in volume.shape), max_voxels=max_voxels)
     if factors == (1, 1, 1):
         return volume, spacing, factors
@@ -291,6 +300,8 @@ class VTKScene:
         self._current = RenderConfig()
         self._component_coloring: dict[str, int] = {}
         self._component_unassigned_labels: dict[str, int] = {}
+        self._component_gray_labels: dict[str, frozenset[int]] = {}
+        self._show_gray_branches = True
         self._microglia_debug_actors: list[vtkActor] = []
         self._last_render_time = time.perf_counter()
         self._fps_actor = self._build_fps_actor()
@@ -407,16 +418,26 @@ class VTKScene:
         *,
         label_count: int = 0,
         unassigned_label: int = 0,
+        gray_labels=(),
     ) -> None:
         channel = channel.lower()
         if enabled:
             self._component_coloring[channel] = max(0, int(label_count), int(unassigned_label))
             self._component_unassigned_labels[channel] = max(0, int(unassigned_label))
+            self._component_gray_labels[channel] = frozenset(int(cid) for cid in gray_labels)
         else:
             self._component_coloring.pop(channel, None)
             self._component_unassigned_labels.pop(channel, None)
+            self._component_gray_labels.pop(channel, None)
         if channel in self._actors:
             self.apply_render_config(self._current)
+
+    def set_gray_branches_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if visible == self._show_gray_branches:
+            return
+        self._show_gray_branches = visible
+        self.apply_render_config(self._current)
 
     def set_microglia_analysis_debug(self, overlay: MicrogliaDebugOverlay | None) -> None:
         for actor in self._microglia_debug_actors:
@@ -938,10 +959,15 @@ class VTKScene:
         if label_mode:
             # Extract a separate boundary for every label, including touching
             # cells. Ordinary marching cubes at 0.5 merges them into one object.
-            actor.marching.GenerateValues(label_count, 1, label_count)
+            if (actor.marching.GetNumberOfContours() != label_count
+                or actor.marching.GetValue(0) != 1
+                or actor.marching.GetValue(label_count - 1) != label_count):
+                actor.marching.GenerateValues(label_count, 1, label_count)
             iso_mapper.SetScalarModeToUseCellData()
             iso_mapper.SetLookupTable(self._component_color_transfer_function(
                 label_count, unassigned_label=self._component_unassigned_labels.get(channel, 0),
+                gray_labels=self._component_gray_labels.get(channel, ()),
+                hide_gray=not self._show_gray_branches,
             ))
             iso_mapper.SetScalarRange(1, label_count)
             iso_mapper.ScalarVisibilityOn()
@@ -1025,6 +1051,7 @@ class VTKScene:
         if label_count > 0:
             color_tf = self._component_color_transfer_function(
                 label_count, unassigned_label=self._component_unassigned_labels.get(channel, 0),
+                gray_labels=self._component_gray_labels.get(channel, ()),
             )
             scalar_opacity = actor.volume_property.GetScalarOpacity()
             if scalar_opacity is None:
@@ -1034,6 +1061,14 @@ class VTKScene:
             scalar_opacity.AddPoint(0.5, 0.0)
             scalar_opacity.AddPoint(1.0, opacity * 0.74)
             scalar_opacity.AddPoint(float(label_count) + 0.5, opacity * 0.74)
+            if not self._show_gray_branches:
+                gray = self._component_gray_labels.get(channel, ())
+                scalar_opacity.RemoveAllPoints()
+                scalar_opacity.AddPoint(0.0, 0.0)
+                for cid in range(1, label_count + 1):
+                    alpha = 0.0 if cid in gray else opacity * 0.74
+                    scalar_opacity.AddPoint(cid - 0.49, alpha)
+                    scalar_opacity.AddPoint(cid + 0.49, alpha)
 
             gradient_opacity = vtkPiecewiseFunction()
             gradient_opacity.AddPoint(0.0, 1.0)
@@ -1090,9 +1125,12 @@ class VTKScene:
 
     @staticmethod
     def _component_color_transfer_function(
-        label_count: int, *, unassigned_label: int = 0,
+        label_count: int, *, unassigned_label: int = 0, gray_labels=(), hide_gray=False,
     ) -> vtkColorTransferFunction:
-        color_tf = vtkColorTransferFunction()
+        color_tf = vtkDiscretizableColorTransferFunction()
+        color_tf.SetDiscretize(False)
+        visibility = vtkPiecewiseFunction()
+        visibility.AddPoint(0.0, 0.0)
         color_tf.AddRGBPoint(0.0, 0.0, 0.0, 0.0)
         for label_id in range(1, int(label_count) + 1):
             hue = (0.11 + (0.61803398875 * float(label_id))) % 1.0
@@ -1101,9 +1139,16 @@ class VTKScene:
             red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
             if label_id == unassigned_label:
                 red, green, blue = (0.1, 1.0, 0.2)
+            if label_id in gray_labels:
+                red, green, blue = (0.48, 0.50, 0.54)
             x = float(label_id)
             color_tf.AddRGBPoint(x - 0.49, red, green, blue)
             color_tf.AddRGBPoint(x + 0.49, red, green, blue)
+            alpha = 0.0 if hide_gray and label_id in gray_labels else 1.0
+            visibility.AddPoint(x - 0.49, alpha)
+            visibility.AddPoint(x + 0.49, alpha)
+        color_tf.SetScalarOpacityFunction(visibility)
+        color_tf.EnableOpacityMappingOn()
         return color_tf
 
     def capture_snapshot(self, output_path: str | Path, *, scale: int = 2) -> Path:

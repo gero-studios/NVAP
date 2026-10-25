@@ -45,7 +45,6 @@ from nvap.analysis.microglia_analysis import (
     microglia_analysis_to_csv_rows,
 )
 from nvap.analysis.metrics import compute_metrics, metrics_to_csv_rows
-from nvap.analysis.microglia_quality import filter_analyzable_components
 from nvap.analysis.vascular_analysis import (
     analyze_vasculature,
     build_vascular_masks,
@@ -89,11 +88,7 @@ from nvap.pipeline import (
     apply_psf_to_dataset,
     automatic_thresholds,
     fill_and_sync_dataset,
-    prepare_dataset_for_mesh,
-)
-from nvap.analysis.microglia_components import (
-    compute_component_labels,
-    filter_components_by_preferred_voxel_floor,
+    prepare_dataset_for_view,
 )
 from nvap.preprocess.enhancement import (
     enhance_microglia_background,
@@ -122,6 +117,8 @@ from nvap.update_check import UpdateInfo, check_for_update_async
 from nvap.ui.sidebar_pages import SettingsPage
 
 logger = logging.getLogger(__name__)
+from nvap.analysis.contact_components import classify_components
+from nvap.config.types import SomaCriteria
 _METRICS_BACKGROUND_MIN_VOXELS = 20_000_000
 
 # Default render/analysis thresholds chosen for the microscopy workbench.
@@ -152,6 +149,10 @@ class _MicrogliaComponentsTaskResult:
     threshold: float
     branch_sensitivity: float
     shape: tuple[int, int, int]
+    soma_ids: np.ndarray | None = None
+    interior_ids: np.ndarray | None = None
+    interior_min_voxels: int = 128
+    soma_criteria: SomaCriteria = SomaCriteria()
 
 
 @dataclass
@@ -189,6 +190,14 @@ class _ProjectAnalyticsResult:
     files: list[Path]
     sample_count: int
     row_count: int
+
+
+def _materialize_component_labels(shape, sparse) -> np.ndarray:
+    """Restore accepted sparse masks without rerunning segmentation."""
+    labels = np.zeros(shape, dtype=np.int32)
+    for component_id, (bounds, mask) in sparse.items():
+        labels[bounds][mask] = int(component_id)
+    return labels
 
 
 def _vascular_cache_key_for(render: RenderConfig) -> tuple[float, int, int]:
@@ -402,6 +411,8 @@ class MainWindow(QMainWindow):
         self.current_render = self.controls.current_render_config()
         self.latest_metrics: MetricsComputation | None = None
         self.latest_microglia_analysis: MicrogliaAnalysisResult | None = None
+        self._microglia_analysis_thread: _FunctionThread | None = None
+        self._microglia_close_pending = False
         self._metrics_revision = 0
         self._microglia_analysis_revision = 0
         self._metrics_cache_key: tuple[int, float, float, int, int, float, float, float] | None = None
@@ -445,6 +456,11 @@ class MainWindow(QMainWindow):
         self._green_component_branch_sensitivity: float | None = None
         self._green_component_shape: tuple[int, int, int] | None = None
         self._green_component_sparse: dict[int, tuple[tuple[slice, slice, slice], np.ndarray]] = {}
+        self._green_component_cell_ids: frozenset[int] | None = None
+        self._green_component_soma_ids: frozenset[int] | None = None
+        self._green_component_interior_ids: frozenset[int] = frozenset()
+        self._green_component_soma_criteria = SomaCriteria()
+        self._green_component_interior_min_voxels = 128
         self._green_component_coloring_active = False
         self._green_component_unassigned_label = 0
         self._microglia_isolate_active = bool(self.controls.microglia_view_state()[0])
@@ -467,6 +483,7 @@ class MainWindow(QMainWindow):
         self.controls.spacing_changed.connect(self._on_spacing_changed)
         self.controls.render_config_changed.connect(self._on_render_config_changed)
         self.controls.microglia_view_changed.connect(self._on_microglia_view_changed)
+        self.controls.gray_branches_visibility_changed.connect(self._on_gray_branches_visibility_changed)
         self.controls.run_microglia_segmentation_requested.connect(
             self._on_run_microglia_segmentation_requested
         )
@@ -514,6 +531,12 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl(info.download_url))
 
     def closeEvent(self, event) -> None:
+        if self._microglia_analysis_thread is not None:
+            # Keep the worker's owner alive until QThread.finished is delivered.
+            self._microglia_close_pending = True
+            self.hide()
+            event.ignore()
+            return
         try:
             self.controls.force_apply_pending_changes()
         except Exception:
@@ -809,7 +832,7 @@ class MainWindow(QMainWindow):
         analysis_grid.setHorizontalSpacing(12)
         analysis_grid.setVerticalSpacing(12)
         self._analytics_microglia_cards: dict[str, _AnalyticsMetricCard] = {
-            "cells": _AnalyticsMetricCard("Cells analyzed", "--", "Visible separated microglia."),
+            "cells": _AnalyticsMetricCard("Cells analyzed", "--", "Soma-supported objects; gray fragments are excluded."),
             "branches": _AnalyticsMetricCard("Avg branches", "--", "Branch tips per visible cell."),
             "soma": _AnalyticsMetricCard("Avg soma volume", "--", "Non-branched soma body volume."),
             "soma_shape": _AnalyticsMetricCard("Avg soma roundness", "--", "Soma shape: 1.0 is round."),
@@ -821,11 +844,12 @@ class MainWindow(QMainWindow):
         lo.addLayout(analysis_grid)
         lo.addSpacing(16)
 
-        self._analytics_cell_table = QTableWidget(0, 10)
+        self._analytics_cell_table = QTableWidget(0, 11)
         self._analytics_cell_table.setObjectName("analyticsCellTable")
         self._analytics_cell_table.setHorizontalHeaderLabels(
             [
-                "Cell",
+                "Component",
+                "Classification",
                 "Branches",
                 "Branch tortuosity",
                 "Soma (um^3)",
@@ -908,33 +932,111 @@ class MainWindow(QMainWindow):
             return
 
         cache_key = self._microglia_analysis_cache_key_for_render(self.current_render)
-        if self.latest_microglia_analysis is None or self._microglia_analysis_cache_key != cache_key:
-            # Runs synchronously and can take ~1 minute on large volumes; show a
-            # wait cursor + status so the UI doesn't look frozen or stuck on "--".
-            self._analytics_microglia_hint.setText(
-                "Analyzing visible microglia… this can take up to a minute on large volumes."
-            )
-            self.statusBar().showMessage("Analyzing microglia cells…")
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            QApplication.processEvents()
-            try:
-                labels, order, _sizes = self._ensure_microglia_components_current()
-                branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
-                self.latest_microglia_analysis = analyze_microglia_cells(
-                    self.visual_dataset.green.data,
-                    self.visual_dataset.red.data,
-                    labels,
-                    order,
-                    spacing=self.visual_dataset.green.spacing,
-                    render=self.current_render,
-                    branch_sensitivity=branch_sensitivity,
-                )
-                self._microglia_analysis_cache_key = cache_key
-            finally:
-                QApplication.restoreOverrideCursor()
-                self.statusBar().showMessage("Microglia analysis updated.", 3000)
+        if self.latest_microglia_analysis is not None and self._microglia_analysis_cache_key == cache_key:
+            self._set_analytics_microglia_result(self.latest_microglia_analysis)
+            return
+        if self._microglia_analysis_thread is not None or self._microglia_close_pending:
+            return
 
-        self._set_analytics_microglia_result(self.latest_microglia_analysis)
+        # Capture all Qt state here. Segmentation and analysis run without
+        # touching widgets; only one analytics job can be resident at a time.
+        dataset = self.visual_dataset
+        render = replace(self.current_render)
+        branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
+        base_min_voxels = max(64, int(self.preprocess_config.green_speckle_min_voxels) * 4)
+        interior_min_voxels = int(self.controls.current_wipe_speck_max_voxels())
+        spacing = dataset.green.spacing
+        components = None
+        sparse_components = None
+        if (
+            self._green_component_sizes is not None
+            and self._green_component_threshold == float(render.threshold_green)
+            and self._green_component_branch_sensitivity == branch_sensitivity
+            and self._green_component_shape == dataset.green.data.shape
+            and self._green_component_soma_criteria == render.soma_criteria
+            and self._green_component_interior_min_voxels == interior_min_voxels
+        ):
+            if self._green_component_labels is not None:
+                components = (self._green_component_labels, self._green_component_order, self._green_component_sizes)
+            elif self._green_component_sparse or not len(self._green_component_order):
+                sparse_components = (dict(self._green_component_sparse), self._green_component_order, self._green_component_sizes)
+
+        self._clear_analytics_microglia_widgets("Analyzing visible microglia in the background… You can keep using NVAP.")
+        self.statusBar().showMessage("Analyzing microglia cells…")
+
+        def compute() -> object:
+            current = components
+            if current is None and sparse_components is not None:
+                sparse, order, sizes = sparse_components
+                current = (_materialize_component_labels(dataset.green.data.shape, sparse), order, sizes)
+            if current is None:
+                current = self._compute_microglia_components_from_params(
+                    dataset.green.data, threshold=float(render.threshold_green),
+                    branch_sense=branch_sensitivity, base_min_voxels=base_min_voxels,
+                    spacing=(float(spacing.z_um), float(spacing.y_um), float(spacing.x_um)),
+                    trim_first_slices=render.trim_first_slices,
+                    trim_last_slices=render.trim_last_slices,
+                    soma_criteria=render.soma_criteria,
+                )
+            labels, order, sizes = current
+            classification = classify_components(dataset.green.data, labels, order,
+                threshold=float(render.threshold_green), spacing=(spacing.z_um, spacing.y_um, spacing.x_um),
+                trim_first_slices=render.trim_first_slices, trim_last_slices=render.trim_last_slices,
+                interior_min_voxels=interior_min_voxels, soma_criteria=render.soma_criteria,)
+            analysis = analyze_microglia_cells(
+                dataset.green.data, dataset.red.data, labels, classification.cell_ids,
+                spacing=spacing, render=render, branch_sensitivity=branch_sensitivity,
+                components_prepared=True,
+                inferred_component_ids=classification.interior_ids,
+            )
+            return analysis, labels, order, sizes, classification
+
+        def is_current() -> bool:
+            return (
+                not self._microglia_close_pending
+                and self.visual_dataset is dataset
+                and self._microglia_analysis_cache_key_for_render(self.current_render) == cache_key
+            )
+
+        def accept(result: object) -> None:
+            if not is_current():
+                return
+            analysis, labels, order, sizes, classification = result
+            if components is None and sparse_components is None:
+                self._cache_microglia_components(
+                    labels, order, sizes, threshold=float(render.threshold_green),
+                    branch_sensitivity=branch_sensitivity, shape=dataset.green.data.shape,
+                    selected_index=int(self.controls.microglia_view_state()[1]),
+                    soma_ids=classification.soma_ids, interior_ids=classification.interior_ids,
+                    interior_min_voxels=interior_min_voxels,
+                    soma_criteria=render.soma_criteria,
+                )
+            self.latest_microglia_analysis = analysis
+            self._microglia_analysis_cache_key = cache_key
+            self._set_analytics_microglia_result(analysis)
+            self.statusBar().showMessage("Microglia analysis updated.", 3000)
+
+        def failed(error: str) -> None:
+            logger.error("Microglia analytics failed:\n%s", error)
+            if is_current():
+                self._clear_analytics_microglia_widgets("Microglia analysis failed. Reopen Analytics to retry.")
+                self.statusBar().showMessage("Microglia analysis failed.", 5000)
+
+        def finished() -> None:
+            self._microglia_analysis_thread = None
+            thread.deleteLater()
+            if self._microglia_close_pending:
+                self.close()
+            elif not is_current() and self.visual_dataset is not None and self._page_stack.currentIndex() == 2:
+                # Changes made during the job collapse into one fresh request.
+                self._refresh_microglia_analysis()
+
+        thread = _FunctionThread(compute, self)
+        self._microglia_analysis_thread = thread
+        thread.result_ready.connect(accept)
+        thread.error_raised.connect(failed)
+        thread.finished.connect(finished)
+        thread.start()
 
     def _ensure_microglia_components_current(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.visual_dataset is None:
@@ -950,16 +1052,22 @@ class MainWindow(QMainWindow):
             and np.isclose(self._green_component_threshold, threshold, atol=1.0e-6)
             and np.isclose(self._green_component_branch_sensitivity, branch_sensitivity, atol=1.0e-6)
             and self._green_component_shape == green.shape
-            and self._green_component_labels is not None
+            and self._green_component_soma_criteria == self.current_render.soma_criteria
+            and self._green_component_interior_min_voxels == int(self.controls.current_wipe_speck_max_voxels())
+            and (self._green_component_labels is not None or self._green_component_sparse or not len(self._green_component_order))
         ):
+            labels = self._green_component_labels
+            if labels is None:
+                labels = _materialize_component_labels(green.shape, self._green_component_sparse)
             return (
-                np.asarray(self._green_component_labels, dtype=np.int32),
+                np.asarray(labels),
                 np.asarray(self._green_component_order, dtype=np.int32),
                 np.asarray(self._green_component_sizes, dtype=np.int64),
             )
 
         labels, order, sizes = self._compute_microglia_components(green, threshold)
         selected_index = int(self.controls.microglia_view_state()[1])
+        classification = self._classify_component_cells(green, labels, order, threshold)
         self._cache_microglia_components(
             labels,
             order,
@@ -968,6 +1076,9 @@ class MainWindow(QMainWindow):
             branch_sensitivity=branch_sensitivity,
             shape=green.shape,
             selected_index=selected_index,
+            soma_ids=classification.soma_ids, interior_ids=classification.interior_ids,
+            interior_min_voxels=int(self.controls.current_wipe_speck_max_voxels()),
+            soma_criteria=self.current_render.soma_criteria,
         )
         return labels, order, sizes
 
@@ -977,20 +1088,21 @@ class MainWindow(QMainWindow):
 
         self._analytics_microglia_cards["cells"].set_value(
             f"{analysis.analyzed_cell_count:,}",
-            "Visible separated cells in the current view.",
+            f"{sum(cell.soma_detected for cell in analysis.cells)} soma-supported; "
+            f"{sum(cell.inferred_from_z_interior for cell in analysis.cells)} Z-interior inferred.",
         )
         self._analytics_microglia_cards["branches"].set_value(
             f"{analysis.mean_branch_count:,.2f}",
-            f"Avg process branches per cell ({analysis.mean_tip_count:,.1f} tips, "
+            f"Avg process branches per component ({analysis.mean_tip_count:,.1f} tips, "
             f"{analysis.mean_process_length_um:,.1f} um length, "
             f"{analysis.mean_branch_tortuosity:,.2f} tortuosity).",
         )
         self._analytics_microglia_cards["soma"].set_value(
-            f"{analysis.mean_soma_volume_um3:,.1f}",
-            f"Avg soma diameter {analysis.mean_soma_equivalent_diameter_um:,.1f} um.",
+            f"{analysis.mean_soma_volume_um3:,.1f}" if any(cell.soma_detected for cell in analysis.cells) else "--",
+            f"Detected somas only. Avg diameter {analysis.mean_soma_equivalent_diameter_um:,.1f} um.",
         )
         self._analytics_microglia_cards["soma_shape"].set_value(
-            f"{analysis.mean_soma_roundness:,.2f}",
+            f"{analysis.mean_soma_roundness:,.2f}" if any(cell.soma_detected for cell in analysis.cells) else "--",
             "1.0 is rounder; lower values are elongated/rectangular.",
         )
         closest_distance = (
@@ -1010,12 +1122,13 @@ class MainWindow(QMainWindow):
         self._analytics_cell_table.setRowCount(int(len(analysis.cells)))
         for row, cell in enumerate(analysis.cells):
             values = [
-                str(row + 1),
+                str(cell.component_id),
+                "Z-interior inferred" if cell.inferred_from_z_interior else "Soma-supported",
                 str(cell.branch_count),
                 f"{cell.mean_branch_tortuosity:,.2f}",
-                f"{cell.soma_volume_um3:,.1f}",
-                f"{cell.soma_equivalent_diameter_um:,.1f}",
-                f"{cell.soma_roundness:,.2f}",
+                f"{cell.soma_volume_um3:,.1f}" if cell.soma_detected else "--",
+                f"{cell.soma_equivalent_diameter_um:,.1f}" if cell.soma_detected else "--",
+                f"{cell.soma_roundness:,.2f}" if cell.soma_detected else "--",
                 self._format_optional_analytics_value(cell.nearest_tip_to_vessel_um),
                 self._format_optional_analytics_value(cell.nearest_cell_to_vessel_um),
                 self._format_optional_analytics_value(cell.soma_to_vessel_um),
@@ -1035,7 +1148,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self._analytics_microglia_hint.setText(
-                "Selecting a row isolates the same microglia in the viewer and keeps the measurements aligned with the current view."
+                "Rows follow the current soma requirement and size settings. Unassigned fragments stay gray."
             )
         self._analytics_cell_table.resizeColumnsToContents()
         self._sync_analytics_table_selection()
@@ -1095,6 +1208,7 @@ class MainWindow(QMainWindow):
             known_tip_distance_um=known_tip_distance,
             known_soma_distance_um=known_soma_distance,
             known_cell_distance_um=known_cell_distance,
+            allow_soma=component_id not in self._green_component_interior_ids,
         )
         if debug is None:
             self.scene.set_microglia_analysis_debug(None)
@@ -1258,7 +1372,7 @@ class MainWindow(QMainWindow):
     def _microglia_analysis_cache_key_for_render(
         self,
         render: RenderConfig,
-    ) -> tuple[int, tuple[int, int, int], float, float, int, int, float, float, float, float]:
+    ) -> tuple:
         if self.visual_dataset is None:
             raise RuntimeError("No visual dataset loaded.")
         return (
@@ -1272,6 +1386,8 @@ class MainWindow(QMainWindow):
             float(render.offset_y_um),
             float(render.offset_z_um),
             float(self.controls.current_microglia_branch_sensitivity()),
+            int(self.controls.current_wipe_speck_max_voxels()),
+            render.soma_criteria,
         )
 
     def _clear_project_set(self) -> None:
@@ -1462,6 +1578,7 @@ class MainWindow(QMainWindow):
                 preprocess_config=self.preprocess_config,
                 cache_key=self._last_processed_cache_key,
                 enhancement_method=self._current_microglia_enhancement_method,
+                soma_criteria=self.current_render.soma_criteria,
             )
         except OSError as exc:
             self._log_info(f"Project metadata save failed: {exc}")
@@ -1691,6 +1808,9 @@ class MainWindow(QMainWindow):
         return None
 
     def _invalidate_microglia_components(self) -> None:
+        self._green_component_cell_ids = None
+        self._green_component_soma_ids = None
+        self._green_component_interior_ids = frozenset()
         self._green_component_labels = None
         self._green_component_order = np.empty((0,), dtype=np.int32)
         self._green_component_sizes = None
@@ -1705,7 +1825,7 @@ class MainWindow(QMainWindow):
         self.scene.set_channel_component_coloring("green", False)
         self.controls.set_microglia_component_summary(0, 0, 0)
         self.controls.microglia_info.setText(
-            "Use 'Run Segmentation' or enable 'View one microglia' to detect components."
+            "Use 'Run Segmentation' or enable 'View one component' to detect components."
         )
 
     def _compute_microglia_components(
@@ -1727,6 +1847,7 @@ class MainWindow(QMainWindow):
             spacing=spacing_zyx,
             trim_first_slices=self.current_render.trim_first_slices,
             trim_last_slices=self.current_render.trim_last_slices,
+            soma_criteria=self.current_render.soma_criteria,
         )
 
     def _compute_microglia_components_from_params(
@@ -1739,26 +1860,23 @@ class MainWindow(QMainWindow):
         spacing: tuple[float, float, float] | None = None,
         trim_first_slices: int = 0,
         trim_last_slices: int = 0,
+        soma_criteria: SomaCriteria = SomaCriteria(),
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        min_voxels = int(round(base_min_voxels / (0.85 + (0.35 * branch_sense))))
-        min_voxels = max(32, min_voxels)
-        if green.size >= 120 * 1024 * 1024:
-            min_voxels = max(min_voxels, 256)
-        labels, order, sizes = compute_component_labels(
-            green,
-            threshold=threshold,
-            min_voxels=min_voxels,
-            max_components=256,
-            smooth_sigma=(0.2, 0.45, 0.45),
-            branch_sensitivity=branch_sense,
-            spacing=spacing,
-        )
-        labels, order, sizes = filter_analyzable_components(
-            green, labels, order, sizes, threshold=threshold,
+        from nvap.analysis.contact_components import prepare_contact_components
+        return prepare_contact_components(
+            green, threshold=threshold,
             spacing=spacing or (1.0, 1.0, 1.0),
             trim_first_slices=trim_first_slices, trim_last_slices=trim_last_slices,
+            require_soma=False, soma_criteria=soma_criteria,
         )
-        return filter_components_by_preferred_voxel_floor(labels, order, sizes)
+
+    def _classify_component_cells(self, green, labels, order, threshold):
+        spacing = self.visual_dataset.green.spacing
+        return classify_components(green, labels, order, threshold=threshold,
+            spacing=(spacing.z_um, spacing.y_um, spacing.x_um),
+            trim_first_slices=self.current_render.trim_first_slices,
+            trim_last_slices=self.current_render.trim_last_slices,
+            interior_min_voxels=int(self.controls.current_wipe_speck_max_voxels()), soma_criteria=self.current_render.soma_criteria,)
 
     def _cache_microglia_components(
         self,
@@ -1770,7 +1888,17 @@ class MainWindow(QMainWindow):
         branch_sensitivity: float,
         shape: tuple[int, int, int],
         selected_index: int,
+        soma_ids=None,
+        interior_ids=None,
+        interior_min_voxels=128,
+        soma_criteria: SomaCriteria = SomaCriteria(),
     ) -> None:
+        self._green_component_soma_ids = None if soma_ids is None else frozenset(int(cid) for cid in soma_ids)
+        self._green_component_interior_ids = frozenset(int(cid) for cid in (() if interior_ids is None else interior_ids))
+        self._green_component_cell_ids = (None if soma_ids is None else
+            self._green_component_soma_ids | self._green_component_interior_ids)
+        self._green_component_soma_criteria = soma_criteria
+        self._green_component_interior_min_voxels = int(interior_min_voxels)
         label_count = int(len(order))
         if label_count <= int(np.iinfo(np.uint8).max):
             label_dtype = np.uint8
@@ -1828,6 +1956,8 @@ class MainWindow(QMainWindow):
         spacing = self.visual_dataset.green.spacing
         spacing_zyx = (float(spacing.z_um), float(spacing.y_um), float(spacing.x_um))
         base_min_voxels = max(64, int(self.preprocess_config.green_speckle_min_voxels) * 4)
+        interior_min_voxels = int(self.controls.current_wipe_speck_max_voxels())
+        soma_criteria = self.current_render.soma_criteria
         eta_seconds = self._estimate_microglia_separation_eta_seconds(
             green.shape,
             branch_sensitivity,
@@ -1840,6 +1970,8 @@ class MainWindow(QMainWindow):
             and np.isclose(self._green_component_threshold, threshold, atol=1.0e-6)
             and np.isclose(self._green_component_branch_sensitivity, branch_sensitivity, atol=1.0e-6)
             and self._green_component_shape == green.shape
+            and self._green_component_soma_criteria == self.current_render.soma_criteria
+            and self._green_component_interior_min_voxels == int(self.controls.current_wipe_speck_max_voxels())
         ):
             self._push_scene_channels(green_only=True)
             self.scene.apply_render_config(self.current_render)
@@ -1856,8 +1988,12 @@ class MainWindow(QMainWindow):
                 spacing=spacing_zyx,
                 trim_first_slices=quality_trim[0],
                 trim_last_slices=quality_trim[1],
+                soma_criteria=soma_criteria,
             )
             self._publish_busy_progress(percent=75.0, message="Preparing isolate cache...")
+            classification = classify_components(green, labels, order, threshold=threshold,
+                spacing=spacing_zyx, trim_first_slices=quality_trim[0], trim_last_slices=quality_trim[1],
+                interior_min_voxels=interior_min_voxels, soma_criteria=soma_criteria,)
             return _MicrogliaComponentsTaskResult(
                 labels=labels,
                 order=order,
@@ -1865,6 +2001,9 @@ class MainWindow(QMainWindow):
                 threshold=threshold,
                 branch_sensitivity=branch_sensitivity,
                 shape=green.shape,
+                soma_ids=classification.soma_ids, interior_ids=classification.interior_ids,
+                interior_min_voxels=interior_min_voxels,
+                soma_criteria=soma_criteria,
             )
 
         def _on_success(result: object) -> None:
@@ -1874,6 +2013,9 @@ class MainWindow(QMainWindow):
             if not isolate_enabled:
                 return
             self._publish_busy_progress(percent=85.0, message="Updating component cache...")
+            if result.soma_criteria != self.current_render.soma_criteria:
+                QTimer.singleShot(0, self._start_microglia_refresh_task)
+                return
             self._cache_microglia_components(
                 result.labels,
                 result.order,
@@ -1882,12 +2024,17 @@ class MainWindow(QMainWindow):
                 branch_sensitivity=result.branch_sensitivity,
                 shape=result.shape,
                 selected_index=int(current_selected if current_selected > 0 else selected_index),
+                soma_ids=result.soma_ids,
+                interior_ids=result.interior_ids, interior_min_voxels=result.interior_min_voxels,
+                soma_criteria=result.soma_criteria,
             )
             self._publish_busy_progress(percent=92.0, message="Updating 3D view...")
             self._push_scene_channels(green_only=True)
             self.scene.apply_render_config(self.current_render)
             self._refresh_microglia_analysis_debug()
             self._publish_busy_progress(percent=100.0, message="Microglia view updated.")
+            if self._page_stack.currentIndex() == 2:
+                QTimer.singleShot(0, self._refresh_microglia_analysis)
 
         self._start_background_task(
             title="Microglia Separation",
@@ -1918,10 +2065,13 @@ class MainWindow(QMainWindow):
             and np.isclose(self._green_component_threshold, threshold, atol=1.0e-6)
             and np.isclose(self._green_component_branch_sensitivity, branch_sensitivity, atol=1.0e-6)
             and self._green_component_shape == green.shape
+            and self._green_component_soma_criteria == self.current_render.soma_criteria
+            and self._green_component_interior_min_voxels == int(self.controls.current_wipe_speck_max_voxels())
         ):
             return
 
         labels, order, sizes = self._compute_microglia_components(green, threshold)
+        classification = self._classify_component_cells(green, labels, order, threshold)
         self._cache_microglia_components(
             labels,
             order,
@@ -1930,6 +2080,9 @@ class MainWindow(QMainWindow):
             branch_sensitivity=branch_sensitivity,
             shape=green.shape,
             selected_index=selected_index,
+            soma_ids=classification.soma_ids, interior_ids=classification.interior_ids,
+            interior_min_voxels=int(self.controls.current_wipe_speck_max_voxels()),
+            soma_criteria=self.current_render.soma_criteria,
         )
 
     def _current_green_volume_for_view(self) -> np.ndarray:
@@ -1947,7 +2100,7 @@ class MainWindow(QMainWindow):
             return np.zeros(base.shape, dtype=np.uint8)
         count = int(len(self._green_component_order))
         if count == 0:
-            self.controls.microglia_info.setText("No cells eligible for analysis. Excluded signal is hidden.")
+            self.controls.microglia_info.setText("No connected components above threshold.")
             return np.zeros(base.shape, dtype=np.uint8)
         if selected_index <= 0:
             self.controls.set_microglia_component_summary(
@@ -1965,8 +2118,7 @@ class MainWindow(QMainWindow):
                 selected_voxels=int(self._green_component_sizes[component_id]),
             )
 
-        # Show only accepted cell labels consumed by the analysis. Unassigned
-        # fluorescence must not appear to be another measured cell in All.
+        # Cell ownership and gray context retain separate contact-based IDs.
         component_id = int(self._green_component_order[selected_index - 1]) if selected_index > 0 else 0
         threshold = float(np.clip(self.current_render.threshold_green, 1.0e-3, 1.0))
         max_display_label = int(np.max(self._green_component_order))
@@ -1988,6 +2140,7 @@ class MainWindow(QMainWindow):
                 comp_slice, local_mask = sparse
                 visible = local_mask & (base[comp_slice] >= threshold)
                 out[comp_slice][visible] = int(label_id)
+        show_gray = self.controls.show_gray_branches.isChecked()
         if component_id == 0:
             trim_first = max(0, int(self.current_render.trim_first_slices))
             trim_stop = max(trim_first, base.shape[0] - max(0, int(self.current_render.trim_last_slices)))
@@ -1995,9 +2148,15 @@ class MainWindow(QMainWindow):
             visible_count = int(np.count_nonzero(base[trim_first:trim_stop] >= threshold))
             coverage = 100.0 * assigned_count / max(1, visible_count)
             self.controls.microglia_info.setText(
-                f"{count} cells eligible for analysis. {coverage:.1f}% of visible signal assigned. "
-                "Excluded signal is hidden."
+                f"{count} connected component{'s' if count != 1 else ''}. {coverage:.1f}% of visible signal assigned. "
+                + (f"{len(self._green_component_soma_ids)} soma-supported + {len(self._green_component_interior_ids)} Z-interior inferred colored; "
+                   f"{count - len(self._green_component_cell_ids)} unassigned fragments {'gray' if show_gray else 'hidden'}."
+                   if self._green_component_cell_ids is not None else "Soma classification pending.")
             )
+        elif self._green_component_cell_ids is not None and component_id not in self._green_component_cell_ids:
+            self.controls.microglia_info.setText(f"Component {selected_index}/{count}: unassigned fragment; {'gray' if show_gray else 'hidden'}. No confirmed soma in this scan.")
+        elif component_id in self._green_component_interior_ids:
+            self.controls.microglia_info.setText(f"Component {selected_index}/{count}: Z-interior inferred; substantial branching; touches neither retained Z boundary. No detected soma.")
         self._green_component_coloring_active = True
         return out
 
@@ -2017,7 +2176,10 @@ class MainWindow(QMainWindow):
             self._green_component_coloring_active,
             label_count=int(len(self._green_component_order)),
             unassigned_label=self._green_component_unassigned_label,
+            gray_labels=(set(int(cid) for cid in self._green_component_order) - self._green_component_cell_ids
+                         if self._green_component_cell_ids is not None else ()),
         )
+        self.scene.set_gray_branches_visible(self.controls.show_gray_branches.isChecked())
         self.scene.set_channel_data(
             channel="green",
             volume=green_volume,
@@ -2663,6 +2825,14 @@ class MainWindow(QMainWindow):
     ) -> None:
         root = root.resolve()
         self.dataset_root = root
+        state = load_project_state(root)
+        if state and isinstance(state.get("soma_criteria"), dict):
+            try:
+                criteria = SomaCriteria(**state["soma_criteria"])
+                self.controls.set_soma_criteria(criteria)
+                self.current_render = self.controls.current_render_config()
+            except (TypeError, ValueError):
+                self._log_info("Invalid saved soma settings; using current settings.")
         shared_source = channel_dirs["green"].resolve()
         if spacing_override is not None:
             self.controls.set_voxel_spacing(
@@ -2902,7 +3072,7 @@ class MainWindow(QMainWindow):
             progress_bounds=(26.0, 74.0),
         )
         self._log_info("Load step 3/5 complete.")
-        self._publish_busy_progress(percent=76.0, message="Preparing mesh dataset...")
+        self._publish_busy_progress(percent=76.0, message="Preparing native voxel grid...")
 
         enhancement_method: str | None = None
         saved_state = load_project_state(root)
@@ -2927,8 +3097,8 @@ class MainWindow(QMainWindow):
                 enhancement_method = saved_method
                 self._log_info(f"Restored microglia enhancement '{saved_method}' from cache.")
 
-        self._log_info("Load step 4/5: preparing mesh dataset...")
-        visual_dataset = prepare_dataset_for_mesh(processed_dataset, preprocess_cfg)
+        self._log_info("Load step 4/5: preserving native voxel grid...")
+        visual_dataset = prepare_dataset_for_view(processed_dataset, preprocess_cfg)
         self._log_info("Load step 4/5 complete.")
         self._publish_busy_progress(percent=86.0, message="Computing automatic thresholds...")
 
@@ -3140,7 +3310,7 @@ class MainWindow(QMainWindow):
         self._microglia_isolate_active = bool(self.controls.microglia_view_state()[0])
         self.processed_dataset = result
         self._mark_metrics_dirty()
-        self.visual_dataset = prepare_dataset_for_mesh(self.processed_dataset, self.preprocess_config)
+        self.visual_dataset = prepare_dataset_for_view(self.processed_dataset, self.preprocess_config)
         self._publish_busy_progress(percent=94.0, message="Uploading channels to VTK...")
         self._invalidate_microglia_components()
         self._push_scene_channels()
@@ -3296,7 +3466,7 @@ class MainWindow(QMainWindow):
         self.raw_dataset = self._dataset_with_spacing(self.raw_dataset, spacing)
         if self.processed_dataset is not None:
             self.processed_dataset = self._dataset_with_spacing(self.processed_dataset, spacing)
-            self.visual_dataset = prepare_dataset_for_mesh(
+            self.visual_dataset = prepare_dataset_for_view(
                 self.processed_dataset,
                 self.preprocess_config,
             )
@@ -3370,6 +3540,9 @@ class MainWindow(QMainWindow):
             new_z_scale,
             atol=1.0e-6,
         )
+        soma_changed = previous.soma_criteria != config.soma_criteria
+        if soma_changed:
+            self._save_current_project_state()
         trim_changed = self._render_trim_changed(previous, config)
         data_upload_changed = z_scale_changed or trim_changed
         metrics_changed = self._render_config_affects_metrics(previous, config)
@@ -3390,10 +3563,10 @@ class MainWindow(QMainWindow):
             (green_threshold_changed or red_threshold_changed)
             and self.controls.auto_wipe_specks_on_threshold_edit_enabled()
         )
-        if green_threshold_changed or trim_changed:
+        if green_threshold_changed or trim_changed or soma_changed:
             self._invalidate_microglia_components()
         isolate_enabled, _ = self.controls.microglia_view_state()
-        if isolate_enabled and (green_threshold_changed or trim_changed):
+        if isolate_enabled and (green_threshold_changed or trim_changed or soma_changed):
             # Start background microglia refresh which will also push scene
             # channels when done — avoid synchronous watershed here.
             if data_upload_changed:
@@ -3416,6 +3589,24 @@ class MainWindow(QMainWindow):
             self._refresh_metrics()
         if should_auto_wipe:
             self._on_wipe_specks_requested()
+        if soma_changed and self._page_stack.currentIndex() == 2:
+            self._refresh_microglia_analysis()
+
+    def _on_gray_branches_visibility_changed(self, _enabled: bool) -> None:
+        # This is a visibility preference, independent of segmentation/analysis
+        # and the Auto-apply checkbox. Never recompute or invalidate labels.
+        if (self.visual_dataset is None or not self.controls.microglia_view_state()[0]
+            or self._green_component_sizes is None):
+            return
+        self.scene.set_gray_branches_visible(_enabled)
+        if self._green_component_cell_ids is not None:
+            count = len(self._green_component_order)
+            supported = len(self._green_component_cell_ids)
+            self.controls.microglia_info.setText(
+                f"{len(self._green_component_soma_ids)} soma-supported + {len(self._green_component_interior_ids)} Z-interior inferred colored; "
+                f"{count - supported} unassigned fragments "
+                f"{'gray' if _enabled else 'hidden'}. They may originate outside this scan."
+            )
 
     def _on_microglia_view_changed(self) -> None:
         if self.visual_dataset is None or self.processed_dataset is None:
@@ -3511,7 +3702,7 @@ class MainWindow(QMainWindow):
         self._publish_busy_progress(percent=90.0, message="Preparing enhanced render...")
         self.processed_dataset = result
         self._mark_metrics_dirty()
-        self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
+        self.visual_dataset = prepare_dataset_for_view(result, self.preprocess_config)
         self._invalidate_microglia_components()
         self._push_scene_channels()
         self.current_render = self.controls.current_render_config()
@@ -3580,7 +3771,7 @@ class MainWindow(QMainWindow):
         self._publish_busy_progress(percent=90.0, message="Preparing enhanced render...")
         self.processed_dataset = result
         self._mark_metrics_dirty()
-        self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
+        self.visual_dataset = prepare_dataset_for_view(result, self.preprocess_config)
         self._invalidate_microglia_components()
         self._push_scene_channels()
         self.current_render = self.controls.current_render_config()
@@ -3750,7 +3941,7 @@ class MainWindow(QMainWindow):
         self._publish_busy_progress(percent=90.0, message="Preparing render...")
         self.processed_dataset = result
         self._mark_metrics_dirty()
-        self.visual_dataset = prepare_dataset_for_mesh(result, self.preprocess_config)
+        self.visual_dataset = prepare_dataset_for_view(result, self.preprocess_config)
         self._invalidate_microglia_components()
         self._push_scene_channels()
         self._publish_busy_progress(percent=96.0, message="Refreshing render...")
@@ -4030,7 +4221,7 @@ class MainWindow(QMainWindow):
                 ),
                 shared_z_range=processed.shared_z_range,
             )
-            visual = prepare_dataset_for_mesh(processed, config.preprocess)
+            visual = prepare_dataset_for_view(processed, config.preprocess)
 
             stage(0.70, "computing whole-volume metrics...")
             metrics = compute_metrics(processed, config.render)
@@ -4071,15 +4262,22 @@ class MainWindow(QMainWindow):
                 spacing=spacing_zyx,
                 trim_first_slices=config.render.trim_first_slices,
                 trim_last_slices=config.render.trim_last_slices,
+                soma_criteria=config.render.soma_criteria,
             )
+            classification = classify_components(visual.green.data, labels, order,
+                threshold=config.render.threshold_green, spacing=spacing_zyx,
+                trim_first_slices=config.render.trim_first_slices, trim_last_slices=config.render.trim_last_slices,
+                interior_min_voxels=config.wipe_max_voxels, soma_criteria=config.render.soma_criteria,)
             microglia = analyze_microglia_cells(
                 visual.green.data,
                 visual.red.data,
                 labels,
-                order,
+                classification.cell_ids,
                 spacing=visual.green.spacing,
                 render=config.render,
                 branch_sensitivity=float(config.branch_sensitivity),
+                components_prepared=True,
+                inferred_component_ids=classification.interior_ids,
             )
             individual_rows.extend(
                 self._stamp_project_rows(
@@ -4179,6 +4377,9 @@ class MainWindow(QMainWindow):
             "sample_path": str(entry.root),
             "threshold_green": float(config.render.threshold_green),
             "threshold_red": float(config.render.threshold_red),
+            "soma_required": config.render.soma_required,
+            "soma_min_radius_um": config.render.soma_min_radius_um,
+            "soma_min_core_volume_um3": config.render.soma_min_core_volume_um3,
             "trim_first_slices": int(config.render.trim_first_slices),
             "trim_last_slices": int(config.render.trim_last_slices),
             "offset_x_um": float(config.render.offset_x_um),
@@ -4400,6 +4601,7 @@ class MainWindow(QMainWindow):
         context = _AnalyticsExportContext(dataset, render, microglia, self._provenance_rows())
         branch_sensitivity = float(self.controls.current_microglia_branch_sensitivity())
         base_min_voxels = max(64, int(self.preprocess_config.green_speckle_min_voxels) * 4)
+        interior_min_voxels = int(self.controls.current_wipe_speck_max_voxels())
 
         def _export_task() -> tuple[Path, list[Path]]:
             self._publish_busy_progress(percent=10.0, message="Computing current channel metrics...")
@@ -4417,10 +4619,17 @@ class MainWindow(QMainWindow):
                     spacing=(float(spacing.z_um), float(spacing.y_um), float(spacing.x_um)),
                     trim_first_slices=render.trim_first_slices,
                     trim_last_slices=render.trim_last_slices,
+                    soma_criteria=render.soma_criteria,
                 )
+                classification = classify_components(visual.green.data, labels, order,
+                    threshold=render.threshold_green, spacing=(spacing.z_um, spacing.y_um, spacing.x_um),
+                    trim_first_slices=render.trim_first_slices, trim_last_slices=render.trim_last_slices,
+                    interior_min_voxels=interior_min_voxels, soma_criteria=render.soma_criteria,)
                 analysis = analyze_microglia_cells(
-                    visual.green.data, visual.red.data, labels, order,
+                    visual.green.data, visual.red.data, labels, classification.cell_ids,
                     spacing=spacing, render=render, branch_sensitivity=branch_sensitivity,
+                    components_prepared=True,
+                    inferred_component_ids=classification.interior_ids,
                 )
             provenance = [row for row in context.provenance if row["setting"] != "microglia_cell_count"]
             provenance.append({"setting": "microglia_cell_count", "value": analysis.analyzed_cell_count})
@@ -4534,6 +4743,12 @@ class MainWindow(QMainWindow):
             "compute_backend": os.environ.get("NVAP_GPU_BACKEND", "auto"),
             "threshold_green": float(render.threshold_green),
             "threshold_red": float(render.threshold_red),
+            "microglia_inclusion_rule": "soma_required" if render.soma_required else "soma_supported_or_z_interior_inferred",
+            "soma_min_radius_um": render.soma_min_radius_um,
+            "soma_min_core_volume_um3": render.soma_min_core_volume_um3,
+            "z_interior_min_voxels": int(self.controls.current_wipe_speck_max_voxels()),
+            "soma_required": render.soma_required,
+            "z_interior_requires_substantial_arbor": True,
             "trim_first_slices": int(render.trim_first_slices),
             "trim_last_slices": int(render.trim_last_slices),
             "offset_x_um": float(render.offset_x_um),

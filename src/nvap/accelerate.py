@@ -54,13 +54,17 @@ def _runtime_supports_filters(torch, F, device, backend: str) -> bool:
 
 @lru_cache(maxsize=4)
 def _torch_runtime(preferred_backend: str = "auto"):
+    candidates = _backend_candidates(preferred_backend)
+    if not candidates:
+        # CPU mode must not import/initialize an unused Torch installation.
+        return None
     try:
         import torch
         import torch.nn.functional as F
     except ImportError:
         return None
 
-    for candidate in _backend_candidates(preferred_backend):
+    for candidate in candidates:
         if candidate in {"cuda", "rocm"}:
             if not torch.cuda.is_available():
                 continue

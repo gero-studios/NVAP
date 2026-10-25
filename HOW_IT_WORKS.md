@@ -62,23 +62,21 @@ driven by the UI in `src/nvap/ui/main_window.py`):
    branch-preserving microglia pipeline. The green channel bypasses PSF
    deconvolution by default (`pipeline._green_bypasses_psf`).
 
-4. **Component labelling** (`analysis/microglia_components.py`). The masked green
-   volume is separated into individual microglia. Soma-like blobs are detected
-   from the Euclidean distance transform (thick interior regions), used as seeds,
-   and grown outward so each connected cell — including touching cells — gets its
-   own label. Unseeded regions are checked for soma-sized interiors at the active
-   threshold. A second growth pass follows fainter measured signal to recover
-   disconnected branches when they have one cell owner; these weak paths establish
-   ownership without adding below-mask voxels to the measured cell. Ambiguous
-   fragments remain unassigned and are hidden in the segmented view. Smaller accepted cells are
-   preserved. Components are ranked by size (unusually large objects may follow
-   typical cells); that ranking is the `Cell` index in the viewer. The viewer also
-   reports assignment coverage within the current slice trim.
+4. **Component labelling** (`analysis/contact_components.py`). Visible green
+   voxels at the active threshold are grouped by shared-face 3D contact. Each
+   disconnected piece gets its own ID. Detected soma cores may split a touching
+   cluster, and components without a supported soma remain gray. There is
+   no faint-path growth, distance-based attachment, minimum size gate or top-256
+   cutoff during segmentation. Speck removal remains a separate preprocessing
+   control. Components are ranked by size and navigated by `Component` index.
+   The view reports coverage of signal within the active slice trim.
 
 5. **Render and analyse.** The renderer (`render/vtk_scene.py`) and the analysis
    modules (`analysis/`) both consume the processed dataset and the active
-   `RenderConfig`. For mesh rendering only, the volume is resampled toward
-   isotropic z-spacing (`preprocess/resample.py`); metrics are always computed on
+   `RenderConfig`. The view and measurements retain the processed native voxel
+   grid (`pipeline.prepare_dataset_for_view`). The renderer maps labels into its
+   display grid with nearest-neighbor sampling after segmentation. Explicit mesh
+   preparation uses its separate resampling path; metrics are computed on
    the non-resampled data.
 
 6. **Export** (`export/exporters.py`, `export/mesh_export.py`). Metrics to CSV,
@@ -172,14 +170,39 @@ density and radius metrics available otherwise.
 One row per cell in `metrics_microglia.csv`. Each cell is processed inside its
 own bounding box for speed.
 
-The colored cell view and analysis share a single-soma eligibility check
-(`microglia_quality.py`). Only visible signal at the current green threshold
-and within the slice trim counts. A component must contain exactly one supported
-soma core: radius at least 1 µm, with at least 1 µm³ of core support above the
-larger of 1 µm or 45% of its maximum interior radius. Components with no qualifying
-core or multiple qualifying cores are excluded from both the colored view and
-cell analysis. These are application quality thresholds, not a validated
-biological classification. The full arbor of each eligible cell is retained.
+The component view uses visible-contact segmentation (`contact_components.py`).
+Every face-connected visible island keeps a separate ID. Corner-only or edge-only contact cannot transfer a cell color. A supported soma gives an
+object a cell color; other objects initially remain visible in neutral
+gray. Gray pieces share a context color but never share a cell identity. The **Show gray branches** toggle changes rendering opacity only, including surface and volume modes. It does not relabel objects, rerun segmentation, upload another volume or alter cell statistics. Gray fragments may belong to somas outside the scanned volume. Faint
+paths below the display threshold and proximity do not establish ownership.
+Multiple detected soma cores can split a touching cluster.
+
+Soma detection requires an interior radius of at least 1 micrometer and at
+least 0.1 cubic micrometers of supported core with multiple sampled voxels.
+The core must span all three axes and have a smallest-to-largest covariance
+axis ratio of at least 0.15. Single-plane knots, tiny peaks and long filamentary
+cores remain uncertain gray context. Smaller compact 3D somas remain eligible.
+These are conservative morphological criteria, not a validated cell classifier.
+
+The Z-interior inclusion rule also gives a separate cell color to a face-connected
+component touching neither the first nor last retained Z plane, provided it meets
+the current speck-size floor (128 voxels by default) and substantial-arbor
+criteria: 20 µm³ foreground volume, 8 µm extent on two axes, 30 µm total skeleton
+length, and at least three terminal arms each 3 µm long. Supported somas bypass
+these arbor floors; small soma-free twigs and unbranched fibers remain gray.
+Only Z boundaries are tested;
+X/Y edge contact does not disqualify a component. This is a user-defined inference,
+not a detected soma. The viewer and CSV distinguish `z_interior_inferred` from
+`soma_supported`, and inferred candidates have no fabricated soma measurements.
+
+Cell analytics and population statistics include both categories; gray
+fragments remain separate context and are excluded from cell counts. Their
+component IDs can still be isolated in the viewer. Connectivity and soma detection run on native processed voxels. Fluorescence is
+not interpolated into a different Z grid before thresholding; that would break
+thin measured connections. The default end trim is zero;
+explicit trims apply to both view and measurements. Categorical labels retain
+their native render-upload grid, avoiding pooling that erases small objects or
+changes contact boundaries.
 
 **Soma segmentation.** The soma is the thick core of the cell: within a component,
 the distance-transform peak marks the centre, and voxels above a fraction of that
@@ -314,7 +337,26 @@ measured and is measured where it appears.
 
 ---
 
-## 8. Module map
+## 8. Processing performance
+
+Image stacks are decoded directly into their destination volumes, with bounded
+read queues. Already complete, aligned stacks and disabled PSF stages use
+read-only views to avoid copying entire channels. Microscopy cleanup reuses
+workers and exact morphology kernels; rolling-ball processing omits only kernel
+positions that cannot affect the result at the image's intensity range.
+
+Contact segmentation labels the visible mask directly and inspects compact
+component boxes for optional soma split cues. Analytics reuses these accepted
+dense or sparse labels. Direct analysis calls apply the same contact repair.
+
+Per-cell measurements use up to two workers by default, with deterministic output
+order. Available memory and cell bounding-box sizes limit concurrent work; large
+cells run individually. These changes retain the existing resolution, thresholds,
+cell ownership rules and measurement definitions.
+
+---
+
+## 9. Module map
 
 | Path | Responsibility |
 |------|----------------|
@@ -334,3 +376,16 @@ measured and is measured where it appears.
 | `cache/processed_cache.py` | Processed-volume cache. |
 | `runtime_optimization.py`, `accelerate.py` | Backend/worker selection and GPU filters. |
 | `plugins/` | Plugin discovery and the analyzer protocol. |
+
+
+### Soma controls
+
+In **Microglia Workbench**, **Require detected soma** excludes all soma-free
+objects from cell colors, analysis and cell counts, including large Z-interior
+arbors. Leave it unchecked to allow the substantial-arbor exception. **Min soma
+radius** sets the minimum inscribed radius (default 1 µm, equivalent to 2 µm
+local thickness). **Min soma core volume** sets the minimum supported thick-core
+volume (default 0.1 µm³), rather than whole-cell volume. Compact 3D support is
+still required. The size settings apply in either mode and also affect separation
+of touching soma-supported cells. Use Apply changes when Auto-apply is off.
+Settings are saved with the dataset and recorded in analysis export provenance.

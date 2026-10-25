@@ -151,6 +151,7 @@ class ControlPanel(QWidget):
     psf_config_changed                = Signal(object)
     spacing_changed                   = Signal(object)
     microglia_view_changed            = Signal()
+    gray_branches_visibility_changed = Signal(bool)
     run_microglia_segmentation_requested = Signal()
     run_microglia_analysis_requested  = Signal()
     enhance_microglia_requested       = Signal()
@@ -464,13 +465,22 @@ class ControlPanel(QWidget):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        self.microglia_isolate = QCheckBox("View one microglia")
+        self.microglia_isolate = QCheckBox("View one component")
         self.microglia_isolate.setToolTip(
             "Show segmented components with distinct tints. Choose All to view "
-            "them together, or a Cell index to isolate one with the same tint."
+            "them together, or a Component index to isolate one with the same tint."
         )
         self.microglia_isolate.toggled.connect(self._on_microglia_setting_changed)
         form.addRow(self.microglia_isolate)
+
+        self.show_gray_branches = QCheckBox("Show gray branches")
+        self.show_gray_branches.setChecked(True)
+        self.show_gray_branches.setToolTip(
+            "Show unassigned branches and uncertain objects in gray. They may "
+            "belong to cells outside the scanned volume and are excluded from cell counts."
+        )
+        self.show_gray_branches.toggled.connect(self.gray_branches_visibility_changed.emit)
+        form.addRow(self.show_gray_branches)
 
         # Cell navigation
         nav_row = QHBoxLayout()
@@ -479,7 +489,7 @@ class ControlPanel(QWidget):
         self.microglia_prev = QPushButton()
         self.microglia_prev.setIcon(icon("chevron-left", ICON_SM, COLOR.text_secondary))
         self.microglia_prev.setFixedSize(28, 28)
-        self.microglia_prev.setToolTip("Previous microglia")
+        self.microglia_prev.setToolTip("Previous component")
         self.microglia_prev.clicked.connect(self._on_microglia_prev)
         nav_row.addWidget(self.microglia_prev)
 
@@ -492,15 +502,31 @@ class ControlPanel(QWidget):
         self.microglia_next = QPushButton()
         self.microglia_next.setIcon(icon("chevron-right", ICON_SM, COLOR.text_secondary))
         self.microglia_next.setFixedSize(28, 28)
-        self.microglia_next.setToolTip("Next microglia")
+        self.microglia_next.setToolTip("Next component")
         self.microglia_next.clicked.connect(self._on_microglia_next)
         nav_row.addWidget(self.microglia_next)
 
-        form.addRow("Cell", nav_row)
+        form.addRow("Component", nav_row)
 
         self.microglia_info = QLabel("Load a dataset to detect microglia components.")
         self.microglia_info.setWordWrap(True)
         form.addRow(self.microglia_info)
+
+        self.soma_required = QCheckBox("Require detected soma")
+        self.soma_required.setToolTip("When checked, only soma-supported objects receive cell colors and enter cell counts. Unchecked also allows substantial Z-interior arbors.")
+        self.soma_required.toggled.connect(self._on_render_setting_changed)
+        form.addRow(self.soma_required)
+        self.soma_min_radius_um = self._make_unit_spinbox(0.2, 20.0, 0.1, 1.0)
+        self.soma_min_radius_um.setSuffix(" µm")
+        self.soma_min_radius_um.setToolTip("Minimum inscribed soma radius (half its local thickness), in physical units. Default: 1 µm.")
+        self.soma_min_radius_um.valueChanged.connect(self._on_render_setting_changed)
+        form.addRow("Min soma radius", self.soma_min_radius_um)
+        self.soma_min_core_volume_um3 = self._make_unit_spinbox(0.001, 1000.0, 0.1, 0.1)
+        self.soma_min_core_volume_um3.setDecimals(3)
+        self.soma_min_core_volume_um3.setSuffix(" µm³")
+        self.soma_min_core_volume_um3.setToolTip("Minimum volume of the supported thick soma core, not the whole cell. The core must still be compact and span all three axes.")
+        self.soma_min_core_volume_um3.valueChanged.connect(self._on_render_setting_changed)
+        form.addRow("Min soma core volume", self.soma_min_core_volume_um3)
 
         self.microglia_branch_sensitivity = self._make_unit_spinbox(0.4, 2.0, 0.05, 1.0)
         self.microglia_branch_sensitivity.setVisible(False)
@@ -1039,7 +1065,21 @@ class ControlPanel(QWidget):
             show_red=self.show_red.isChecked(),
             show_iso_green=self.show_iso_green.isChecked(),
             show_iso_red=self.show_iso_red.isChecked(),
+            soma_required=self.soma_required.isChecked(),
+            soma_min_radius_um=float(self.soma_min_radius_um.value()),
+            soma_min_core_volume_um3=float(self.soma_min_core_volume_um3.value()),
         )
+
+    def set_soma_criteria(self, criteria) -> None:
+        controls = (self.soma_required, self.soma_min_radius_um, self.soma_min_core_volume_um3)
+        previous = [widget.blockSignals(True) for widget in controls]
+        try:
+            self.soma_required.setChecked(criteria.required)
+            self.soma_min_radius_um.setValue(criteria.min_radius_um)
+            self.soma_min_core_volume_um3.setValue(criteria.min_core_volume_um3)
+        finally:
+            for widget, blocked in zip(controls, previous):
+                widget.blockSignals(blocked)
 
     def current_voxel_spacing(self) -> VoxelSpacing:
         return VoxelSpacing(
@@ -1170,7 +1210,7 @@ class ControlPanel(QWidget):
             self.microglia_info.setText("No microglia component found above threshold.")
             return
         if selected <= 0:
-            self.microglia_info.setText(f"{total} cells eligible for analysis. Showing all.")
+            self.microglia_info.setText(f"{total} connected component{'s' if total != 1 else ''}. Showing all.")
             return
         self.microglia_info.setText(
             f"Component {selected}/{total} · voxels={int(selected_voxels)}"

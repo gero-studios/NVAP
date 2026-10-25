@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from nvap.config.types import PSFConfig, PreprocessConfig, VoxelSpacing
+from nvap.config.types import PSFConfig, PreprocessConfig, VoxelSpacing, SomaCriteria
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ def save_project_state(
     preprocess_config: PreprocessConfig,
     cache_key: str | None = None,
     enhancement_method: str | None = None,
+    soma_criteria: SomaCriteria | None = None,
 ) -> Path:
     """Write a small project descriptor next to the dataset."""
     root_path = Path(root).resolve()
@@ -58,6 +59,7 @@ def save_project_state(
         "spacing": _dataclass_payload(spacing),
         "psf_config": _dataclass_payload(psf_config),
         "preprocess_config": _dataclass_payload(preprocess_config),
+        "soma_criteria": _dataclass_payload(soma_criteria),
     }
     path = project_file_path(root_path)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

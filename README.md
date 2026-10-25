@@ -188,7 +188,7 @@ preprocessing, and denoising settings.
 - **Isosurface toggles:** show a solid surface at the threshold instead of a
   translucent cloud.
 - **Trim first/last Z:** exclude edge slices from both the view and all metrics
-  (default: 10 slices at each end).
+  (default: 0; the complete stack is retained until you choose a trim).
 - **Offset (x/y/z):** shift the green channel relative to red to correct
   registration; applied identically to the view and the overlap metric.
 - **Z height scale:** a display-only depth scale (default `0.70`; `1.0` matches
@@ -199,19 +199,31 @@ preprocessing, and denoising settings.
 
 Use the **Microglia Viewer** panel to inspect one green component at a time:
 
-1. Enable **View one microglia**.
-2. Select a **Cell** index to isolate that component in 3D.
+1. Enable **View one component**.
+2. Select a **Component** index to isolate that component in 3D.
 
-After **Run Segmentation**, **All** shows each detected component with its own
-tint in both volume and surface rendering. Isolating a cell keeps its tint.
-Signal that has not been assigned to an accepted cell is hidden in the segmented
-view, including **All**. Only cell labels used for analysis are shown.
-The viewer reports the percentage of visible signal assigned to cells.
-Segmentation checks unassigned regions for dimmer cell bodies and reconnects
-branches through faint measured signal paths. Smaller accepted cells are kept
-alongside larger cells. Fragments with competing cell owners remain unassigned.
-The current green threshold and slice trim still apply; the underlying
-enhanced intensities and analysis data are unchanged.
+After **Run Segmentation**, **All** shows soma-supported objects and Z-interior
+inferred candidates in cell colors; other components appear in neutral gray. Each visible face-connected
+piece keeps its own ID; gray fragments are not one shared cell. A distant piece
+cannot inherit a soma through a subthreshold path or distance rule. Detected
+soma cores can split touching clusters, and smaller supported somas are retained.
+
+Gray fragments remain available for visual inspection and isolation. Use
+**Show gray branches** to hide or reveal them immediately, independently of
+Auto-apply. This does not change cell counts or segmentation. They may originate
+from cells outside the scanned volume. A component touching neither the first nor
+last retained Z plane bypasses soma detection if it meets the current speck-size
+floor (128 voxels by default) and has substantial branching: at least 20 µm³
+of foreground, 8 µm extent on two axes, 30 µm of skeleton length, and three
+terminal arms of at least 3 µm each. Small isolated twigs and unbranched fibers
+stay gray. X/Y edge contact does not disqualify it. The viewer
+and CSV identify this user-defined inference as **Z-interior inferred**, without
+inventing soma measurements. Cell analytics and population statistics include
+soma-supported and Z-interior inferred candidates and exclude
+gray fragments from cell counts. The current threshold and explicit slice trim
+define visible contact. Native categorical render labels preserve small objects.
+Connectivity and cell measurements use the original processed voxel grid; display
+resampling happens after labels are assigned, preserving native branch contact.
 
 Components are ranked by size (largest first) at the current green threshold.
 
@@ -351,3 +363,16 @@ Force a packaging profile:
 NVAP exposes plugin discovery through the `nvap.plugins` entry-point group and a
 `ChannelAnalyzerPlugin` protocol (`src/nvap/plugins/`). This is an extension
 point for adding custom per-channel analyzers; no analyzers ship by default.
+
+
+### Soma controls
+
+In **Microglia Workbench**, **Require detected soma** excludes all soma-free
+objects from cell colors, analysis and cell counts, including large Z-interior
+arbors. Leave it unchecked to allow the substantial-arbor exception. **Min soma
+radius** sets the minimum inscribed radius (default 1 µm, equivalent to 2 µm
+local thickness). **Min soma core volume** sets the minimum supported thick-core
+volume (default 0.1 µm³), rather than whole-cell volume. Compact 3D support is
+still required. The size settings apply in either mode and also affect separation
+of touching soma-supported cells. Use Apply changes when Auto-apply is off.
+Settings are saved with the dataset and recorded in analysis export provenance.

@@ -2,20 +2,25 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import inspect
 import os
 import time
 from typing import Callable
+from functools import lru_cache
 
 import numpy as np
 import scipy.ndimage as ndi
 from skimage import exposure
 from skimage.filters import apply_hysteresis_threshold, frangi, meijering, sato, threshold_otsu
-from skimage.morphology import binary_closing, binary_dilation, binary_opening, remove_small_holes, remove_small_objects, disk, white_tophat
-from skimage.restoration import denoise_bilateral, denoise_nl_means, denoise_wavelet, rolling_ball
+from skimage.morphology import disk, white_tophat
+from skimage.restoration import denoise_bilateral, denoise_nl_means, denoise_wavelet, rolling_ball, ball_kernel
 
 from nvap.accelerate import torch_gaussian_filter
 from nvap.config.types import ChannelVolume, DatasetVolume, PreprocessConfig
 from nvap.preprocess._executor import get_executor
+from nvap.preprocess.morphology import (
+    binary_closing, binary_dilation, binary_opening, remove_small_holes, remove_small_objects,
+)
 from nvap.preprocess.denoisers import (
     denoise_wavelet_3d,
     estimate_noise_sigma,
@@ -27,6 +32,42 @@ logger = logging.getLogger(__name__)
 _BRANCH_MAP_CHUNK_THRESHOLD = 64 * 1024 * 1024
 _FAST_BG_VOXEL_THRESHOLD = 64 * 1024 * 1024
 _GPU_FILTER_MIN_VOXELS = 4 * 1024 * 1024
+_ROLLING_BALL_WORKER_KEY = 'workers' if 'workers' in inspect.signature(rolling_ball).parameters else 'num_threads'
+
+
+@lru_cache(maxsize=16)
+def _cached_ball_kernel(radius: int, ndim: int) -> np.ndarray:
+    kernel = ball_kernel(radius, ndim)
+    kernel.flags.writeable = False
+    return kernel
+
+
+def _rolling_ball_background_fast(image: np.ndarray, radius: int, *, workers: int = 1) -> np.ndarray:
+    """Exact rolling ball, pruning kernel offsets that cannot win a minimum.
+
+    For an image in [lo, hi], an offset whose ball height difference exceeds
+    hi-lo cannot beat the center pixel. Normalized fluorescence images have
+    a small range, so radius-18 balls need far fewer than all 37x37 offsets.
+    Retained kernel samples and border handling are the library's originals.
+    """
+    kwargs = {_ROLLING_BALL_WORKER_KEY: workers}
+    arr = np.asarray(image)
+    if arr.size == 0 or arr.dtype not in (np.dtype('float32'), np.dtype('float64')):
+        return rolling_ball(arr, radius=radius, **kwargs)
+    lo, hi = float(np.min(arr)), float(np.max(arr))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return rolling_ball(arr, radius=radius, **kwargs)
+    kernel = _cached_ball_kernel(int(radius), arr.ndim)
+    typed = kernel.astype(arr.dtype)
+    center = np.asarray(typed.shape) // 2
+    center_value = typed[tuple(center)]
+    # Include near ties under floating-point rounding as well as exact ties.
+    guard = 8 * np.finfo(arr.dtype).eps * max(1.0, abs(lo), abs(hi), abs(float(center_value)))
+    eligible = np.isfinite(typed) & ((center_value - typed) <= (hi - lo + guard))
+    coordinates = np.nonzero(eligible)
+    extents = [max(int(c) - int(axis.min()), int(axis.max()) - int(c)) for axis, c in zip(coordinates, center)]
+    bounds = tuple(slice(int(c) - extent, int(c) + extent + 1) for c, extent in zip(center, extents))
+    return rolling_ball(arr, radius=radius, kernel=kernel[bounds], **kwargs)
 
 
 def _gaussian_filter_fast(
@@ -55,6 +96,8 @@ def _resolve_worker_threads(config: PreprocessConfig) -> int:
 
 
 def _fmt_stage_stats(arr: np.ndarray) -> str:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return f"shape={arr.shape} dtype={arr.dtype}"
     finite = np.asarray(arr, dtype=np.float32)
     if finite.size == 0:
         return "empty"
@@ -749,20 +792,30 @@ def _keep_process_like_components(
         return np.zeros_like(mask, dtype=bool)
 
     keep = np.zeros(int(count) + 1, dtype=bool)
-    for label, bbox in enumerate(ndi.find_objects(labels), start=1):
+    sizes = np.bincount(labels.ravel(), minlength=count + 1)
+    objects = ndi.find_objects(labels)
+    # Every acceptance rule requires at least seven pixels. Most background
+    # components are tiny dots; avoid Python masks and means for all of them.
+    candidates = np.flatnonzero(sizes >= 7)
+    for label in candidates[candidates > 0]:
+        bbox = objects[label - 1]
         if bbox is None:
             continue
-        component = labels[bbox] == label
-        area = int(np.count_nonzero(component))
-        if area <= 0:
-            continue
-
-        height, width = component.shape
+        area = int(sizes[label])
+        height, width = (axis.stop - axis.start for axis in bbox)
         longest = max(height, width)
         shortest = max(1, min(height, width))
         aspect = float(longest) / float(shortest)
         extent = float(area) / float(max(1, height * width))
+        could_broad = area >= 44
+        could_elongated = longest >= 6 and aspect >= 1.8
+        could_supported = area >= 20 and longest >= 6 and extent <= 0.78
+        if not (could_broad or could_elongated or could_supported):
+            continue
+        component = labels[bbox] == label
         vessel_mean = float(np.mean(vesselness[bbox][component]))
+        if vessel_mean < 0.10:
+            continue
         detail_mean = float(np.mean(detail[bbox][component]))
 
         broad_process = area >= 44 and vessel_mean >= 0.12 and detail_mean >= 0.035
@@ -822,7 +875,10 @@ def _microscopy_clean_background(
         plane_smooth = ndi.gaussian_filter(plane, sigma=0.65, mode="nearest")
 
         try:
-            background = rolling_ball(plane_smooth, radius=18)
+            background = _rolling_ball_background_fast(
+                plane_smooth, radius=18,
+                workers=1 if workers > 1 else configured_cpu_workers(),
+            )
             detail = np.maximum(plane_smooth - np.asarray(background, dtype=np.float32), 0.0)
         except Exception:
             background = ndi.gaussian_filter(plane_smooth, sigma=18.0, mode="nearest")
@@ -949,7 +1005,7 @@ def _microscopy_clean_background(
         logger.info("microscopy_clean: parallel workers=%d slices=%d", workers, depth)
         progress_every = max(1, depth // 8)
         completed = 0
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nvap-mclean") as pool:
+        with get_executor(workers, "nvap-mclean") as pool:
             for future in as_completed([pool.submit(_run_slice, z) for z in range(depth)]):
                 try:
                     z, plane_out = future.result()
@@ -1041,12 +1097,19 @@ def _reconnect_and_denoise_microglia(
             anchor_ids = comp_ids[substantial]
         else:
             anchor_ids = comp_ids[[int(np.argmax(sizes))]]
-        anchor_mask = np.isin(labels, anchor_ids)
+        anchor_lut = np.zeros(n + 1, dtype=bool)
+        anchor_lut[anchor_ids] = True
+        anchor_mask = anchor_lut[labels]
         dist_to_anchor = ndi.distance_transform_edt(~anchor_mask)
-        min_dist = np.asarray(ndi.minimum(dist_to_anchor, labels, comp_ids), dtype=np.float64)
-        is_anchor = np.isin(comp_ids, anchor_ids)
+        # min(distance for a component) <= cutoff is exactly equivalent to
+        # having any voxel inside that cutoff. Bincount avoids ndimage's full
+        # volume label sort/reduction and its large temporary index arrays.
+        near_anchor = np.bincount(
+            labels[dist_to_anchor <= float(far_voxels)], minlength=n + 1,
+        ) > 0
+        is_anchor = anchor_lut[comp_ids]
         keep_comp = is_anchor | (
-            (sizes >= int(min_object_voxels)) & (min_dist <= float(far_voxels))
+            (sizes >= int(min_object_voxels)) & near_anchor[comp_ids]
         )
         lut = np.zeros(n + 1, dtype=bool)
         lut[comp_ids[keep_comp]] = True

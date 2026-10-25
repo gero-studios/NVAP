@@ -34,13 +34,48 @@ def normalize_backend(value: str | None, default: str = "auto") -> str:
     return backend if backend in _VALID_BACKENDS else default
 
 
-def _total_memory_gb() -> float | None:
+def _system_memory_gb(*, available: bool = False) -> float | None:
     try:
         import psutil  # type: ignore
 
-        return float(psutil.virtual_memory().total / (1024**3))
+        memory = psutil.virtual_memory()
+        return float((memory.available if available else memory.total) / (1024**3))
     except Exception:
-        return None
+        pass
+    # psutil is optional; Windows builds still need a real memory budget.
+    try:
+        if os.name == 'nt':
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ('length', ctypes.c_uint32), ('load', ctypes.c_uint32),
+                    ('physical_total', ctypes.c_uint64), ('physical_available', ctypes.c_uint64),
+                    ('page_total', ctypes.c_uint64), ('page_available', ctypes.c_uint64),
+                    ('virtual_total', ctypes.c_uint64), ('virtual_available', ctypes.c_uint64),
+                    ('extended_available', ctypes.c_uint64),
+                ]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return float((status.physical_available if available else status.physical_total) / (1024**3))
+        elif hasattr(os, 'sysconf'):
+            pages = 'SC_AVPHYS_PAGES' if available else 'SC_PHYS_PAGES'
+            return float(os.sysconf(pages) * os.sysconf('SC_PAGE_SIZE') / (1024**3))
+    except (AttributeError, OSError, ValueError):
+        pass
+    return None
+
+
+def _total_memory_gb() -> float | None:
+    return _system_memory_gb()
+
+
+def available_memory_bytes() -> int | None:
+    """Available physical RAM, without requiring an optional dependency."""
+    memory = _system_memory_gb(available=True)
+    return None if memory is None else max(0, int(memory * 1024**3))
 
 
 def _memory_tier(total_gb: float | None) -> str:

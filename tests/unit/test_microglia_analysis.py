@@ -12,6 +12,7 @@ from nvap.analysis.microglia_analysis import (
     _min_distance_at_coords,
     _min_positive_distance_at_coords,
     _nearest_segment_between_masks,
+    _nearby_vessel_component_count,
     _spacing_zyx,
     _voxel_tip_coords_geodesic,
     analyze_microglia_cells,
@@ -19,6 +20,26 @@ from nvap.analysis.microglia_analysis import (
     microglia_analysis_to_csv_rows,
 )
 from nvap.config.types import RenderConfig, VoxelSpacing
+
+
+@pytest.mark.parametrize("spacing", [(1., 1., 1.), (2., .4, .7)])
+@pytest.mark.parametrize("radius", [0., 1.4, 5., 100.])
+def test_nearby_vessel_components_match_physical_distance(spacing, radius):
+    rng = np.random.default_rng(42)
+    labels = rng.integers(0, 8, size=(5, 9, 11), dtype=np.int32)
+    tips = np.array([[0, 0, 0], [4, 8, 10], [2, 4, 5], [-20, 0, 0]])
+    shift = np.array([1, -1, 0])
+    spacing = np.asarray(spacing)
+    vessel_coords = np.argwhere(labels > 0)
+    expected = set()
+    for tip in tips + shift:
+        if np.any(tip < 0) or np.any(tip >= labels.shape):
+            continue
+        nearby = vessel_coords[np.linalg.norm((vessel_coords - tip) * spacing, axis=1) <= radius]
+        expected.update(labels[tuple(nearby.T)].tolist())
+    assert _nearby_vessel_component_count(
+        labels, tips, shift, spacing, labels.shape, radius_um=radius,
+    ) == len(expected)
 
 
 def test_gate_and_cluster_tips_merges_fans_and_drops_body_endpoints() -> None:
@@ -288,14 +309,14 @@ def test_microglia_analysis_counts_branches_and_vessel_distances() -> None:
     assert cell.soma_centroid_to_vessel_um is not None
     assert cell.soma_centroid_to_vessel_um > cell.nearest_cell_to_vessel_um
     assert cell.soma_equivalent_diameter_um > 0.0
-    assert 0.0 < cell.soma_roundness <= 1.0
+    assert 0.0 <= cell.soma_roundness <= 1.0  # A planar core has zero 3D roundness.
     assert cell.mean_branch_tortuosity >= 1.0
     assert cell.tip_near_vessel_component_count == 2
     assert cell.tips_near_multiple_vessels is True
     assert result.cells_with_tips_near_multiple_vessels == 1
 
 
-def test_microglia_analysis_counts_component_owned_low_threshold_voxels() -> None:
+def test_raw_analysis_hides_somaless_component_with_dim_owned_voxels() -> None:
     green = np.zeros((5, 24, 24), dtype=np.float32)
     green[2, 11:14, 11:14] = 0.8
     green[2, 12, 14:21] = 0.16
@@ -318,8 +339,8 @@ def test_microglia_analysis_counts_component_owned_low_threshold_voxels() -> Non
         ),
     )
 
-    assert result.analyzed_cell_count == 1
-    assert result.cells[0].voxel_count == int(np.count_nonzero(labels))
+    assert result.analyzed_cell_count == 0
+    assert result.cells == []
 
 
 def test_microglia_analysis_reports_branch_points_length_and_sholl() -> None:
@@ -412,6 +433,7 @@ def test_microglia_analysis_applies_offsets_to_vessel_distances() -> None:
         red,
         labels,
         np.asarray([1], dtype=np.int32),
+        components_prepared=True,  # Supplied geometry isolates measurement from soma gating.
         spacing=VoxelSpacing(x_um=1.0, y_um=1.0, z_um=1.0),
         render=RenderConfig(
             threshold_green=0.5,
@@ -464,6 +486,7 @@ def test_microglia_analysis_csv_rows_follow_cell_metrics() -> None:
         red,
         labels,
         np.asarray([1], dtype=np.int32),
+        components_prepared=True,  # Supplied geometry isolates measurement from soma gating.
         spacing=VoxelSpacing(x_um=1.0, y_um=1.0, z_um=1.0),
         render=RenderConfig(
             threshold_green=0.5,
@@ -553,6 +576,7 @@ def test_microglia_cell_debug_uses_render_offset_for_distance_segments() -> None
         red,
         labels,
         np.asarray([1], dtype=np.int32),
+        components_prepared=True,  # Supplied geometry isolates measurement from soma gating.
         spacing=spacing,
         render=render,
     )

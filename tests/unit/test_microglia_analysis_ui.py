@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import threading
 
 import numpy as np
 import pytest
@@ -86,8 +87,8 @@ def test_render_trim_defaults_and_updates(qtbot) -> None:
     assert cfg.opacity_green == 0.40
     assert cfg.opacity_red == 0.80
     assert cfg.display_z_scale == 0.70
-    assert cfg.trim_first_slices == 10
-    assert cfg.trim_last_slices == 10
+    assert cfg.trim_first_slices == 0
+    assert cfg.trim_last_slices == 0
     assert panel.microglia_branch_sensitivity.isHidden()
 
     panel.trim_first_slices.setValue(7)
@@ -481,6 +482,7 @@ def test_analytics_page_populates_microglia_table_and_syncs_selection(qtbot, mon
     window._refresh_metrics()
     window._nav_to(2)
 
+    qtbot.waitUntil(lambda: window._microglia_analysis_thread is None, timeout=30000)
     assert window.latest_microglia_analysis is not None
     assert window.latest_microglia_analysis.analyzed_cell_count >= 1
     assert window._analytics_cell_table.rowCount() >= 1
@@ -517,11 +519,98 @@ def test_analytics_microglia_populates_while_metrics_pending(qtbot, monkeypatch)
     assert window.latest_metrics is None
     window._nav_to(2)
 
+    qtbot.waitUntil(lambda: window._microglia_analysis_thread is None, timeout=30000)
     assert window.latest_microglia_analysis is not None
     assert window.latest_microglia_analysis.analyzed_cell_count >= 1
     assert window._analytics_cell_table.rowCount() >= 1
     # Whole-volume card stays in a pending state rather than showing a stale value.
     assert window._analytics_cards["volume"]._value.text() == "--"
+
+
+def test_analytics_worker_coalesces_changes_and_discards_stale_results(qtbot, monkeypatch):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.visual_dataset = _analytics_dataset()
+    window.controls.auto_apply_checkbox.setChecked(False)
+    window.current_render = replace(window.current_render, threshold_green=0.5)
+    monkeypatch.setattr(window, "_refresh_metrics", lambda: None)
+    labels = np.zeros(window.visual_dataset.green.data.shape, dtype=np.int32)
+    monkeypatch.setattr(window, "_compute_microglia_components_from_params", lambda *a, **kw: (
+        labels, np.array([], dtype=np.int32), np.array([labels.size]),
+    ))
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    gui_thread = threading.get_ident()
+
+    def analyze(*args, **kwargs):
+        calls.append((threading.get_ident(), kwargs["render"].threshold_green))
+        if len(calls) == 1:
+            started.set()
+            release.wait(5)
+        return MicrogliaAnalysisResult()
+
+    monkeypatch.setattr("nvap.ui.main_window.analyze_microglia_cells", analyze)
+    shown = []
+    monkeypatch.setattr(window, "_set_analytics_microglia_result", lambda result: shown.append(result))
+    try:
+        window._nav_to(2)
+        qtbot.waitUntil(started.is_set)
+        assert calls[0][0] != gui_thread
+        window.current_render = replace(window.current_render, threshold_green=0.7)
+        window._refresh_microglia_analysis()
+        window._refresh_microglia_analysis()
+        assert len(calls) == 1
+        assert not shown
+    finally:
+        release.set()
+        qtbot.waitUntil(lambda: window._microglia_analysis_thread is None, timeout=30000)
+    assert [threshold for _, threshold in calls] == [0.5, 0.7]
+    assert len(shown) == 1
+    assert window._microglia_analysis_cache_key == window._microglia_analysis_cache_key_for_render(window.current_render)
+
+
+def test_analytics_worker_failure_can_be_retried(qtbot, monkeypatch):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.visual_dataset = _analytics_dataset()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("analysis test failure")
+
+    monkeypatch.setattr(window, "_compute_microglia_components_from_params", fail)
+    window._refresh_microglia_analysis()
+    qtbot.waitUntil(lambda: window._microglia_analysis_thread is None)
+    assert "failed" in window._analytics_microglia_hint.text()
+    assert window.latest_microglia_analysis is None
+    window._refresh_microglia_analysis()
+    qtbot.waitUntil(lambda: window._microglia_analysis_thread is None)
+    assert "failed" in window._analytics_microglia_hint.text()
+
+
+def test_closing_analytics_keeps_worker_alive_until_finished(qtbot, monkeypatch):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.visual_dataset = _analytics_dataset()
+    started = threading.Event()
+    release = threading.Event()
+
+    def compute(*args, **kwargs):
+        started.set()
+        release.wait(5)
+        raise RuntimeError("window already closing")
+
+    monkeypatch.setattr(window, "_compute_microglia_components_from_params", compute)
+    try:
+        window._refresh_microglia_analysis()
+        qtbot.waitUntil(started.is_set)
+        window.close()
+        assert window._microglia_close_pending
+        assert window._microglia_analysis_thread is not None
+    finally:
+        release.set()
+        qtbot.waitUntil(lambda: window._microglia_analysis_thread is None)
+    assert window.latest_microglia_analysis is None
 
 
 def test_run_microglia_segmentation_button_starts_refresh(qtbot, monkeypatch) -> None:
@@ -597,7 +686,7 @@ def test_microglia_views_use_component_ids_without_changing_intensities(qtbot, s
     assert view[2, 10, 10] == 0
     assert window._green_component_unassigned_label == 0
     assert window.controls.microglia_index.maximum() == 2
-    assert "Excluded signal is hidden" in window.controls.microglia_info.text()
+    assert "visible signal assigned" in window.controls.microglia_info.text()
     assert "98.4% of visible signal assigned" in window.controls.microglia_info.text()
     assert window._green_component_coloring_active is True
     for index, component_id in enumerate(order, start=1):
@@ -611,6 +700,39 @@ def test_microglia_views_use_component_ids_without_changing_intensities(qtbot, s
     np.testing.assert_array_equal(window._current_green_volume_for_view(), original)
     assert window._green_component_coloring_active is False
     np.testing.assert_array_equal(dataset.green.data, original)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_sparse_component_cache_reused_without_segmentation(qtbot, monkeypatch, empty):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.controls.auto_apply_checkbox.setChecked(False)
+    dataset = _multi_component_dataset()
+    window.processed_dataset = dataset
+    window.visual_dataset = dataset
+    window.current_render = replace(window.current_render, threshold_green=0.5)
+    window._microglia_label_cache_max_bytes = 0
+    labels = np.zeros(dataset.green.data.shape, dtype=np.int32)
+    if not empty:
+        labels[2, 3:8, 3:8] = 1
+        labels[2, 15:21, 15:21] = 2
+    order = np.array([] if empty else [1, 2], dtype=np.int32)
+    sizes = np.bincount(labels.ravel())
+    window._cache_microglia_components(
+        labels, order, sizes, threshold=0.5,
+        branch_sensitivity=window.controls.current_microglia_branch_sensitivity(),
+        shape=labels.shape, selected_index=0,
+    )
+    assert window._green_component_labels is None
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('accepted sparse labels should be reused')
+
+    monkeypatch.setattr(window, '_compute_microglia_components', unexpected)
+    restored, restored_order, restored_sizes = window._ensure_microglia_components_current()
+    np.testing.assert_array_equal(restored, labels)
+    np.testing.assert_array_equal(restored_order, order)
+    np.testing.assert_array_equal(restored_sizes, sizes)
 
 
 @pytest.mark.parametrize("sparse_cache", [False, True])
@@ -642,7 +764,7 @@ def test_microglia_tints_exclude_dim_segmentation_support_and_apply_trim(qtbot, 
 
     window._push_scene_channels(green_only=True)
 
-    assert modes[-1] == (("green", True), {"label_count": 2, "unassigned_label": 0})
+    assert modes[-1] == (("green", True), {"label_count": 2, "unassigned_label": 0, "gray_labels": ()})
     expected = np.where(dataset.green.data >= 0.5, labels, 0)
     expected[[0, -1]] = 0
     np.testing.assert_array_equal(uploads["green"], expected)
@@ -719,12 +841,12 @@ def test_segmented_view_with_no_accepted_cells_hides_all_signal(qtbot, sparse_ca
     )
 
     assert not np.any(window._current_green_volume_for_view())
-    assert "No cells eligible for analysis" in window.controls.microglia_info.text()
+    assert "No connected components above threshold" in window.controls.microglia_info.text()
     np.testing.assert_array_equal(dataset.green.data, original)
 
 
 @pytest.mark.parametrize("sparse_cache", [False, True])
-def test_component_view_hides_somaless_candidate_before_analysis(qtbot, monkeypatch, sparse_cache):
+def test_component_view_keeps_somaless_component_gray_and_separate(qtbot, monkeypatch, sparse_cache):
     window = MainWindow()
     qtbot.addWidget(window)
     zz, yy, xx = np.indices((20, 40, 60))
@@ -741,9 +863,6 @@ def test_component_view_hides_somaless_candidate_before_analysis(qtbot, monkeypa
     )
     window.processed_dataset = window.visual_dataset = dataset
     window.current_render = replace(window.current_render, threshold_green=0.4, trim_first_slices=0, trim_last_slices=0)
-    monkeypatch.setattr('nvap.ui.main_window.compute_component_labels', lambda *args, **kwargs: (
-        raw_labels, np.array([1, 2]), np.bincount(raw_labels.ravel()),
-    ))
     labels, order, sizes = window._compute_microglia_components(green, 0.4)
     window.controls.microglia_isolate.blockSignals(True)
     window.controls.microglia_isolate.setChecked(True)
@@ -753,11 +872,60 @@ def test_component_view_hides_somaless_candidate_before_analysis(qtbot, monkeypa
     window._cache_microglia_components(
         labels, order, sizes, threshold=0.4,
         branch_sensitivity=window.controls.current_microglia_branch_sensitivity(),
-        shape=green.shape, selected_index=0,
+        shape=green.shape, selected_index=0, soma_ids=[1],
     )
-    np.testing.assert_array_equal(window._current_green_volume_for_view() > 0, body)
-    assert len(window._green_component_order) == 1
-    assert '1 cells eligible for analysis' in window.controls.microglia_info.text()
+    np.testing.assert_array_equal(window._current_green_volume_for_view() > 0, green >= .4)
+    assert len(window._green_component_order) == 2
+    assert '1 unassigned fragments gray' in window.controls.microglia_info.text()
+    assert window._green_component_soma_ids == frozenset([1])
+    measured_orders = []
+
+    def inspect_analysis(_green, _red, _labels, analyzed_order, **kwargs):
+        measured_orders.append(np.asarray(analyzed_order).tolist())
+        return MicrogliaAnalysisResult()
+
+    monkeypatch.setattr('nvap.ui.main_window.analyze_microglia_cells', inspect_analysis)
+    window._refresh_microglia_analysis()
+    qtbot.waitUntil(lambda: window._microglia_analysis_thread is None, timeout=10000)
+    assert measured_orders == [[1]]  # The gray component never enters cell statistics.
+
+
+def test_gray_branch_toggle_is_immediate_and_preserves_labels_and_analysis(qtbot, monkeypatch):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.controls.auto_apply_checkbox.setChecked(False)
+    dataset = _multi_component_dataset()
+    window.processed_dataset = window.visual_dataset = dataset
+    window.current_render = replace(window.current_render, threshold_green=.5)
+    labels = np.zeros(dataset.green.data.shape, dtype=np.int32)
+    labels[2, 3:8, 3:8] = 1
+    labels[2, 15:21, 15:21] = 2
+    order = np.array([1, 2], dtype=np.int32)
+    window.controls.microglia_isolate.blockSignals(True)
+    window.controls.microglia_isolate.setChecked(True)
+    window.controls.microglia_isolate.blockSignals(False)
+    window._cache_microglia_components(labels, order, np.bincount(labels.ravel()),
+        threshold=.5, branch_sensitivity=window.controls.current_microglia_branch_sensitivity(),
+        shape=labels.shape, selected_index=0, soma_ids=[1])
+    window._microglia_analysis_cache_key = ('unchanged',)
+    uploads = {}
+    visibility = []
+    monkeypatch.setattr(window.scene, 'set_channel_data', lambda **kw: uploads.update({kw['channel']: kw['volume']}))
+    monkeypatch.setattr(window.scene, 'set_gray_branches_visible', visibility.append)
+    monkeypatch.setattr(window.scene, 'set_channel_component_coloring', lambda *a, **kw: None)
+    monkeypatch.setattr(window.scene, 'apply_render_config', lambda *a: None)
+    monkeypatch.setattr(window, '_compute_microglia_components', lambda *a: pytest.fail('visibility must not resegment'))
+    assert window.controls.show_gray_branches.isChecked()
+    window.controls.show_gray_branches.setChecked(False)
+    assert visibility[-1] is False
+    assert not uploads
+    assert 'fragments hidden' in window.controls.microglia_info.text()
+    window.controls.show_gray_branches.setChecked(True)
+    assert visibility[-1] is True
+    assert not uploads
+    np.testing.assert_array_equal(window._green_component_labels, labels)
+    assert window._microglia_analysis_cache_key == ('unchanged',)
+    np.testing.assert_array_equal(window._green_component_order, order)
 
 
 def test_microglia_analysis_debug_overlay_builds_for_selected_cell(qtbot, monkeypatch) -> None:

@@ -19,6 +19,13 @@ def interpolate_missing_slices(
     if len(z_indices) == 0:
         raise ValueError("z_indices cannot be empty.")
 
+    if all(int(z) == int(z_indices[0]) + index for index, z in enumerate(z_indices)):
+        # Already ordered and complete: avoid sorting plus two full stack
+        # copies. A read-only view protects the source from downstream edits.
+        unchanged = np.asarray(volume, dtype=np.float32).view()
+        unchanged.flags.writeable = False
+        return unchanged, [int(z) for z in z_indices]
+
     order = np.argsort(np.asarray(z_indices))
     sorted_z = [int(z_indices[i]) for i in order]
     sorted_volume = volume[order].astype(np.float32, copy=False)

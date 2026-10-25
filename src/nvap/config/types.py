@@ -95,6 +95,19 @@ class PreprocessConfig:
 
 
 @dataclass(frozen=True)
+class SomaCriteria:
+    required: bool = False
+    min_radius_um: float = 1.0
+    min_core_volume_um3: float = 0.1
+
+    def __post_init__(self):
+        if not np.isfinite(self.min_radius_um) or self.min_radius_um <= 0:
+            raise ValueError("Minimum soma radius must be finite and positive.")
+        if not np.isfinite(self.min_core_volume_um3) or self.min_core_volume_um3 <= 0:
+            raise ValueError("Minimum soma core volume must be finite and positive.")
+
+
+@dataclass(frozen=True)
 class RenderConfig:
     threshold_green: float = 0.80
     threshold_red: float = 0.60
@@ -103,8 +116,8 @@ class RenderConfig:
     iso_green: float = 0.25
     iso_red: float = 0.25
     display_z_scale: float = 0.70
-    trim_first_slices: int = 10
-    trim_last_slices: int = 10
+    trim_first_slices: int = 0
+    trim_last_slices: int = 0
     offset_x_um: float = 0.0
     offset_y_um: float = 0.0
     offset_z_um: float = 0.0
@@ -112,6 +125,13 @@ class RenderConfig:
     show_red: bool = True
     show_iso_green: bool = True
     show_iso_red: bool = True
+    soma_required: bool = False
+    soma_min_radius_um: float = 1.0
+    soma_min_core_volume_um3: float = 0.1
+
+    @property
+    def soma_criteria(self) -> SomaCriteria:
+        return SomaCriteria(self.soma_required, self.soma_min_radius_um, self.soma_min_core_volume_um3)
 
 
 @dataclass(frozen=True)

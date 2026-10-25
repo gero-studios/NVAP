@@ -745,6 +745,13 @@ def _assign_low_confidence_branches_to_one_owner(
     for branch_id, comp_slice in enumerate(objects, start=1):
         if comp_slice is None:
             continue
+        # Include the surrounding soma frontier. A tight branch bounding box
+        # hides owners just outside it and used to trigger winner-take-all
+        # reassignment based only on brightness already inside the branch.
+        comp_slice = tuple(
+            slice(max(0, int(s.start) - 1), min(labels.shape[axis], int(s.stop) + 1))
+            for axis, s in enumerate(comp_slice)
+        )
         local_branch = branch_labels[comp_slice] == int(branch_id)
         branch_voxels = int(np.count_nonzero(local_branch))
         if branch_voxels <= 0 or branch_voxels > int(max_branch_voxels):
@@ -801,20 +808,8 @@ def _assign_low_confidence_branches_to_one_owner(
                     reassigned += 1
                     continue
 
-        # Score branch ownership by integrated intensity already assigned to
-        # each label; this favors the soma with the strongest 3D connection.
-        scores: list[tuple[float, int]] = []
-        local_values = np.asarray(working[comp_slice], dtype=np.float32)
-        for label_id in current_ids.tolist():
-            owned = local_branch & (local_labels == int(label_id))
-            if np.any(owned):
-                scores.append((float(np.sum(local_values[owned])), int(label_id)))
-        if not scores:
-            continue
-        owner = max(scores)[1]
-        local_labels[local_branch] = owner
-        out[comp_slice] = local_labels
-        reassigned += 1
+        # Without a measured owner frontier, preserve the existing separation.
+        # Integrated brightness alone cannot justify merging different cells.
 
     if reassigned > 0:
         logger.info(
@@ -1481,25 +1476,6 @@ def compute_component_labels(
     )
     structure = _spacing_aware_structure(spacing_zyx)
 
-    # Detect soma seed centres — one compact region per microglia.
-    seed = _detect_soma_blobs(
-        working,
-        threshold=t,
-        branch_sensitivity=branch_sense,
-        spacing=(float(spacing_zyx[0]), float(spacing_zyx[1]), float(spacing_zyx[2])),
-    )
-    logger.info(
-        "Microglia segmentation stage=seed_detection dt=%.2fs seed_voxels=%d.",
-        time.perf_counter() - stage_t0,
-        int(np.count_nonzero(seed)),
-    )
-    if not np.any(seed):
-        seed = finite & (working >= high_t)
-        if not np.any(seed):
-            seed = finite & (working >= max(t, high_t * 0.92))
-        if not np.any(seed):
-            return _empty_labels(arr.shape)
-
     # Single low threshold for the watershed growth mask.  The watershed
     # itself handles where adjacent regions should be split, so we no longer
     # need to iterate over multiple candidate thresholds.
@@ -1556,14 +1532,15 @@ def compute_component_labels(
     # bounding box before the growth mask is even built.
     active_bounds = _mask_bounds(finite & ((working >= low_t) | (arr >= t)))
     if active_bounds is None:
-        active_bounds = _mask_bounds(seed)
-    if active_bounds is None:
         return _empty_labels(arr.shape)
 
     arr_roi = arr[active_bounds]
     working_roi = working[active_bounds]
     finite_roi = finite[active_bounds]
-    seed_roi = seed[active_bounds]
+    # The thickness-based soma detector normally supplies all markers and
+    # ignores blob seeds. Avoid an expensive full-volume contrast/peak/EDT
+    # pass whose result would be discarded; keep it as the identical fallback.
+    seed_roi = np.zeros(working_roi.shape, dtype=bool)
 
     seed_labels = _seed_labels_from_soma_candidates(
         seed_roi,
@@ -1577,7 +1554,25 @@ def compute_component_labels(
         structure=structure,
     )
     if not np.any(seed_labels):
-        return _empty_labels(arr.shape)
+        seed = _detect_soma_blobs(
+            working, threshold=t, branch_sensitivity=branch_sense,
+            spacing=tuple(float(s) for s in spacing_zyx),
+        )
+        if not np.any(seed):
+            seed = finite & (working >= high_t)
+            if not np.any(seed):
+                seed = finite & (working >= max(t, high_t * 0.92))
+        seed_labels = _seed_labels_from_soma_candidates(
+            seed[active_bounds], working_roi, finite_roi, low_floor=low_t,
+            high_t=high_t, branch_sensitivity=branch_sense, min_keep=min_keep,
+            spacing_zyx=spacing_zyx, structure=structure,
+        )
+        if not np.any(seed_labels):
+            return _empty_labels(arr.shape)
+    logger.info(
+        "Microglia segmentation stage=soma_markers dt=%.2fs markers=%d.",
+        time.perf_counter() - stage_t0, int(seed_labels.max()),
+    )
 
     seed_count = int(np.max(seed_labels))
     seed_cap = int(max(256, min(2048, max_keep * 6)))

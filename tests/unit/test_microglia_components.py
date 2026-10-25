@@ -808,12 +808,12 @@ def test_coarse_z_spacing_keeps_diagonal_in_plane_branches_connected() -> None:
     assert int(sizes[component_id]) == 125
 
 
-def test_faint_bridge_branch_gets_single_soma_owner() -> None:
+def test_faint_bridge_between_two_somas_preserves_both_owners() -> None:
     arr = np.zeros((5, 96, 96), dtype=np.float32)
     z = 2
 
     # Two clear somas with one faint branch-like bridge between them. The
-    # left soma has a stronger local connection to the bridge.
+    # left soma is brighter, but this must not merge the two cell territories.
     arr[z, 42:51, 24:33] = 0.54
     arr[z, 42:51, 64:73] = 0.42
     arr[z, 46, 33:64] = 0.15
@@ -837,7 +837,18 @@ def test_faint_bridge_branch_gets_single_soma_owner() -> None:
     assert left_id > 0
     assert right_id > 0
     assert left_id != right_id
-    assert len(bridge_ids) == 1
+    assert bridge_ids == {left_id, right_id}
+
+
+def test_unanchored_branch_network_is_not_merged_by_brightness():
+    labels = np.zeros((3, 7, 16), dtype=np.int32)
+    labels[1, 3, 2:7] = 1
+    labels[1, 3, 7:12] = 2
+    working = np.where(labels == 1, 0.3, np.where(labels == 2, 0.2, 0.0))
+    result = microglia_components._assign_low_confidence_branches_to_one_owner(
+        labels, working, low_t=0.1, high_t=0.5, max_branch_voxels=100,
+    )
+    np.testing.assert_array_equal(result, labels)
 
 
 def test_preferred_voxel_floor_preserves_valid_small_cells_beside_large_cells() -> None:
